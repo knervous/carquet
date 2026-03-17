@@ -282,7 +282,8 @@ void carquet_avx2_byte_stream_split_encode_float(
 }
 
 /**
- * Decode byte stream split floats using AVX2.
+ * Decode byte stream split floats using full-width AVX2.
+ * Processes 16 floats per iteration using 256-bit loads and unpack cascade.
  */
 void carquet_avx2_byte_stream_split_decode_float(
     const uint8_t* data,
@@ -292,9 +293,41 @@ void carquet_avx2_byte_stream_split_decode_float(
     uint8_t* dst = (uint8_t*)values;
     int64_t i = 0;
 
-    /* Process 8 floats at a time */
+    /* Process 16 floats at a time with full 256-bit AVX2 operations.
+     * Load 16 bytes from each of 4 streams into __m256i (via two 8-byte halves),
+     * then use 256-bit unpack cascade + lane-fix permute. */
+    for (; i + 16 <= count; i += 16) {
+        __m128i s0_lo = _mm_loadl_epi64((const __m128i*)(data + 0 * count + i));
+        __m128i s0_hi = _mm_loadl_epi64((const __m128i*)(data + 0 * count + i + 8));
+        __m128i s1_lo = _mm_loadl_epi64((const __m128i*)(data + 1 * count + i));
+        __m128i s1_hi = _mm_loadl_epi64((const __m128i*)(data + 1 * count + i + 8));
+        __m128i s2_lo = _mm_loadl_epi64((const __m128i*)(data + 2 * count + i));
+        __m128i s2_hi = _mm_loadl_epi64((const __m128i*)(data + 2 * count + i + 8));
+        __m128i s3_lo = _mm_loadl_epi64((const __m128i*)(data + 3 * count + i));
+        __m128i s3_hi = _mm_loadl_epi64((const __m128i*)(data + 3 * count + i + 8));
+
+        __m256i b0 = _mm256_inserti128_si256(_mm256_castsi128_si256(s0_lo), s0_hi, 1);
+        __m256i b1 = _mm256_inserti128_si256(_mm256_castsi128_si256(s1_lo), s1_hi, 1);
+        __m256i b2 = _mm256_inserti128_si256(_mm256_castsi128_si256(s2_lo), s2_hi, 1);
+        __m256i b3 = _mm256_inserti128_si256(_mm256_castsi128_si256(s3_lo), s3_hi, 1);
+
+        /* AVX2 unpack operates per-lane */
+        __m256i lo01 = _mm256_unpacklo_epi8(b0, b1);
+        __m256i lo23 = _mm256_unpacklo_epi8(b2, b3);
+
+        __m256i r0 = _mm256_unpacklo_epi16(lo01, lo23);
+        __m256i r1 = _mm256_unpackhi_epi16(lo01, lo23);
+
+        /* Fix lane ordering for sequential output */
+        __m256i out0 = _mm256_permute2x128_si256(r0, r1, 0x20);
+        __m256i out1 = _mm256_permute2x128_si256(r0, r1, 0x31);
+
+        _mm256_storeu_si256((__m256i*)(dst + i * 4), out0);
+        _mm256_storeu_si256((__m256i*)(dst + i * 4 + 32), out1);
+    }
+
+    /* 8-float fallback using 128-bit ops */
     for (; i + 8 <= count; i += 8) {
-        /* Load 8 bytes from each of the 4 streams (use memcpy for unaligned access) */
         uint64_t t0, t1, t2, t3;
         memcpy(&t0, data + 0 * count + i, sizeof(uint64_t));
         memcpy(&t1, data + 1 * count + i, sizeof(uint64_t));
@@ -305,18 +338,16 @@ void carquet_avx2_byte_stream_split_decode_float(
         __m128i b2 = _mm_cvtsi64_si128((long long)t2);
         __m128i b3 = _mm_cvtsi64_si128((long long)t3);
 
-        /* Interleave bytes to reconstruct floats */
-        __m128i lo01 = _mm_unpacklo_epi8(b0, b1);  /* a0b0 a1b1 a2b2 ... */
-        __m128i lo23 = _mm_unpacklo_epi8(b2, b3);  /* c0d0 c1d1 c2d2 ... */
-
-        __m128i result_lo = _mm_unpacklo_epi16(lo01, lo23);  /* a0b0c0d0 a1b1c1d1 ... */
+        __m128i lo01 = _mm_unpacklo_epi8(b0, b1);
+        __m128i lo23 = _mm_unpacklo_epi8(b2, b3);
+        __m128i result_lo = _mm_unpacklo_epi16(lo01, lo23);
         __m128i result_hi = _mm_unpackhi_epi16(lo01, lo23);
 
         _mm_storeu_si128((__m128i*)(dst + i * 4), result_lo);
         _mm_storeu_si128((__m128i*)(dst + i * 4 + 16), result_hi);
     }
 
-    /* Handle remaining values */
+    /* Scalar tail */
     for (; i < count; i++) {
         for (int b = 0; b < 4; b++) {
             dst[i * 4 + b] = data[b * count + i];
@@ -424,7 +455,9 @@ void carquet_avx2_byte_stream_split_encode_double(
 }
 
 /**
- * Decode byte stream split doubles using AVX2.
+ * Decode byte stream split doubles using full-width AVX2.
+ * Processes 32 doubles per iteration using 256-bit loads, a 3-stage unpack
+ * cascade, and lane-fix permutations — 8x throughput vs the old 4-double path.
  */
 void carquet_avx2_byte_stream_split_decode_double(
     const uint8_t* data,
@@ -434,6 +467,61 @@ void carquet_avx2_byte_stream_split_decode_double(
     uint8_t* dst = (uint8_t*)values;
     int64_t i = 0;
 
+    /* Process 32 doubles at a time with full-width AVX2.
+     * Load 32 bytes from each of 8 streams, do 256-bit unpack cascade,
+     * then fix lane ordering with permute2x128. */
+    for (; i + 32 <= count; i += 32) {
+        __m256i s0 = _mm256_loadu_si256((const __m256i*)(data + 0 * count + i));
+        __m256i s1 = _mm256_loadu_si256((const __m256i*)(data + 1 * count + i));
+        __m256i s2 = _mm256_loadu_si256((const __m256i*)(data + 2 * count + i));
+        __m256i s3 = _mm256_loadu_si256((const __m256i*)(data + 3 * count + i));
+        __m256i s4 = _mm256_loadu_si256((const __m256i*)(data + 4 * count + i));
+        __m256i s5 = _mm256_loadu_si256((const __m256i*)(data + 5 * count + i));
+        __m256i s6 = _mm256_loadu_si256((const __m256i*)(data + 6 * count + i));
+        __m256i s7 = _mm256_loadu_si256((const __m256i*)(data + 7 * count + i));
+
+        /* Stage 1: byte-level interleave of stream pairs (per 128-bit lane) */
+        __m256i a01_lo = _mm256_unpacklo_epi8(s0, s1);
+        __m256i a01_hi = _mm256_unpackhi_epi8(s0, s1);
+        __m256i a23_lo = _mm256_unpacklo_epi8(s2, s3);
+        __m256i a23_hi = _mm256_unpackhi_epi8(s2, s3);
+        __m256i a45_lo = _mm256_unpacklo_epi8(s4, s5);
+        __m256i a45_hi = _mm256_unpackhi_epi8(s4, s5);
+        __m256i a67_lo = _mm256_unpacklo_epi8(s6, s7);
+        __m256i a67_hi = _mm256_unpackhi_epi8(s6, s7);
+
+        /* Stage 2: 16-bit interleave of quad groups */
+        __m256i b0 = _mm256_unpacklo_epi16(a01_lo, a23_lo);
+        __m256i b1 = _mm256_unpackhi_epi16(a01_lo, a23_lo);
+        __m256i b2 = _mm256_unpacklo_epi16(a01_hi, a23_hi);
+        __m256i b3 = _mm256_unpackhi_epi16(a01_hi, a23_hi);
+        __m256i b4 = _mm256_unpacklo_epi16(a45_lo, a67_lo);
+        __m256i b5 = _mm256_unpackhi_epi16(a45_lo, a67_lo);
+        __m256i b6 = _mm256_unpacklo_epi16(a45_hi, a67_hi);
+        __m256i b7 = _mm256_unpackhi_epi16(a45_hi, a67_hi);
+
+        /* Stage 3: 32-bit interleave assembles full 8-byte doubles */
+        __m256i c0 = _mm256_unpacklo_epi32(b0, b4);
+        __m256i c1 = _mm256_unpackhi_epi32(b0, b4);
+        __m256i c2 = _mm256_unpacklo_epi32(b1, b5);
+        __m256i c3 = _mm256_unpackhi_epi32(b1, b5);
+        __m256i c4 = _mm256_unpacklo_epi32(b2, b6);
+        __m256i c5 = _mm256_unpackhi_epi32(b2, b6);
+        __m256i c6 = _mm256_unpacklo_epi32(b3, b7);
+        __m256i c7 = _mm256_unpackhi_epi32(b3, b7);
+
+        /* Fix lane ordering and store 32 doubles sequentially */
+        _mm256_storeu_si256((__m256i*)(dst + i * 8),       _mm256_permute2x128_si256(c0, c1, 0x20));
+        _mm256_storeu_si256((__m256i*)(dst + i * 8 + 32),  _mm256_permute2x128_si256(c2, c3, 0x20));
+        _mm256_storeu_si256((__m256i*)(dst + i * 8 + 64),  _mm256_permute2x128_si256(c4, c5, 0x20));
+        _mm256_storeu_si256((__m256i*)(dst + i * 8 + 96),  _mm256_permute2x128_si256(c6, c7, 0x20));
+        _mm256_storeu_si256((__m256i*)(dst + i * 8 + 128), _mm256_permute2x128_si256(c0, c1, 0x31));
+        _mm256_storeu_si256((__m256i*)(dst + i * 8 + 160), _mm256_permute2x128_si256(c2, c3, 0x31));
+        _mm256_storeu_si256((__m256i*)(dst + i * 8 + 192), _mm256_permute2x128_si256(c4, c5, 0x31));
+        _mm256_storeu_si256((__m256i*)(dst + i * 8 + 224), _mm256_permute2x128_si256(c6, c7, 0x31));
+    }
+
+    /* 4-double fallback using 128-bit ops */
     for (; i + 4 <= count; i += 4) {
         uint32_t b0, b1, b2, b3, b4, b5, b6, b7;
         memcpy(&b0, data + 0 * count + i, sizeof(b0));
@@ -467,6 +555,7 @@ void carquet_avx2_byte_stream_split_decode_double(
         _mm_storeu_si128((__m128i*)(dst + i * 8 + 16), hi_cd);
     }
 
+    /* Scalar tail */
     for (; i < count; i++) {
         for (int b = 0; b < 8; b++) {
             dst[i * 8 + b] = data[b * count + i];
@@ -744,6 +833,11 @@ bool carquet_avx2_checked_gather_double(const double* dict, int32_t dict_count,
 uint32_t carquet_avx2_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
     size_t i = 0;
 
+    /* Standard CRC32C convention: pre/post XOR with 0xFFFFFFFF.
+     * The _mm_crc32_* intrinsics compute the raw polynomial remainder
+     * without any inversion, so we must handle it. */
+    crc = ~crc;
+
 #ifdef __x86_64__
     for (; i + 8 <= len; i += 8) {
         uint64_t val;
@@ -769,7 +863,7 @@ uint32_t carquet_avx2_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
         crc = _mm_crc32_u8(crc, data[i]);
     }
 
-    return crc;
+    return ~crc;
 }
 
 void carquet_avx2_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset) {

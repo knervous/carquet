@@ -57,10 +57,12 @@ typedef struct carquet_worker_pool {
     CRITICAL_SECTION mutex;
     CONDITION_VARIABLE work_available;
     CONDITION_VARIABLE work_done;
+    CONDITION_VARIABLE queue_not_full;
 #else
     pthread_mutex_t mutex;
     pthread_cond_t work_available;
     pthread_cond_t work_done;
+    pthread_cond_t queue_not_full;
 #endif
 
     int32_t active_tasks;   /* Tasks currently being executed */
@@ -83,6 +85,14 @@ carquet_worker_pool_t* carquet_worker_pool_create(int32_t num_threads);
  */
 void carquet_worker_pool_submit(carquet_worker_pool_t* pool,
                                  carquet_task_fn fn, void* arg);
+
+/**
+ * Submit N tasks with the same function but different arguments.
+ * Acquires the lock once for the entire batch, reducing synchronization overhead.
+ */
+void carquet_worker_pool_submit_batch(carquet_worker_pool_t* pool,
+                                       carquet_task_fn fn,
+                                       void** args, int32_t count);
 
 /**
  * Block until all submitted tasks have completed.

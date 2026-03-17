@@ -285,7 +285,8 @@ static double benchmark_write(const char* filename, const test_data_t* td,
     return elapsed;
 }
 
-static double benchmark_read(const char* filename, int expected_rows) {
+static double benchmark_read(const char* filename, int expected_rows,
+                              carquet_thread_pool_t* pool) {
     carquet_error_t err = CARQUET_ERROR_INIT;
 
     double start = get_time_ms();
@@ -305,6 +306,7 @@ static double benchmark_read(const char* filename, int expected_rows) {
     carquet_batch_reader_config_t config;
     carquet_batch_reader_config_init(&config);
     config.batch_size = 262144;
+    config.thread_pool = pool;
 
     carquet_batch_reader_t* batch_reader = carquet_batch_reader_create(reader, &config, &err);
     if (batch_reader) {
@@ -387,18 +389,23 @@ static void run_benchmark(const char* dataset_name, int num_rows,
 
     long file_size = get_file_size(filename);
 
+    /* Create a reusable thread pool — avoids pthread create/join per iteration */
+    carquet_thread_pool_t* pool = carquet_thread_pool_create(0);
+
     /* Purge cache once, then warmup reads (first read = cold, rest = warm) */
     purge_file_cache(filename);
 
     for (int i = 0; i < WARMUP_ITERATIONS; i++) {
-        benchmark_read(filename, num_rows);
+        benchmark_read(filename, num_rows, pool);
     }
 
     /* Benchmark reads (warm cache — realistic for most workloads) */
     double read_times[MAX_BENCH_ITERATIONS];
     for (int i = 0; i < iters; i++) {
-        read_times[i] = benchmark_read(filename, num_rows);
+        read_times[i] = benchmark_read(filename, num_rows, pool);
     }
+
+    carquet_thread_pool_destroy(pool);
 
     double write_med = trimmed_median(write_times, iters);
     double read_med = trimmed_median(read_times, iters);
@@ -414,7 +421,8 @@ static void run_benchmark(const char* dataset_name, int num_rows,
     printf("CSV:carquet,%s,%s,%d,%.2f,%.2f,%ld\n",
            dataset_name, compression_name, num_rows, write_med, read_med, file_size);
 
-    remove(filename);
+    /* File is NOT removed here — the orchestrator handles cleanup
+     * after cross-read benchmarking is done. */
     test_data_destroy(td);
 }
 
@@ -430,12 +438,98 @@ static int find_compression(const char* name, compression_config_t* comps, int n
     return -1;
 }
 
+static int run_crossread(const char* filename) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+
+    /* Open file to get row count from metadata */
+    carquet_reader_options_t opts;
+    carquet_reader_options_init(&opts);
+    opts.use_mmap = true;
+    opts.verify_checksums = false;
+
+    carquet_reader_t* reader = carquet_reader_open(filename, &opts, &err);
+    if (!reader) {
+        fprintf(stderr, "carquet_reader_open failed for %s: %s\n",
+                filename, err.message[0] ? err.message : "unknown error");
+        return 1;
+    }
+
+    int64_t num_rows = carquet_reader_num_rows(reader);
+    carquet_reader_close(reader);
+
+    if (num_rows <= 0) {
+        fprintf(stderr, "File %s has no rows\n", filename);
+        return 1;
+    }
+
+    int expected_rows = (int)num_rows;
+    long file_size = get_file_size(filename);
+
+    /* Scale iterations based on row count */
+    int iters;
+    const char* iter_env = getenv("CARQUET_BENCH_ITERATIONS");
+    if (iter_env && atoi(iter_env) > 0) {
+        iters = atoi(iter_env);
+        if (iters > MAX_BENCH_ITERATIONS) iters = MAX_BENCH_ITERATIONS;
+    } else if (num_rows <= 100000) {
+        iters = BENCH_ITERATIONS_SMALL;
+    } else if (num_rows <= 1000000) {
+        iters = BENCH_ITERATIONS_MEDIUM;
+    } else {
+        iters = BENCH_ITERATIONS_LARGE;
+    }
+
+    carquet_thread_pool_t* pool = carquet_thread_pool_create(0);
+
+    /* Purge file cache before reads */
+    purge_file_cache(filename);
+
+    /* Warmup reads */
+    for (int i = 0; i < WARMUP_ITERATIONS; i++) {
+        double t = benchmark_read(filename, expected_rows, pool);
+        if (t <= 0.0) {
+            fprintf(stderr, "Warmup read failed for %s\n", filename);
+            carquet_thread_pool_destroy(pool);
+            return 1;
+        }
+    }
+
+    /* Measured reads */
+    double read_times[MAX_BENCH_ITERATIONS];
+    for (int i = 0; i < iters; i++) {
+        read_times[i] = benchmark_read(filename, expected_rows, pool);
+        if (read_times[i] <= 0.0) {
+            fprintf(stderr, "Benchmark read failed for %s\n", filename);
+            carquet_thread_pool_destroy(pool);
+            return 1;
+        }
+    }
+
+    carquet_thread_pool_destroy(pool);
+
+    double read_med = trimmed_median(read_times, iters);
+
+    printf("CSV:carquet,crossread,external,%d,0.00,%.2f,%ld\n",
+           expected_rows, read_med, file_size);
+
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
         printf("%s\n", carquet_version());
         return 0;
+    }
+
+    /* read <filename> subcommand for cross-read benchmarking */
+    if (argc == 2 && strcmp(argv[1], "read") == 0) {
+        fprintf(stderr, "Usage: %s read <filename>\n", argv[0]);
+        return 1;
+    }
+    if (argc >= 3 && strcmp(argv[1], "read") == 0) {
+        return run_crossread(argv[2]);
     }
 
     dataset_t datasets[] = {

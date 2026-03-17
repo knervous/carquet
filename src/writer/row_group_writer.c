@@ -156,8 +156,11 @@ static carquet_status_t finalize_columns_parallel(
     carquet_row_group_writer_t* writer,
     finalized_column_chunk_t* chunks) {
 #ifdef _OPENMP
+    int num_threads = omp_get_max_threads();
+    if (num_threads > writer->num_columns) num_threads = writer->num_columns;
+    if (num_threads < 1) num_threads = 1;
     int i;
-    #pragma omp parallel for schedule(dynamic)
+    #pragma omp parallel for num_threads(num_threads) schedule(static)
     for (i = 0; i < writer->num_columns; i++) {
         finalized_column_chunk_t* chunk = &chunks[i];
         chunk->status = carquet_column_writer_finalize(

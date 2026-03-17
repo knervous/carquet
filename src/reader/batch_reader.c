@@ -22,6 +22,10 @@
 #include <omp.h>
 #endif
 
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#endif
+
 /* SIMD dispatch function for null bitmap construction */
 extern void carquet_dispatch_build_null_bitmap(const int16_t* def_levels, int64_t count,
                                                 int16_t max_def_level, uint8_t* null_bitmap);
@@ -77,14 +81,45 @@ typedef struct {
     int64_t* col_num_values; /* [num_projected] values actually read */
     int64_t total_rows;      /* total rows in this RG (min of col values read) */
     int64_t rows_consumed;   /* rows already served to batch_reader_next */
+
+    /* Per-slot independent mmap for this row group's byte range.
+     * Avoids page table lock contention when 12+ threads fault pages
+     * from the same shared mmap simultaneously. */
+#if !defined(_WIN32)
+    uint8_t* slot_mmap;         /* independent mmap for this RG, or NULL */
+    size_t   slot_mmap_size;    /* mmap length */
+    int64_t  slot_mmap_offset;  /* file offset corresponding to slot_mmap[0] */
+#endif
 } rg_slot_t;
+
+/* Forward declarations for coalesced read fast path.
+ * data_base: pointer to file data (per-slot mmap or shared mmap).
+ *            Byte at file offset N is at data_base[N]. */
+static bool can_coalesce_column(const carquet_column_reader_t* cr);
+static void coalesced_read_column_range(const carquet_column_reader_t* cr,
+    const uint8_t* data_base, void* dest, int64_t max_values,
+    int64_t start_offset, int64_t end_offset, int64_t* out_values_read);
+static void coalesced_read_column(const carquet_column_reader_t* cr,
+    void* dest, int64_t max_values, int64_t* out_values_read);
+static int32_t plan_coalesced_column_splits(const carquet_column_reader_t* cr,
+    const uint8_t* data_base, int64_t max_values, int32_t max_splits,
+    int64_t* split_offsets, int64_t* split_values);
+
+extern carquet_status_t carquet_byte_stream_split_decode_float(
+    const uint8_t* data, size_t data_size, float* values, int64_t count);
+extern carquet_status_t carquet_byte_stream_split_decode_double(
+    const uint8_t* data, size_t data_size, double* values, int64_t count);
 
 /* Task argument for parallel bulk column reading */
 typedef struct {
     carquet_column_reader_t* col_reader;
+    const uint8_t* data_base;  /* file data pointer (per-slot or shared mmap) */
     void* dest;
     int64_t max_values;
     int64_t* out_values_read;
+    int64_t start_offset;      /* 0 = full chunk */
+    int64_t end_offset;        /* 0 = full chunk */
+    int64_t local_values_read; /* scratch for split tasks */
 } bulk_read_arg_t;
 
 struct carquet_batch_reader {
@@ -119,6 +154,7 @@ struct carquet_batch_reader {
 
     /* Persistent worker pool for cross-RG parallel decompression */
     carquet_worker_pool_t* pool;
+    bool pool_is_borrowed;  /* true when pool comes from config.thread_pool */
 
     /* Pipeline ring buffer for multi-RG parallel decompression.
      * Pre-decompresses pages for upcoming row groups so that by the time
@@ -131,6 +167,10 @@ struct carquet_batch_reader {
     int32_t rg_order_len;         /* total filtered RGs */
     int32_t rg_order_next;        /* next RG to submit */
     bool pipeline_active;         /* multi-RG pipeline enabled */
+
+    /* Per-reader task args (replaces static global array) */
+    bulk_read_arg_t* task_args;
+    int32_t task_args_capacity;
 };
 
 /* ============================================================================
@@ -698,7 +738,15 @@ carquet_batch_reader_t* carquet_batch_reader_create(
     /* ====================================================================
      * Create worker pool + pipeline for compressed mmap multi-RG files
      * ==================================================================== */
-    if (reader->mmap_data != NULL && batch_reader->rg_order_len > 1) {
+    /* Enable the pipeline for multi-RG files, or single-RG files that are
+     * large enough for the pipeline overhead to be amortized.  Small files
+     * (< 500K rows) are faster with the simpler per-batch OMP path. */
+    int64_t total_pipeline_rows = 0;
+    for (int32_t r = 0; r < batch_reader->rg_order_len; r++) {
+        total_pipeline_rows += reader->metadata.row_groups[batch_reader->rg_order[r]].num_rows;
+    }
+    if (reader->mmap_data != NULL &&
+        (batch_reader->rg_order_len > 1 || total_pipeline_rows >= 500000)) {
         bool has_compression = false;
         const parquet_file_metadata_t* meta = &reader->metadata;
         if (meta->num_row_groups > 0 && meta->row_groups[0].columns) {
@@ -716,16 +764,25 @@ carquet_batch_reader_t* carquet_batch_reader_create(
         }
 
         if (has_compression) {
-            int32_t pt = batch_reader->config.num_threads;
+            /* Optimization 6: borrow external pool if provided */
+            if (batch_reader->config.thread_pool) {
+                batch_reader->pool = (carquet_worker_pool_t*)batch_reader->config.thread_pool;
+                batch_reader->pool_is_borrowed = true;
+            } else {
+                int32_t pt = batch_reader->config.num_threads;
 #ifdef _OPENMP
-            if (pt <= 0) pt = omp_get_max_threads();
+                if (pt <= 0) pt = omp_get_max_threads();
 #else
-            if (pt <= 0) pt = 4;
+                if (pt <= 0) pt = 4;
 #endif
-            if (pt < 2) pt = 2;
+                if (pt < 2) pt = 2;
 
-            batch_reader->pool = carquet_worker_pool_create(pt);
+                batch_reader->pool = carquet_worker_pool_create(pt);
+                batch_reader->pool_is_borrowed = false;
+            }
+
             if (batch_reader->pool) {
+                int32_t pt = batch_reader->pool->num_threads;
                 int32_t depth = batch_reader->rg_order_len;
                 if (depth > pt * 2) depth = pt * 2;
                 if (depth < 1) depth = 1;
@@ -737,8 +794,25 @@ carquet_batch_reader_t* carquet_batch_reader_create(
                     batch_reader->pipeline_count = 0;
                     batch_reader->pipeline_active = true;
 
+                    /* Allocate per-reader task args.  Each column may be split
+                     * into up to num_threads segments for parallel decompression,
+                     * so the worst case is depth * np * max_splits_per_column. */
                     int32_t np = batch_reader->num_projected;
-                    bool alloc_ok = true;
+                    int32_t max_splits = pt;
+                    if (np > 0 && max_splits > pt / np)
+                        max_splits = pt / np;
+                    if (max_splits < 2) max_splits = 2;
+                    batch_reader->task_args_capacity = depth * np * (max_splits + 1);
+                    batch_reader->task_args = calloc(batch_reader->task_args_capacity,
+                                                     sizeof(bulk_read_arg_t));
+                    if (!batch_reader->task_args) {
+                        free(batch_reader->pipeline);
+                        batch_reader->pipeline = NULL;
+                        batch_reader->pipeline_active = false;
+                        batch_reader->task_args_capacity = 0;
+                    }
+
+                    bool alloc_ok = batch_reader->pipeline_active;
                     for (int32_t s = 0; s < depth && alloc_ok; s++) {
                         batch_reader->pipeline[s].col_readers = calloc(np, sizeof(carquet_column_reader_t*));
                         batch_reader->pipeline[s].col_values = calloc(np, sizeof(void*));
@@ -760,6 +834,28 @@ carquet_batch_reader_t* carquet_batch_reader_create(
                             batch_reader->pipeline = NULL;
                             batch_reader->pipeline_active = false;
                             alloc_ok = false;
+                        }
+                    }
+
+                    /* Optimization 3: pre-allocate value buffers based on
+                     * max row group size so pipeline_fill avoids malloc
+                     * storms on the hot path. */
+                    if (alloc_ok) {
+                        int64_t max_rg_rows = 0;
+                        for (int32_t r = 0; r < batch_reader->rg_order_len; r++) {
+                            int64_t rr = meta->row_groups[batch_reader->rg_order[r]].num_rows;
+                            if (rr > max_rg_rows) max_rg_rows = rr;
+                        }
+                        for (int32_t s = 0; s < depth; s++) {
+                            rg_slot_t* slot = &batch_reader->pipeline[s];
+                            for (int32_t i = 0; i < np; i++) {
+                                size_t needed = (size_t)max_rg_rows *
+                                                batch_reader->projected_value_sizes[i];
+                                if (needed > 0) {
+                                    slot->col_values[i] = malloc(needed);
+                                    slot->col_buf_sizes[i] = slot->col_values[i] ? needed : 0;
+                                }
+                            }
                         }
                     }
                 }
@@ -826,19 +922,260 @@ static carquet_status_t open_row_group_readers(
 static void bulk_read_task(void* arg) {
     bulk_read_arg_t* t = (bulk_read_arg_t*)arg;
     if (t->col_reader && t->dest && t->max_values > 0) {
-        *t->out_values_read = carquet_column_read_batch(
-            t->col_reader, t->dest, t->max_values, NULL, NULL);
+        if (can_coalesce_column(t->col_reader)) {
+            if (t->start_offset > 0 && t->end_offset > t->start_offset) {
+                coalesced_read_column_range(t->col_reader, t->data_base,
+                                            t->dest, t->max_values,
+                                            t->start_offset, t->end_offset,
+                                            t->out_values_read);
+            } else {
+                coalesced_read_column(t->col_reader, t->dest, t->max_values,
+                                      t->out_values_read);
+            }
+        } else {
+            *t->out_values_read = carquet_column_read_batch(
+                t->col_reader, t->dest, t->max_values, NULL, NULL);
+        }
     } else {
         *t->out_values_read = 0;
     }
+}
+
+/* ============================================================================
+ * Coalesced Column Chunk Read — Fast Path for Pipeline Mode
+ * ============================================================================
+ * Instead of the page-by-page carquet_column_read_batch path, this scans all
+ * page headers upfront and decompresses in a tight loop, writing directly to
+ * the output buffer. Eliminates intermediate buffers and per-page state machine
+ * overhead.
+ *
+ * Eligible: REQUIRED columns, fixed-width, PLAIN or BYTE_STREAM_SPLIT encoding,
+ * no dictionary, compressed, mmap available.
+ */
+
+static bool can_coalesce_column(const carquet_column_reader_t* cr) {
+    if (!cr || !cr->col_meta || !cr->file_reader || !cr->file_reader->mmap_data) return false;
+    if (cr->max_def_level > 0 || cr->max_rep_level > 0) return false;
+    if (cr->type == CARQUET_PHYSICAL_BOOLEAN || cr->type == CARQUET_PHYSICAL_BYTE_ARRAY) return false;
+    if (cr->col_meta->has_dictionary_page_offset) return false;
+    if (cr->col_meta->codec == CARQUET_COMPRESSION_UNCOMPRESSED) return false;
+    return true;
+}
+
+static void coalesced_read_column_range(
+    const carquet_column_reader_t* cr,
+    const uint8_t* data_base,
+    void* dest,
+    int64_t max_values,
+    int64_t start_offset,
+    int64_t end_offset,
+    int64_t* out_values_read) {
+
+    const carquet_reader_t* fr = cr->file_reader;
+    carquet_column_reader_t* reader = (carquet_column_reader_t*)cr;
+    const parquet_column_metadata_t* meta = cr->col_meta;
+    size_t file_size = fr->file_size;
+
+    size_t value_size = 0;
+    switch (cr->type) {
+        case CARQUET_PHYSICAL_INT32: case CARQUET_PHYSICAL_FLOAT: value_size = 4; break;
+        case CARQUET_PHYSICAL_INT64: case CARQUET_PHYSICAL_DOUBLE: value_size = 8; break;
+        case CARQUET_PHYSICAL_INT96: value_size = 12; break;
+        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY: value_size = (size_t)cr->type_length; break;
+        default: goto fallback;
+    }
+
+    int64_t offset = start_offset;
+    int64_t chunk_end = end_offset;
+    if (offset <= 0) offset = meta->data_page_offset;
+    if (chunk_end <= 0) chunk_end = meta->data_page_offset + meta->total_compressed_size;
+    if (offset < meta->data_page_offset || chunk_end > meta->data_page_offset + meta->total_compressed_size) {
+        goto fallback;
+    }
+    if (offset < 0 || chunk_end > (int64_t)file_size) goto fallback;
+
+    uint8_t* out = (uint8_t*)dest;
+    int64_t total_values = 0;
+
+    while (offset < chunk_end && total_values < max_values) {
+        /* Parse page header */
+        const uint8_t* ptr = data_base + offset;
+        size_t remaining = (size_t)(chunk_end - offset);
+        size_t max_hdr = remaining < 512 ? remaining : 512;
+
+        parquet_page_header_t hdr;
+        size_t hdr_size;
+        if (parquet_parse_page_header(ptr, max_hdr, &hdr, &hdr_size, NULL) != CARQUET_OK)
+            break;
+
+        if (hdr.type != CARQUET_PAGE_DATA && hdr.type != CARQUET_PAGE_DATA_V2)
+            break;
+
+        int32_t num_values = (hdr.type == CARQUET_PAGE_DATA_V2)
+            ? hdr.data_page_header_v2.num_values
+            : hdr.data_page_header.num_values;
+        carquet_encoding_t encoding = (hdr.type == CARQUET_PAGE_DATA_V2)
+            ? hdr.data_page_header_v2.encoding
+            : hdr.data_page_header.encoding;
+
+        if (num_values <= 0 || total_values + num_values > max_values) break;
+
+        const uint8_t* compressed = ptr + hdr_size;
+        size_t comp_size = (size_t)hdr.compressed_page_size;
+        size_t uncomp_size = (size_t)hdr.uncompressed_page_size;
+
+        if (encoding == CARQUET_ENCODING_PLAIN) {
+            /* Decompress directly to output — data IS the final values */
+            size_t actual;
+            if (carquet_decompress_page(meta->codec, compressed, comp_size,
+                                         out, uncomp_size, &actual) != CARQUET_OK)
+                break;
+        } else if (encoding == CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
+            /* Decompress to temp, then cache-tiled transpose to output */
+            if (uncomp_size > reader->decompress_capacity) {
+                uint8_t* new_buf = realloc(reader->decompress_buffer, uncomp_size);
+                if (!new_buf) {
+                    break;
+                }
+                reader->decompress_buffer = new_buf;
+                reader->decompress_capacity = uncomp_size;
+            }
+            size_t actual;
+            if (carquet_decompress_page(meta->codec, compressed, comp_size,
+                                         reader->decompress_buffer, uncomp_size, &actual) != CARQUET_OK)
+                break;
+            if (value_size == 4) {
+                if (carquet_byte_stream_split_decode_float(
+                        reader->decompress_buffer, actual, (float*)out, num_values) != CARQUET_OK) {
+                    break;
+                }
+            } else {
+                if (carquet_byte_stream_split_decode_double(
+                        reader->decompress_buffer, actual, (double*)out, num_values) != CARQUET_OK) {
+                    break;
+                }
+            }
+        } else {
+            /* Unsupported encoding — bail to fallback */
+            goto fallback;
+        }
+
+        out += (size_t)num_values * value_size;
+        total_values += num_values;
+        offset += (int64_t)hdr_size + (int64_t)comp_size;
+    }
+
+    *out_values_read = total_values;
+    return;
+
+fallback:
+    /* Fall back to standard page-by-page reader */
+    *out_values_read = carquet_column_read_batch(
+        (carquet_column_reader_t*)cr, dest, max_values, NULL, NULL);
+}
+
+static void coalesced_read_column(
+    const carquet_column_reader_t* cr,
+    void* dest,
+    int64_t max_values,
+    int64_t* out_values_read) {
+    coalesced_read_column_range(cr, cr->file_reader->mmap_data,
+                                dest, max_values, 0, 0, out_values_read);
+}
+
+/**
+ * Plan N-way split of a column chunk for parallel decompression.
+ * Walks page headers to find page-aligned boundaries that divide the chunk
+ * into roughly equal pieces (by value count).
+ *
+ * @param cr          Column reader (must pass can_coalesce_column)
+ * @param max_values  Total values in the column chunk
+ * @param max_splits  Maximum number of splits to produce (>= 2)
+ * @param split_offsets  Output: [max_splits+1] byte offsets (start of each segment + end)
+ * @param split_values   Output: [max_splits+1] cumulative value counts at each boundary
+ * @return Number of segments (>= 2 on success, 0 if split not possible)
+ */
+static int32_t plan_coalesced_column_splits(
+    const carquet_column_reader_t* cr,
+    const uint8_t* data_base,
+    int64_t max_values,
+    int32_t max_splits,
+    int64_t* split_offsets,
+    int64_t* split_values) {
+
+    if (!split_offsets || !split_values || !can_coalesce_column(cr)) return 0;
+    if (max_splits < 2) return 0;
+    if (cr->col_meta->codec != CARQUET_COMPRESSION_ZSTD &&
+        cr->col_meta->codec != CARQUET_COMPRESSION_LZ4 &&
+        cr->col_meta->codec != CARQUET_COMPRESSION_LZ4_RAW) {
+        return 0;
+    }
+    if (max_values < 100000) return 0;
+
+    const carquet_reader_t* fr = cr->file_reader;
+    const parquet_column_metadata_t* meta = cr->col_meta;
+    int64_t offset = meta->data_page_offset;
+    int64_t chunk_end = offset + meta->total_compressed_size;
+    if (offset < 0 || chunk_end > (int64_t)fr->file_size) return 0;
+
+    /* First segment starts at the beginning */
+    split_offsets[0] = offset;
+    split_values[0] = 0;
+    int32_t num_segments = 1;
+
+    int64_t target_per_split = max_values / max_splits;
+    /* Need at least 50k values per segment to be worthwhile */
+    if (target_per_split < 50000) {
+        max_splits = (int32_t)(max_values / 50000);
+        if (max_splits < 2) return 0;
+        target_per_split = max_values / max_splits;
+    }
+    int64_t next_target = target_per_split;
+    int64_t values_so_far = 0;
+
+    while (offset < chunk_end) {
+        const uint8_t* ptr = data_base + offset;
+        size_t remaining = (size_t)(chunk_end - offset);
+        size_t max_hdr = remaining < 512 ? remaining : 512;
+
+        parquet_page_header_t hdr;
+        size_t hdr_size;
+        if (parquet_parse_page_header(ptr, max_hdr, &hdr, &hdr_size, NULL) != CARQUET_OK)
+            return 0;
+
+        if (hdr.type != CARQUET_PAGE_DATA && hdr.type != CARQUET_PAGE_DATA_V2)
+            return 0;
+
+        int32_t num_values = (hdr.type == CARQUET_PAGE_DATA_V2)
+            ? hdr.data_page_header_v2.num_values
+            : hdr.data_page_header.num_values;
+        if (num_values <= 0) return 0;
+
+        values_so_far += num_values;
+        offset += (int64_t)hdr_size + (int64_t)hdr.compressed_page_size;
+
+        /* Place a split boundary when we've accumulated enough values,
+         * but only if there's still data remaining for the next segment. */
+        if (values_so_far >= next_target && offset < chunk_end &&
+            num_segments < max_splits) {
+            split_offsets[num_segments] = offset;
+            split_values[num_segments] = values_so_far;
+            num_segments++;
+            next_target = values_so_far + target_per_split;
+        }
+    }
+
+    /* Close the final segment */
+    split_offsets[num_segments] = chunk_end;
+    split_values[num_segments] = values_so_far;
+
+    return (num_segments >= 2) ? num_segments : 0;
 }
 
 /**
  * Fill pipeline slots by reading entire column chunks in parallel.
  * Each task reads ALL values from one column in one row group.
  */
-static bulk_read_arg_t pipeline_task_args[512]; /* Max tasks in flight */
-
 static void pipeline_fill(carquet_batch_reader_t* br) {
     if (!br->pipeline_active || !br->pool) return;
 
@@ -869,13 +1206,13 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
                 }
             }
 
-            /* Ensure value buffer is large enough */
+            /* Ensure value buffer is large enough (grow-only via realloc) */
             size_t needed = (size_t)rg_rows * br->projected_value_sizes[i];
             if (needed > slot->col_buf_sizes[i]) {
-                free(slot->col_values[i]);
-                slot->col_values[i] = malloc(needed);
-                slot->col_buf_sizes[i] = slot->col_values[i] ? needed : 0;
-                if (!slot->col_values[i]) return;
+                void* new_buf = realloc(slot->col_values[i], needed);
+                if (!new_buf) return;
+                slot->col_values[i] = new_buf;
+                slot->col_buf_sizes[i] = needed;
             }
         }
 
@@ -884,18 +1221,104 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
         slot->total_rows = rg_rows;
         slot->rows_consumed = 0;
 
-        /* Submit one bulk-read task per column.
-         * Each task reads ALL values (all pages) from the column chunk. */
-        int32_t base = br->pipeline_count * br->num_projected;
+        /* Create an independent mmap for this row group's byte range.
+         * Each slot gets its own virtual mapping, so worker threads fault
+         * pages into independent page tables without contending on the
+         * shared mmap's page table lock.  Falls back to the shared mmap
+         * if the per-slot mmap fails. */
+        const uint8_t* slot_data = br->reader->mmap_data;  /* fallback */
+#if !defined(_WIN32)
+        if (br->reader->mmap_info && br->reader->mmap_info->fd >= 0) {
+            /* Find byte range spanning all projected column chunks */
+            int64_t range_lo = INT64_MAX, range_hi = 0;
+            for (int32_t i = 0; i < br->num_projected; i++) {
+                const parquet_column_metadata_t* cmeta = slot->col_readers[i]->col_meta;
+                if (cmeta && cmeta->total_compressed_size > 0 && cmeta->data_page_offset >= 0) {
+                    int64_t lo = cmeta->data_page_offset;
+                    int64_t hi = lo + cmeta->total_compressed_size;
+                    if (lo < range_lo) range_lo = lo;
+                    if (hi > range_hi) range_hi = hi;
+                }
+            }
+            if (range_lo < range_hi) {
+                /* Page-align the range for mmap */
+                int64_t page_lo = range_lo & ~(int64_t)4095;
+                size_t mmap_len = (size_t)(range_hi - page_lo);
+                uint8_t* m = (uint8_t*)mmap(NULL, mmap_len, PROT_READ, MAP_PRIVATE,
+                                             br->reader->mmap_info->fd, (off_t)page_lo);
+                if (m != MAP_FAILED) {
+                    /* Unmap previous slot mmap if it exists (reuse across fills) */
+                    if (slot->slot_mmap && slot->slot_mmap_size > 0)
+                        munmap(slot->slot_mmap, slot->slot_mmap_size);
+                    slot->slot_mmap = m;
+                    slot->slot_mmap_size = mmap_len;
+                    slot->slot_mmap_offset = page_lo;
+                    /* data_base[file_offset] = slot_mmap[file_offset - page_lo]
+                     * so data_base = slot_mmap - page_lo */
+                    slot_data = m - page_lo;
+                }
+            }
+        }
+#endif
+
+        /* Submit tasks for parallel decompression.  Each compressed column
+         * is split into up to N page-aligned segments (N ≈ num_threads /
+         * num_columns) so that all worker threads stay busy even when the
+         * file has very few row groups. */
+        int32_t max_splits_per_col = br->pool->num_threads;
+        if (br->num_projected > 0)
+            max_splits_per_col = br->pool->num_threads / br->num_projected;
+        if (max_splits_per_col < 2) max_splits_per_col = 2;
+
+        /* Bound by task_args space available for this pipeline slot */
+        int32_t tasks_per_slot = br->task_args_capacity / (br->pipeline_depth > 0 ? br->pipeline_depth : 1);
+        int32_t base = br->pipeline_count * tasks_per_slot;
+        int32_t task_offset = 0;
+
+        int64_t split_offsets[513];
+        int64_t split_values_arr[513];
+
         for (int32_t i = 0; i < br->num_projected; i++) {
-            int32_t tidx = base + i;
-            if (tidx >= 512) break; /* Safety limit */
-            pipeline_task_args[tidx].col_reader = slot->col_readers[i];
-            pipeline_task_args[tidx].dest = slot->col_values[i];
-            pipeline_task_args[tidx].max_values = rg_rows;
-            pipeline_task_args[tidx].out_values_read = &slot->col_num_values[i];
-            carquet_worker_pool_submit(br->pool, bulk_read_task,
-                                       &pipeline_task_args[tidx]);
+            int32_t nseg = plan_coalesced_column_splits(
+                slot->col_readers[i], slot_data,
+                rg_rows, max_splits_per_col,
+                split_offsets, split_values_arr);
+
+            if (nseg >= 2 && base + task_offset + nseg <= br->task_args_capacity) {
+                size_t value_size = br->projected_value_sizes[i];
+                slot->col_num_values[i] = rg_rows;
+
+                for (int32_t s = 0; s < nseg; s++) {
+                    int32_t tidx = base + task_offset++;
+                    int64_t seg_start_val = split_values_arr[s];
+                    int64_t seg_end_val = split_values_arr[s + 1];
+
+                    br->task_args[tidx].col_reader = slot->col_readers[i];
+                    br->task_args[tidx].data_base = slot_data;
+                    br->task_args[tidx].dest = (uint8_t*)slot->col_values[i] +
+                                               (size_t)seg_start_val * value_size;
+                    br->task_args[tidx].max_values = seg_end_val - seg_start_val;
+                    br->task_args[tidx].out_values_read = &br->task_args[tidx].local_values_read;
+                    br->task_args[tidx].start_offset = split_offsets[s];
+                    br->task_args[tidx].end_offset = split_offsets[s + 1];
+                    br->task_args[tidx].local_values_read = 0;
+                    carquet_worker_pool_submit(br->pool, bulk_read_task,
+                                               &br->task_args[tidx]);
+                }
+            } else {
+                int32_t tidx = base + task_offset++;
+                if (tidx >= br->task_args_capacity) break;
+                br->task_args[tidx].col_reader = slot->col_readers[i];
+                br->task_args[tidx].data_base = slot_data;
+                br->task_args[tidx].dest = slot->col_values[i];
+                br->task_args[tidx].max_values = rg_rows;
+                br->task_args[tidx].out_values_read = &slot->col_num_values[i];
+                br->task_args[tidx].start_offset = 0;
+                br->task_args[tidx].end_offset = 0;
+                br->task_args[tidx].local_values_read = 0;
+                carquet_worker_pool_submit(br->pool, bulk_read_task,
+                                           &br->task_args[tidx]);
+            }
         }
 
         br->pipeline_count++;
@@ -1244,12 +1667,21 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
             }
             free(slot->col_buf_sizes);
             free(slot->col_num_values);
+#if !defined(_WIN32)
+            if (slot->slot_mmap && slot->slot_mmap_size > 0)
+                munmap(slot->slot_mmap, slot->slot_mmap_size);
+#endif
         }
         free(batch_reader->pipeline);
     }
 
-    /* Destroy worker pool */
-    carquet_worker_pool_destroy(batch_reader->pool);
+    /* Free per-reader task args */
+    free(batch_reader->task_args);
+
+    /* Destroy worker pool (only if we created it) */
+    if (!batch_reader->pool_is_borrowed) {
+        carquet_worker_pool_destroy(batch_reader->pool);
+    }
 
     /* Free column readers */
     if (batch_reader->col_readers) {
@@ -1284,6 +1716,27 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
     free(batch_reader->projected_types);
     free(batch_reader->projected_columns);
     free(batch_reader);
+}
+
+/* ============================================================================
+ * Public Thread Pool API
+ * ============================================================================
+ */
+
+carquet_thread_pool_t* carquet_thread_pool_create(int32_t num_threads) {
+    if (num_threads <= 0) {
+#ifdef _OPENMP
+        num_threads = omp_get_max_threads();
+#else
+        num_threads = 4;
+#endif
+    }
+    if (num_threads < 2) num_threads = 2;
+    return (carquet_thread_pool_t*)carquet_worker_pool_create(num_threads);
+}
+
+void carquet_thread_pool_destroy(carquet_thread_pool_t* pool) {
+    carquet_worker_pool_destroy((carquet_worker_pool_t*)pool);
 }
 
 /* ============================================================================

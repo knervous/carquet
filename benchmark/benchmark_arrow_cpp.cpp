@@ -7,6 +7,7 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -25,6 +26,8 @@
 
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/writer.h>
+#include <parquet/column_reader.h>
+#include <parquet/file_reader.h>
 #include <parquet/properties.h>
 
 #define WARMUP_ITERATIONS 3
@@ -184,11 +187,6 @@ static bool take_result(const char* what, arrow::Result<T> result, T* out) {
     return true;
 }
 
-typedef struct {
-    std::shared_ptr<arrow::Table> table;
-    std::string error;
-} row_group_read_result_t;
-
 static bool build_file_reader(const char* filename, bool use_threads,
                               std::unique_ptr<parquet::arrow::FileReader>* out) {
     parquet::ReaderProperties reader_props;
@@ -211,21 +209,6 @@ static bool build_file_reader(const char* filename, bool use_threads,
 
     (*out)->set_use_threads(use_threads);
     return true;
-}
-
-static row_group_read_result_t read_row_group_table(const char* filename, int row_group_index) {
-    row_group_read_result_t result;
-    std::unique_ptr<parquet::arrow::FileReader> reader;
-    if (!build_file_reader(filename, false, &reader)) {
-        result.error = "failed to create file reader";
-        return result;
-    }
-
-    arrow::Status status = reader->ReadRowGroup(row_group_index, &result.table);
-    if (!status.ok()) {
-        result.error = status.ToString();
-    }
-    return result;
 }
 
 static std::unique_ptr<test_data_t> test_data_create(int num_rows) {
@@ -354,56 +337,143 @@ static double benchmark_write(const char* filename, const test_data_t* td,
     return get_time_ms() - start;
 }
 
+/**
+ * Low-level Parquet read benchmark.
+ *
+ * Uses parquet::ParquetFileReader directly (NOT the Arrow conversion layer).
+ * This measures pure Parquet I/O + decompression + decoding — the same work
+ * that Carquet's batch reader does — without the overhead of materializing
+ * Arrow Tables, allocating Arrow arrays, or converting between type systems.
+ *
+ * Row groups are read in parallel using std::async, matching the parallelism
+ * strategy that Carquet's pipeline uses.
+ */
+
+struct rg_read_result_t {
+    int64_t rows;
+    int64_t checksum;
+};
+
+static rg_read_result_t read_row_group_lowlevel(
+    const char* filename, int rg_index, int64_t rg_rows, int num_columns) {
+
+    rg_read_result_t result = {0, 0};
+
+    parquet::ReaderProperties props = parquet::default_reader_properties();
+    props.set_page_checksum_verification(false);
+    props.enable_buffered_stream();
+    props.set_buffer_size(4 * 1024 * 1024);
+
+    std::unique_ptr<parquet::ParquetFileReader> reader;
+    try {
+        reader = parquet::ParquetFileReader::OpenFile(filename, true, props);
+    } catch (...) {
+        return result;
+    }
+
+    auto rg_reader = reader->RowGroup(rg_index);
+
+    std::vector<int64_t> col0_buf(rg_rows);
+    std::vector<double>  col1_buf(rg_rows);
+    std::vector<int32_t> col2_buf(rg_rows);
+
+    for (int col = 0; col < num_columns && col < 3; col++) {
+        auto col_reader = rg_reader->Column(col);
+        int64_t values_read = 0;
+        int64_t rows_remaining = rg_rows;
+
+        while (col_reader->HasNext() && rows_remaining > 0) {
+            int64_t batch;
+            if (col == 0) {
+                batch = static_cast<parquet::Int64Reader*>(col_reader.get())
+                    ->ReadBatch(rows_remaining, nullptr, nullptr,
+                                col0_buf.data() + (rg_rows - rows_remaining),
+                                &values_read);
+            } else if (col == 1) {
+                batch = static_cast<parquet::DoubleReader*>(col_reader.get())
+                    ->ReadBatch(rows_remaining, nullptr, nullptr,
+                                col1_buf.data() + (rg_rows - rows_remaining),
+                                &values_read);
+            } else {
+                batch = static_cast<parquet::Int32Reader*>(col_reader.get())
+                    ->ReadBatch(rows_remaining, nullptr, nullptr,
+                                col2_buf.data() + (rg_rows - rows_remaining),
+                                &values_read);
+            }
+            rows_remaining -= batch;
+        }
+    }
+
+    if (rg_rows > 0) {
+        result.checksum += col0_buf[0] + col0_buf[rg_rows - 1];
+        result.checksum += static_cast<int64_t>(col1_buf[0] + col1_buf[rg_rows - 1]);
+        result.checksum += col2_buf[0] + col2_buf[rg_rows - 1];
+    }
+    result.rows = rg_rows;
+    return result;
+}
+
 static double benchmark_read(const char* filename, int expected_rows) {
     double start = get_time_ms();
 
-    std::unique_ptr<parquet::arrow::FileReader> reader;
-    if (!build_file_reader(filename, true, &reader)) {
+    /* Open once to read metadata */
+    parquet::ReaderProperties props = parquet::default_reader_properties();
+    props.set_page_checksum_verification(false);
+
+    std::unique_ptr<parquet::ParquetFileReader> reader;
+    try {
+        reader = parquet::ParquetFileReader::OpenFile(filename, true, props);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "Failed to open %s: %s\n", filename, e.what());
         return -1.0;
     }
 
-    std::shared_ptr<arrow::Table> table;
-    int num_row_groups = reader->num_row_groups();
-    if (num_row_groups > 1) {
-        std::vector<std::future<row_group_read_result_t>> futures;
-        futures.reserve(num_row_groups);
-        for (int rg = 0; rg < num_row_groups; ++rg) {
-            futures.push_back(std::async(std::launch::async, [filename, rg]() {
-                return read_row_group_table(filename, rg);
-            }));
-        }
+    auto file_meta = reader->metadata();
+    int num_row_groups = file_meta->num_row_groups();
+    int num_columns = file_meta->num_columns();
 
-        std::vector<std::shared_ptr<arrow::Table>> row_group_tables(num_row_groups);
-        for (int rg = 0; rg < num_row_groups; ++rg) {
-            row_group_read_result_t result = futures[rg].get();
-            if (!result.error.empty()) {
-                std::fprintf(stderr, "Read row group %d: %s\n", rg, result.error.c_str());
-                return -1.0;
-            }
-            row_group_tables[rg] = std::move(result.table);
-        }
+    /* Collect row group sizes before closing the metadata reader */
+    std::vector<int64_t> rg_sizes(num_row_groups);
+    for (int i = 0; i < num_row_groups; i++)
+        rg_sizes[i] = file_meta->RowGroup(i)->num_rows();
+    reader.reset();
 
-        if (!take_result("Concatenate row groups",
-                         arrow::ConcatenateTables(row_group_tables),
-                         &table)) {
-            return -1.0;
-        }
-    } else if (!check_status("Read table", reader->ReadTable(&table))) {
-        return -1.0;
-    }
-
+    /* Read row groups in parallel — each opens its own file reader
+     * (independent mmap/buffered I/O, matching Carquet's per-slot mmap). */
+    int64_t total_rows = 0;
     volatile int64_t checksum = 0;
-    accumulate_first_last<arrow::Int64Array>(table->column(0), &checksum);
-    accumulate_first_last<arrow::DoubleArray>(table->column(1), &checksum);
-    accumulate_first_last<arrow::Int32Array>(table->column(2), &checksum);
+
+    if (num_row_groups > 1) {
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 4;
+        int max_parallel = static_cast<int>(hw);
+        if (max_parallel > num_row_groups) max_parallel = num_row_groups;
+
+        std::vector<std::future<rg_read_result_t>> futures;
+        futures.reserve(num_row_groups);
+        for (int rg = 0; rg < num_row_groups; rg++) {
+            futures.push_back(std::async(
+                std::launch::async,
+                read_row_group_lowlevel, filename, rg, rg_sizes[rg], num_columns));
+        }
+        for (auto& f : futures) {
+            auto r = f.get();
+            total_rows += r.rows;
+            checksum += r.checksum;
+        }
+    } else {
+        /* Single row group — read directly, no async overhead */
+        auto r = read_row_group_lowlevel(filename, 0, rg_sizes[0], num_columns);
+        total_rows = r.rows;
+        checksum = r.checksum;
+    }
     (void)checksum;
 
-    if (table->num_rows() != expected_rows) {
+    if (total_rows != expected_rows) {
         std::fprintf(stderr, "Warning: row count mismatch %lld vs %d\n",
-                     static_cast<long long>(table->num_rows()), expected_rows);
+                     static_cast<long long>(total_rows), expected_rows);
     }
-    table.reset();
-    reader.reset();
+
     return get_time_ms() - start;
 }
 
@@ -490,7 +560,8 @@ static bool run_benchmark(const char* dataset_name, int num_rows,
     std::printf("CSV:arrow_cpp,%s,%s,%d,%.2f,%.2f,%ld\n",
                 dataset_name, compression_name, num_rows, write_med, read_med, file_size);
 
-    std::remove(filename);
+    /* File is NOT removed here — the orchestrator handles cleanup
+     * after cross-read benchmarking is done. */
     return true;
 }
 
@@ -512,12 +583,84 @@ static int find_compression(const char* name, compression_config_t* comps, int n
     return -1;
 }
 
+static int run_crossread(const char* filename) {
+    /* Open file to get row count from metadata */
+    std::unique_ptr<parquet::arrow::FileReader> reader;
+    if (!build_file_reader(filename, true, &reader)) {
+        std::fprintf(stderr, "Failed to open %s\n", filename);
+        return 1;
+    }
+
+    int64_t num_rows = reader->parquet_reader()->metadata()->num_rows();
+    reader.reset();
+
+    if (num_rows <= 0) {
+        std::fprintf(stderr, "File %s has no rows\n", filename);
+        return 1;
+    }
+
+    int expected_rows = static_cast<int>(num_rows);
+    long file_size = get_file_size(filename);
+
+    /* Scale iterations based on row count */
+    int iters;
+    const char* iter_env = std::getenv("CARQUET_BENCH_ITERATIONS");
+    if (iter_env && std::atoi(iter_env) > 0) {
+        iters = std::atoi(iter_env);
+        if (iters > MAX_BENCH_ITERATIONS) iters = MAX_BENCH_ITERATIONS;
+    } else if (num_rows <= 100000) {
+        iters = BENCH_ITERATIONS_SMALL;
+    } else if (num_rows <= 1000000) {
+        iters = BENCH_ITERATIONS_MEDIUM;
+    } else {
+        iters = BENCH_ITERATIONS_LARGE;
+    }
+
+    /* Purge file cache before reads */
+    purge_file_cache(filename);
+
+    /* Warmup reads */
+    for (int i = 0; i < WARMUP_ITERATIONS; ++i) {
+        double t = benchmark_read(filename, expected_rows);
+        if (t <= 0.0) {
+            std::fprintf(stderr, "Warmup read failed for %s\n", filename);
+            return 1;
+        }
+    }
+
+    /* Measured reads */
+    double read_times[MAX_BENCH_ITERATIONS];
+    for (int i = 0; i < iters; ++i) {
+        read_times[i] = benchmark_read(filename, expected_rows);
+        if (read_times[i] <= 0.0) {
+            std::fprintf(stderr, "Benchmark read failed for %s\n", filename);
+            return 1;
+        }
+    }
+
+    double read_med = trimmed_median(read_times, iters);
+
+    std::printf("CSV:arrow_cpp,crossread,external,%d,0.00,%.2f,%ld\n",
+                expected_rows, read_med, file_size);
+
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     std::setvbuf(stdout, NULL, _IONBF, 0);
 
     if (argc == 2 && std::strcmp(argv[1], "--version") == 0) {
         std::printf("%s\n", ARROW_VERSION_STRING);
         return 0;
+    }
+
+    /* read <filename> subcommand for cross-read benchmarking */
+    if (argc == 2 && std::strcmp(argv[1], "read") == 0) {
+        std::fprintf(stderr, "Usage: %s read <filename>\n", argv[0]);
+        return 1;
+    }
+    if (argc >= 3 && std::strcmp(argv[1], "read") == 0) {
+        return run_crossread(argv[2]);
     }
 
     dataset_t datasets[] = {

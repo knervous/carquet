@@ -104,7 +104,7 @@ static size_t prebuf_read_at(carquet_reader_t* file_reader,
  * ============================================================================
  */
 
-static carquet_status_t decompress_page(
+carquet_status_t carquet_decompress_page(
     carquet_compression_t codec,
     const uint8_t* compressed,
     size_t compressed_size,
@@ -1211,7 +1211,7 @@ static carquet_status_t load_dictionary_page_mmap(
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
 
-        status = decompress_page(col_meta->codec,
+        status = carquet_decompress_page(col_meta->codec,
             compressed, page_header.compressed_page_size,
             decompressed, page_header.uncompressed_page_size, &page_size);
 
@@ -1326,7 +1326,7 @@ static carquet_status_t load_dictionary_page_fread(
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
 
-        status = decompress_page(col_meta->codec,
+        status = carquet_decompress_page(col_meta->codec,
             compressed, page_header.compressed_page_size,
             page_data, page_header.uncompressed_page_size, &page_size);
         free(compressed);
@@ -1503,13 +1503,12 @@ static carquet_status_t load_next_page_mmap(
             size_t total_needed = levels_size + uncompressed_data_size;
 
             if (total_needed > reader->decompress_capacity) {
-                free(reader->decompress_buffer);
-                reader->decompress_buffer = malloc(total_needed);
-                if (!reader->decompress_buffer) {
-                    reader->decompress_capacity = 0;
+                uint8_t* new_buf = realloc(reader->decompress_buffer, total_needed);
+                if (!new_buf) {
                     CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate V2 decompress buffer");
                     return CARQUET_ERROR_OUT_OF_MEMORY;
                 }
+                reader->decompress_buffer = new_buf;
                 reader->decompress_capacity = total_needed;
             }
             decompressed = reader->decompress_buffer;
@@ -1519,7 +1518,7 @@ static carquet_status_t load_next_page_mmap(
 
             /* Decompress data portion */
             size_t decompressed_data_size;
-            status = decompress_page(col_meta->codec,
+            status = carquet_decompress_page(col_meta->codec,
                 page_data_ptr + levels_size, compressed_data_size,
                 decompressed + levels_size, uncompressed_data_size,
                 &decompressed_data_size);
@@ -1544,18 +1543,17 @@ static carquet_status_t load_next_page_mmap(
             /* Must decompress - reuse buffer across pages when possible */
             size_t needed = page_header.uncompressed_page_size;
             if (needed > reader->decompress_capacity) {
-                free(reader->decompress_buffer);
-                reader->decompress_buffer = malloc(needed);
-                if (!reader->decompress_buffer) {
-                    reader->decompress_capacity = 0;
+                uint8_t* new_buf = realloc(reader->decompress_buffer, needed);
+                if (!new_buf) {
                     CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate decompress buffer");
                     return CARQUET_ERROR_OUT_OF_MEMORY;
                 }
+                reader->decompress_buffer = new_buf;
                 reader->decompress_capacity = needed;
             }
             decompressed = reader->decompress_buffer;
 
-            status = decompress_page(col_meta->codec,
+            status = carquet_decompress_page(col_meta->codec,
                 page_data_ptr, page_header.compressed_page_size,
                 decompressed, page_header.uncompressed_page_size, &page_size);
 
@@ -1758,7 +1756,7 @@ static carquet_status_t load_next_page_fread(
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
 
-        status = decompress_page(col_meta->codec,
+        status = carquet_decompress_page(col_meta->codec,
             compressed, page_header.compressed_page_size,
             page_data, page_header.uncompressed_page_size, &page_size);
 
@@ -1806,7 +1804,7 @@ static carquet_status_t load_next_page_fread(
             memcpy(reader->decompress_buffer, page_data, levels_size);
 
             size_t decompressed_data_size;
-            status = decompress_page(col_meta->codec,
+            status = carquet_decompress_page(col_meta->codec,
                 page_data + levels_size, compressed_data_size,
                 reader->decompress_buffer + levels_size, uncompressed_data_size,
                 &decompressed_data_size);

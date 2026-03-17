@@ -21,6 +21,10 @@ extern void carquet_dispatch_byte_split_decode_float(const uint8_t* data, int64_
 extern void carquet_dispatch_byte_split_encode_double(const double* values, int64_t count, uint8_t* output);
 extern void carquet_dispatch_byte_split_decode_double(const uint8_t* data, int64_t count, double* values);
 
+/* Large pages benefit from a cache-tiled gather before the SIMD transpose. */
+void carquet_bss_decode_float_tiled(const uint8_t* data, int64_t count, float* values);
+void carquet_bss_decode_double_tiled(const uint8_t* data, int64_t count, double* values);
+
 /* ============================================================================
  * Float Encoding (32-bit, 4 bytes)
  * ============================================================================
@@ -64,8 +68,7 @@ carquet_status_t carquet_byte_stream_split_decode_float(
         return CARQUET_ERROR_DECODE;
     }
 
-    /* Use SIMD-optimized un-transpose */
-    carquet_dispatch_byte_split_decode_float(data, count, values);
+    carquet_bss_decode_float_tiled(data, count, values);
 
     return CARQUET_OK;
 }
@@ -113,10 +116,81 @@ carquet_status_t carquet_byte_stream_split_decode_double(
         return CARQUET_ERROR_DECODE;
     }
 
-    /* Use SIMD-optimized un-transpose */
-    carquet_dispatch_byte_split_decode_double(data, count, values);
+    carquet_bss_decode_double_tiled(data, count, values);
 
     return CARQUET_OK;
+}
+
+/* ============================================================================
+ * Cache-Tiled BSS Decode
+ * ============================================================================
+ * The standard BSS decode reads from S interleaved streams, each N values
+ * apart. For large pages (N > 64K), the S stream heads are spread beyond
+ * L2 cache, causing heavy cache misses.
+ *
+ * The tiled version gathers a tile of stream data into a contiguous buffer
+ * that fits in L2 cache, then transposes from that hot buffer. This trades
+ * one sequential memcpy pass for dramatically better cache behavior during
+ * the SIMD transpose.
+ *
+ * Tile size chosen so S streams × tile_bytes ≤ L2 cache (~256KB):
+ * - float (S=4):  tile = 64K values = 256KB
+ * - double (S=8): tile = 32K values = 256KB
+ */
+
+#define BSS_TILE_FLOAT  65536
+#define BSS_TILE_DOUBLE 32768
+
+void carquet_bss_decode_float_tiled(const uint8_t* data, int64_t count, float* values) {
+    /* Small counts: direct decode, no tiling overhead */
+    if (count <= BSS_TILE_FLOAT) {
+        carquet_dispatch_byte_split_decode_float(data, count, values);
+        return;
+    }
+
+    /* Stack-allocate tile buffer: 4 streams × TILE bytes = 256KB */
+    uint8_t tile[4 * BSS_TILE_FLOAT];
+    int64_t offset = 0;
+
+    while (offset < count) {
+        int64_t n = count - offset;
+        if (n > BSS_TILE_FLOAT) n = BSS_TILE_FLOAT;
+
+        /* Gather: copy n bytes from each of 4 streams into contiguous tile */
+        for (int s = 0; s < 4; s++) {
+            memcpy(tile + (size_t)s * n, data + (size_t)s * count + offset, (size_t)n);
+        }
+
+        /* Transpose from L2-hot tile buffer */
+        carquet_dispatch_byte_split_decode_float(tile, n, values + offset);
+        offset += n;
+    }
+}
+
+void carquet_bss_decode_double_tiled(const uint8_t* data, int64_t count, double* values) {
+    /* Small counts: direct decode, no tiling overhead */
+    if (count <= BSS_TILE_DOUBLE) {
+        carquet_dispatch_byte_split_decode_double(data, count, values);
+        return;
+    }
+
+    /* Stack-allocate tile buffer: 8 streams × TILE bytes = 256KB */
+    uint8_t tile[8 * BSS_TILE_DOUBLE];
+    int64_t offset = 0;
+
+    while (offset < count) {
+        int64_t n = count - offset;
+        if (n > BSS_TILE_DOUBLE) n = BSS_TILE_DOUBLE;
+
+        /* Gather: copy n bytes from each of 8 streams into contiguous tile */
+        for (int s = 0; s < 8; s++) {
+            memcpy(tile + (size_t)s * n, data + (size_t)s * count + offset, (size_t)n);
+        }
+
+        /* Transpose from L2-hot tile buffer */
+        carquet_dispatch_byte_split_decode_double(tile, n, values + offset);
+        offset += n;
+    }
 }
 
 /* ============================================================================
@@ -181,12 +255,12 @@ carquet_status_t carquet_byte_stream_split_decode(
     }
 
     if (type_length == 4) {
-        carquet_dispatch_byte_split_decode_float(data, count, (float*)values);
+        carquet_bss_decode_float_tiled(data, count, (float*)values);
         return CARQUET_OK;
     }
 
     if (type_length == 8) {
-        carquet_dispatch_byte_split_decode_double(data, count, (double*)values);
+        carquet_bss_decode_double_tiled(data, count, (double*)values);
         return CARQUET_OK;
     }
 

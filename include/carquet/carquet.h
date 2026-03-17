@@ -470,6 +470,9 @@ typedef struct carquet_bloom_filter carquet_bloom_filter_t;
 /** @brief Column index (per-page min/max statistics) */
 typedef struct carquet_column_index carquet_column_index_t;
 
+/** @brief Reusable thread pool for parallel reading */
+typedef struct carquet_worker_pool carquet_thread_pool_t;
+
 /** @brief Offset index (per-page file locations) */
 typedef struct carquet_offset_index carquet_offset_index_t;
 
@@ -1597,6 +1600,21 @@ typedef struct carquet_batch_reader_config {
      * Default: false
      */
     bool preserve_dictionaries;
+
+    /**
+     * @brief External thread pool for parallel decompression.
+     *
+     * When non-NULL, the batch reader borrows this pool instead of creating
+     * and destroying its own threads per reader. This avoids pthread
+     * create/join overhead (~1-2ms) on every read. Create with
+     * carquet_thread_pool_create() and reuse across multiple batch readers.
+     *
+     * The caller retains ownership and must call carquet_thread_pool_destroy()
+     * after all batch readers using it have been freed.
+     *
+     * Default: NULL (batch reader creates its own pool)
+     */
+    carquet_thread_pool_t* thread_pool;
 } carquet_batch_reader_config_t;
 
 /**
@@ -1608,6 +1626,30 @@ typedef struct carquet_batch_reader_config {
  */
 CARQUET_API CARQUET_NONNULL(1)
 void carquet_batch_reader_config_init(carquet_batch_reader_config_t* config);
+
+/**
+ * @brief Create a reusable thread pool for parallel reading.
+ *
+ * Pass the returned pool to carquet_batch_reader_config_t::thread_pool
+ * to avoid thread create/join overhead on every batch reader.
+ *
+ * @param[in] num_threads Number of worker threads (0 = auto-detect)
+ * @return Thread pool, or NULL on failure
+ *
+ * @note Thread-safe: Yes (the pool itself serializes internally)
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_thread_pool_t* carquet_thread_pool_create(int32_t num_threads);
+
+/**
+ * @brief Destroy a thread pool.
+ *
+ * All batch readers using this pool must be freed first.
+ *
+ * @param[in] pool Thread pool to destroy (may be NULL)
+ */
+CARQUET_API
+void carquet_thread_pool_destroy(carquet_thread_pool_t* pool);
 
 /**
  * @brief Create a batch reader for efficient columnar reading.

@@ -212,6 +212,19 @@ carquet_status_t carquet_column_ensure_page_loaded(
     carquet_column_reader_t* reader,
     carquet_error_t* error);
 
+/* ============================================================================
+ * Page Decompression (shared between page_reader and batch_reader)
+ * ============================================================================
+ */
+
+carquet_status_t carquet_decompress_page(
+    carquet_compression_t codec,
+    const uint8_t* compressed,
+    size_t compressed_size,
+    uint8_t* decompressed,
+    size_t decompressed_capacity,
+    size_t* decompressed_size);
+
 #ifdef __cplusplus
 }
 #endif

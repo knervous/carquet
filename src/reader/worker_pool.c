@@ -26,6 +26,8 @@ static DWORD WINAPI worker_thread_func(LPVOID arg);
 #define POOL_BROADCAST_WORK(p) WakeAllConditionVariable(&(p)->work_available)
 #define POOL_SIGNAL_DONE(p) WakeAllConditionVariable(&(p)->work_done)
 #define POOL_WAIT_DONE(p)  SleepConditionVariableCS(&(p)->work_done, &(p)->mutex, INFINITE)
+#define POOL_WAIT_NOT_FULL(p) SleepConditionVariableCS(&(p)->queue_not_full, &(p)->mutex, INFINITE)
+#define POOL_SIGNAL_NOT_FULL(p) WakeConditionVariable(&(p)->queue_not_full)
 
 #else
 
@@ -38,6 +40,8 @@ static void* worker_thread_func(void* arg);
 #define POOL_BROADCAST_WORK(p) pthread_cond_broadcast(&(p)->work_available)
 #define POOL_SIGNAL_DONE(p) pthread_cond_broadcast(&(p)->work_done)
 #define POOL_WAIT_DONE(p)  pthread_cond_wait(&(p)->work_done, &(p)->mutex)
+#define POOL_WAIT_NOT_FULL(p) pthread_cond_wait(&(p)->queue_not_full, &(p)->mutex)
+#define POOL_SIGNAL_NOT_FULL(p) pthread_cond_signal(&(p)->queue_not_full)
 
 #endif
 
@@ -70,6 +74,7 @@ static void* worker_thread_func(void* arg) {
         pool->queue_head = (pool->queue_head + 1) % CARQUET_POOL_QUEUE_CAPACITY;
         pool->queue_count--;
         pool->active_tasks++;
+        POOL_SIGNAL_NOT_FULL(pool);  /* Unblock any waiting submitter */
         POOL_UNLOCK(pool);
 
         /* Execute task outside lock */
@@ -111,6 +116,7 @@ carquet_worker_pool_t* carquet_worker_pool_create(int32_t num_threads) {
     InitializeCriticalSection(&pool->mutex);
     InitializeConditionVariable(&pool->work_available);
     InitializeConditionVariable(&pool->work_done);
+    InitializeConditionVariable(&pool->queue_not_full);
 
     pool->threads = calloc(num_threads, sizeof(HANDLE));
     if (!pool->threads) {
@@ -137,12 +143,14 @@ carquet_worker_pool_t* carquet_worker_pool_create(int32_t num_threads) {
     pthread_mutex_init(&pool->mutex, NULL);
     pthread_cond_init(&pool->work_available, NULL);
     pthread_cond_init(&pool->work_done, NULL);
+    pthread_cond_init(&pool->queue_not_full, NULL);
 
     pool->threads = calloc(num_threads, sizeof(pthread_t));
     if (!pool->threads) {
         pthread_mutex_destroy(&pool->mutex);
         pthread_cond_destroy(&pool->work_available);
         pthread_cond_destroy(&pool->work_done);
+        pthread_cond_destroy(&pool->queue_not_full);
         free(pool);
         return NULL;
     }
@@ -156,6 +164,7 @@ carquet_worker_pool_t* carquet_worker_pool_create(int32_t num_threads) {
             pthread_mutex_destroy(&pool->mutex);
             pthread_cond_destroy(&pool->work_available);
             pthread_cond_destroy(&pool->work_done);
+            pthread_cond_destroy(&pool->queue_not_full);
             free(pool->threads);
             free(pool);
             return NULL;
@@ -170,10 +179,9 @@ void carquet_worker_pool_submit(carquet_worker_pool_t* pool,
                                  carquet_task_fn fn, void* arg) {
     POOL_LOCK(pool);
 
-    /* Spin-wait if queue is full (shouldn't happen with reasonable usage) */
+    /* Block until queue has space (condition variable instead of spin-wait) */
     while (pool->queue_count >= CARQUET_POOL_QUEUE_CAPACITY) {
-        POOL_UNLOCK(pool);
-        POOL_LOCK(pool);
+        POOL_WAIT_NOT_FULL(pool);
     }
 
     pool->queue[pool->queue_tail].fn = fn;
@@ -202,6 +210,24 @@ void carquet_worker_pool_parallel_for(carquet_worker_pool_t* pool,
     carquet_worker_pool_wait(pool);
 }
 
+void carquet_worker_pool_submit_batch(carquet_worker_pool_t* pool,
+                                       carquet_task_fn fn,
+                                       void** args, int32_t count) {
+    POOL_LOCK(pool);
+    for (int32_t i = 0; i < count; i++) {
+        while (pool->queue_count >= CARQUET_POOL_QUEUE_CAPACITY) {
+            POOL_BROADCAST_WORK(pool);  /* Wake workers to drain queue */
+            POOL_WAIT_NOT_FULL(pool);
+        }
+        pool->queue[pool->queue_tail].fn = fn;
+        pool->queue[pool->queue_tail].arg = args[i];
+        pool->queue_tail = (pool->queue_tail + 1) % CARQUET_POOL_QUEUE_CAPACITY;
+        pool->queue_count++;
+    }
+    POOL_BROADCAST_WORK(pool);  /* Wake all workers */
+    POOL_UNLOCK(pool);
+}
+
 void carquet_worker_pool_destroy(carquet_worker_pool_t* pool) {
     if (!pool) return;
 
@@ -223,6 +249,7 @@ void carquet_worker_pool_destroy(carquet_worker_pool_t* pool) {
     pthread_mutex_destroy(&pool->mutex);
     pthread_cond_destroy(&pool->work_available);
     pthread_cond_destroy(&pool->work_done);
+    pthread_cond_destroy(&pool->queue_not_full);
 #endif
 
     free(pool->threads);

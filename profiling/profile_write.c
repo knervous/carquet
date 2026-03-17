@@ -273,7 +273,8 @@ NOINLINE static double write_test_file(const profile_config_t* config,
         }
         if (carquet_writer_write_batch(writer, 0, ids, to_write, NULL, NULL) != CARQUET_OK) {
             free(ids);
-            (void)carquet_writer_close(writer);
+            carquet_status_t close_st = carquet_writer_close(writer);
+            (void)close_st;
             carquet_schema_free(schema);
             return -1;
         }
@@ -291,7 +292,8 @@ NOINLINE static double write_test_file(const profile_config_t* config,
             }
 
             if (carquet_writer_write_batch(writer, col, col_data, to_write, def, NULL) != CARQUET_OK) {
-                (void)carquet_writer_close(writer);
+                carquet_status_t close_st = carquet_writer_close(writer);
+                (void)close_st;
                 carquet_schema_free(schema);
                 return -1;
             }

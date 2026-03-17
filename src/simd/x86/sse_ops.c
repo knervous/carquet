@@ -829,6 +829,10 @@ bool carquet_sse_checked_gather_double(const double* dict, int32_t dict_count,
 uint32_t carquet_sse_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
     size_t i = 0;
 
+    /* Standard CRC32C convention: pre-invert, process, post-invert.
+     * The _mm_crc32_* intrinsics operate on the raw (inverted) CRC state. */
+    crc = ~crc;
+
 #ifdef __x86_64__
     /* Process 8 bytes at a time on 64-bit */
     for (; i + 8 <= len; i += 8) {
@@ -858,7 +862,7 @@ uint32_t carquet_sse_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
         crc = _mm_crc32_u8(crc, data[i]);
     }
 
-    return crc;
+    return ~crc;
 }
 
 /* ============================================================================

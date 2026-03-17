@@ -230,6 +230,47 @@ run_benchmark({dataset!r}, {rows}, comp_map[{compression!r}], {compression!r})
     return run_benchmark_process([python, "-c", code], timeout_seconds)
 
 
+def crossread_result_is_valid(result):
+    """Validate a cross-read result (write_ms is 0, only read matters)."""
+    if not result:
+        return False
+    return result["rows"] > 0 and result["read_ms"] > 0
+
+
+def run_crossread_process(argv, timeout_seconds):
+    """Run a cross-read benchmark subprocess (write_ms=0 is expected)."""
+    env = os.environ.copy()
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True, text=True, timeout=timeout_seconds, env=env
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {timeout_seconds}s"
+    parsed = None
+    for line in proc.stdout.splitlines():
+        r = parse_csv_line(line)
+        if r:
+            parsed = r
+            break
+
+    if proc.returncode != 0:
+        return None, stderr_tail(proc.stderr) or f"exit code {proc.returncode}"
+    if not crossread_result_is_valid(parsed):
+        return None, stderr_tail(proc.stderr) or "cross-read returned invalid timings"
+    return parsed, None
+
+
+def run_carquet_read_file(binary, filename, timeout_seconds):
+    """Run carquet benchmark in read-only mode on an external file."""
+    return run_crossread_process([binary, "read", filename], timeout_seconds)
+
+
+def run_arrow_cpp_read_file(binary, filename, timeout_seconds):
+    """Run Arrow C++ benchmark in read-only mode on an external file."""
+    return run_crossread_process([binary, "read", filename], timeout_seconds)
+
+
 def cooldown(seconds):
     """Visual cooldown timer."""
     if seconds <= 0:
@@ -364,7 +405,75 @@ def print_comparison_table(results, competitor, competitor_label):
     print(f"  {DIM}ratio = {competitor_label} time / Carquet time (higher = Carquet faster){RST}")
 
 
-def print_final_tables(results):
+def print_crossread_table(crossread_results):
+    """Print a same-file cross-read comparison table."""
+    if not crossread_results:
+        return
+
+    print()
+    print(f"  {BOLD}Same-file cross-read comparison{RST}")
+    print(f"  {DIM}(both libraries read the SAME Parquet file){RST}")
+    print(f"  {BOLD}{'':15} {'Writer':>10} {'Carquet R':>10} {'Arrow R':>10} {'ratio':>7}{RST}")
+    print(f"  {_bar()}")
+
+    for dataset_idx, dataset in enumerate(DATASET_ORDER):
+        printed_dataset = False
+        for compression in COMPRESSION_ORDER:
+            key = (dataset, compression)
+
+            # Carquet-written file results
+            cw = crossread_results.get(("carquet_file", key))
+            # Arrow-written file results
+            aw = crossread_results.get(("arrow_file", key))
+
+            if cw:
+                printed_dataset = True
+                label = f"{dataset}/{compression}"
+                c_r = cw.get("carquet_read_ms")
+                a_r = cw.get("arrow_read_ms")
+                line = f"  {BOLD}{label:<15}{RST}"
+                line += f" {'Carquet':>10}"
+                line += f" {fmt_ms(c_r)}"
+                line += f" {fmt_ms(a_r)}"
+                line += f" {fmt_speedup(c_r, a_r)}"
+                print(line)
+
+            if aw:
+                printed_dataset = True
+                label = f"{dataset}/{compression}"
+                c_r = aw.get("carquet_read_ms")
+                a_r = aw.get("arrow_read_ms")
+                line = f"  {BOLD}{label:<15}{RST}"
+                line += f" {'Arrow':>10}"
+                line += f" {fmt_ms(c_r)}"
+                line += f" {fmt_ms(a_r)}"
+                line += f" {fmt_speedup(c_r, a_r)}"
+                print(line)
+
+            has_later = any(
+                crossread_results.get(("carquet_file", (later, comp))) or
+                crossread_results.get(("arrow_file", (later, comp)))
+                for later in DATASET_ORDER[dataset_idx + 1:]
+                for comp in COMPRESSION_ORDER
+            )
+            if printed_dataset and has_later and (cw or aw):
+                # Only add spacing between dataset groups
+                pass
+        if printed_dataset:
+            has_later = any(
+                crossread_results.get(("carquet_file", (later, comp))) or
+                crossread_results.get(("arrow_file", (later, comp)))
+                for later in DATASET_ORDER[dataset_idx + 1:]
+                for comp in COMPRESSION_ORDER
+            )
+            if has_later:
+                print()
+
+    print()
+    print(f"  {DIM}ratio = Arrow read time / Carquet read time (higher = Carquet faster){RST}")
+
+
+def print_final_tables(results, crossread_results=None):
     """Print final summary tables for the libraries that ran."""
     has_carquet = have_results(results, "carquet")
     has_arrow_cpp = have_results(results, "arrow_cpp")
@@ -377,12 +486,14 @@ def print_final_tables(results):
             print_comparison_table(results, "pyarrow", "PyArrow")
         if not has_arrow_cpp and not has_pyarrow:
             print_library_table(results, "carquet", "Carquet")
-        return
+    else:
+        if has_arrow_cpp:
+            print_library_table(results, "arrow_cpp", "Arrow C++")
+        if has_pyarrow:
+            print_library_table(results, "pyarrow", "PyArrow")
 
-    if has_arrow_cpp:
-        print_library_table(results, "arrow_cpp", "Arrow C++")
-    if has_pyarrow:
-        print_library_table(results, "pyarrow", "PyArrow")
+    if crossread_results:
+        print_crossread_table(crossread_results)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -415,6 +526,8 @@ def main():
                         help="Skip Carquet benchmarks")
     parser.add_argument("--iterations", type=int, default=0,
                         help="Override iteration count for all sizes (default: auto)")
+    parser.add_argument("--no-crossread", action="store_true",
+                        help="Skip same-file cross-read benchmarks")
     args = parser.parse_args()
 
     if args.iterations > 0:
@@ -536,8 +649,16 @@ def main():
     cooldown(args.cooldown)
     print()
 
+    # ── Determine temp directory for file path construction ──
+    bench_tmpdir = os.environ.get("CARQUET_BENCH_TMPDIR", "/tmp")
+
+    # Cross-read is only possible when both carquet and arrow_cpp are enabled
+    do_crossread = (not args.no_crossread and not args.no_carquet
+                    and has_arrow_cpp)
+
     # ── Run benchmarks ──
     results = {}
+    crossread_results = {}
     total = len(configs)
     inter_library_cooldown = 0 if args.cooldown <= 0 else max(1, args.cooldown // 2)
 
@@ -580,6 +701,65 @@ def main():
             rs = fmt_speedup(carquet_r["read_ms"], pyarrow_r["read_ms"])
             print(f"       {DIM}vs PyArrow    W {ws}  R {rs}{RST}")
 
+        # ── Cross-read: each library reads the other's file ──
+        carquet_file = os.path.join(
+            bench_tmpdir, f"benchmark_{dataset}_{compression}_carquet.parquet")
+        arrow_file = os.path.join(
+            bench_tmpdir, f"benchmark_{dataset}_{compression}_arrow_cpp.parquet")
+
+        if do_crossread and carquet_r and arrow_cpp_r:
+            print(f"       {DIM}cross-read...{RST}")
+
+            # Arrow C++ reads Carquet-written file
+            if os.path.isfile(carquet_file):
+                cooldown(inter_library_cooldown)
+                xr_arrow, xr_err = run_arrow_cpp_read_file(
+                    arrow_cpp_bin, carquet_file, args.timeout)
+                xr_carquet, xr_err2 = run_carquet_read_file(
+                    carquet_bin, carquet_file, args.timeout)
+
+                cr_entry = {}
+                if crossread_result_is_valid(xr_arrow):
+                    cr_entry["arrow_read_ms"] = xr_arrow["read_ms"]
+                if crossread_result_is_valid(xr_carquet):
+                    cr_entry["carquet_read_ms"] = xr_carquet["read_ms"]
+                if cr_entry:
+                    crossread_results[("carquet_file", key)] = cr_entry
+                    c_ms = cr_entry.get("carquet_read_ms")
+                    a_ms = cr_entry.get("arrow_read_ms")
+                    print(f"       {DIM}Carquet file: "
+                          f"Carquet R {fmt_ms(c_ms)}  Arrow R {fmt_ms(a_ms)}  "
+                          f"{fmt_speedup(c_ms, a_ms)}{RST}")
+
+            # Carquet reads Arrow-written file
+            if os.path.isfile(arrow_file):
+                cooldown(inter_library_cooldown)
+                xr_carquet2, xr_err3 = run_carquet_read_file(
+                    carquet_bin, arrow_file, args.timeout)
+                xr_arrow2, xr_err4 = run_arrow_cpp_read_file(
+                    arrow_cpp_bin, arrow_file, args.timeout)
+
+                ar_entry = {}
+                if crossread_result_is_valid(xr_carquet2):
+                    ar_entry["carquet_read_ms"] = xr_carquet2["read_ms"]
+                if crossread_result_is_valid(xr_arrow2):
+                    ar_entry["arrow_read_ms"] = xr_arrow2["read_ms"]
+                if ar_entry:
+                    crossread_results[("arrow_file", key)] = ar_entry
+                    c_ms = ar_entry.get("carquet_read_ms")
+                    a_ms = ar_entry.get("arrow_read_ms")
+                    print(f"       {DIM}Arrow file:   "
+                          f"Carquet R {fmt_ms(c_ms)}  Arrow R {fmt_ms(a_ms)}  "
+                          f"{fmt_speedup(c_ms, a_ms)}{RST}")
+
+        # ── Clean up benchmark files ──
+        for f in [carquet_file, arrow_file]:
+            try:
+                if os.path.isfile(f):
+                    os.remove(f)
+            except OSError:
+                pass
+
         # Cooldown between configs
         if i < total - 1:
             cooldown(args.cooldown)
@@ -589,7 +769,7 @@ def main():
     print(f"  {_bar('═')}")
     print(f"  {BOLD}Results{RST}")
     print(f"  {_bar('═')}")
-    print_final_tables(results)
+    print_final_tables(results, crossread_results)
     print()
 
     # ── Save JSON report ──
@@ -624,6 +804,20 @@ def main():
             "read_ms": round(r["read_ms"], 2),
             "file_bytes": r["file_bytes"],
         })
+
+    if crossread_results:
+        report["crossread_results"] = []
+        for (writer, (ds, comp)), cr in sorted(crossread_results.items()):
+            entry = {
+                "writer": writer,
+                "dataset": ds,
+                "compression": comp,
+            }
+            if "carquet_read_ms" in cr:
+                entry["carquet_read_ms"] = round(cr["carquet_read_ms"], 2)
+            if "arrow_read_ms" in cr:
+                entry["arrow_read_ms"] = round(cr["arrow_read_ms"], 2)
+            report["crossread_results"].append(entry)
 
     date_str = datetime.date.today().strftime("%Y%m%d")
     os_tag = f"{platform.system().lower()}_{platform.machine()}"

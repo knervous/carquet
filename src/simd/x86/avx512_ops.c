@@ -248,6 +248,7 @@ void carquet_avx512_byte_stream_split_encode_float(
 
 /**
  * Decode byte stream split floats using AVX-512.
+ * Processes 16 floats (64 bytes) at a time using 512-bit operations.
  */
 void carquet_avx512_byte_stream_split_decode_float(
     const uint8_t* data,
@@ -257,32 +258,80 @@ void carquet_avx512_byte_stream_split_decode_float(
     uint8_t* dst = (uint8_t*)values;
     int64_t i = 0;
 
-    /* Process 16 floats at a time */
+#ifdef __AVX512VBMI__
+    /* VBMI path: single vpermb for 16 floats.
+     * Input in __m512i:
+     *   bytes  0-15: stream 0 (byte 0 of each float)
+     *   bytes 16-31: stream 1 (byte 1 of each float)
+     *   bytes 32-47: stream 2 (byte 2 of each float)
+     *   bytes 48-63: stream 3 (byte 3 of each float)
+     * Output: float[k] = {byte0[k], byte1[k], byte2[k], byte3[k]}
+     *   output byte 4*k+0 = input byte k
+     *   output byte 4*k+1 = input byte 16+k
+     *   output byte 4*k+2 = input byte 32+k
+     *   output byte 4*k+3 = input byte 48+k */
+    const __m512i perm = _mm512_set_epi32(
+        0x3F2F1F0F, 0x3E2E1E0E, 0x3D2D1D0D, 0x3C2C1C0C,
+        0x3B2B1B0B, 0x3A2A1A0A, 0x39291909, 0x38281808,
+        0x37271707, 0x36261606, 0x35251505, 0x34241404,
+        0x33231303, 0x32221202, 0x31211101, 0x30201000);
+
     for (; i + 16 <= count; i += 16) {
-        /* Load 16 bytes from each of the 4 streams */
-        __m128i b0 = _mm_loadu_si128((const __m128i*)(data + 0 * count + i));
-        __m128i b1 = _mm_loadu_si128((const __m128i*)(data + 1 * count + i));
-        __m128i b2 = _mm_loadu_si128((const __m128i*)(data + 2 * count + i));
-        __m128i b3 = _mm_loadu_si128((const __m128i*)(data + 3 * count + i));
+        __m128i s0 = _mm_loadu_si128((const __m128i*)(data + 0 * count + i));
+        __m128i s1 = _mm_loadu_si128((const __m128i*)(data + 1 * count + i));
+        __m128i s2 = _mm_loadu_si128((const __m128i*)(data + 2 * count + i));
+        __m128i s3 = _mm_loadu_si128((const __m128i*)(data + 3 * count + i));
 
-        /* Interleave to reconstruct floats */
-        __m128i lo01_lo = _mm_unpacklo_epi8(b0, b1);
-        __m128i lo01_hi = _mm_unpackhi_epi8(b0, b1);
-        __m128i lo23_lo = _mm_unpacklo_epi8(b2, b3);
-        __m128i lo23_hi = _mm_unpackhi_epi8(b2, b3);
+        __m512i combined = _mm512_castsi128_si512(s0);
+        combined = _mm512_inserti32x4(combined, s1, 1);
+        combined = _mm512_inserti32x4(combined, s2, 2);
+        combined = _mm512_inserti32x4(combined, s3, 3);
 
-        __m128i result0 = _mm_unpacklo_epi16(lo01_lo, lo23_lo);
-        __m128i result1 = _mm_unpackhi_epi16(lo01_lo, lo23_lo);
-        __m128i result2 = _mm_unpacklo_epi16(lo01_hi, lo23_hi);
-        __m128i result3 = _mm_unpackhi_epi16(lo01_hi, lo23_hi);
-
-        _mm_storeu_si128((__m128i*)(dst + i * 4 + 0), result0);
-        _mm_storeu_si128((__m128i*)(dst + i * 4 + 16), result1);
-        _mm_storeu_si128((__m128i*)(dst + i * 4 + 32), result2);
-        _mm_storeu_si128((__m128i*)(dst + i * 4 + 48), result3);
+        __m512i result = _mm512_permutexvar_epi8(perm, combined);
+        _mm512_storeu_si512((__m512i*)(dst + i * 4), result);
     }
+#else
+    /* Non-VBMI fallback: use the inverse of the encode approach.
+     * The encode uses: (1) intra-lane shuffle to group bytes, (2) cross-lane dword permute.
+     * For decode, reverse the process:
+     * (1) Load streams into 512-bit lanes, (2) cross-lane permute, (3) intra-lane shuffle. */
 
-    /* Handle remaining values */
+    /* Step 1 cross-lane: inverse of the encode's cross_lane_perm.
+     * Encode permutes dwords as {12,8,4,0, 13,9,5,1, 14,10,6,2, 15,11,7,3}.
+     * The inverse moves dword K to position inverse[K]. */
+    const __m512i cross_lane_inv = _mm512_set_epi32(
+        15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0);
+
+    /* Step 2 intra-lane: inverse of the encode's intra_lane_shuf.
+     * Encode: byte[4k+j] -> position[j*4+k] (for k=0..3, j=0..3)
+     * Decode: position[j*4+k] -> byte[4k+j], i.e. byte[p] -> pos[((p%4)*4 + p/4)] */
+    const __m512i intra_lane_inv = _mm512_set_epi32(
+        0x0F0B0703, 0x0E0A0602, 0x0D090501, 0x0C080400,
+        0x0F0B0703, 0x0E0A0602, 0x0D090501, 0x0C080400,
+        0x0F0B0703, 0x0E0A0602, 0x0D090501, 0x0C080400,
+        0x0F0B0703, 0x0E0A0602, 0x0D090501, 0x0C080400);
+
+    for (; i + 16 <= count; i += 16) {
+        __m128i s0 = _mm_loadu_si128((const __m128i*)(data + 0 * count + i));
+        __m128i s1 = _mm_loadu_si128((const __m128i*)(data + 1 * count + i));
+        __m128i s2 = _mm_loadu_si128((const __m128i*)(data + 2 * count + i));
+        __m128i s3 = _mm_loadu_si128((const __m128i*)(data + 3 * count + i));
+
+        __m512i combined = _mm512_castsi128_si512(s0);
+        combined = _mm512_inserti32x4(combined, s1, 1);
+        combined = _mm512_inserti32x4(combined, s2, 2);
+        combined = _mm512_inserti32x4(combined, s3, 3);
+
+        /* Rearrange dwords across lanes */
+        __m512i permuted = _mm512_permutexvar_epi32(cross_lane_inv, combined);
+        /* Shuffle bytes within each lane to reconstruct floats */
+        __m512i result = _mm512_shuffle_epi8(permuted, intra_lane_inv);
+
+        _mm512_storeu_si512((__m512i*)(dst + i * 4), result);
+    }
+#endif
+
+    /* Scalar tail */
     for (; i < count; i++) {
         for (int b = 0; b < 4; b++) {
             dst[i * 4 + b] = data[b * count + i];
@@ -292,7 +341,7 @@ void carquet_avx512_byte_stream_split_decode_float(
 
 /**
  * Encode doubles using byte stream split with AVX-512.
- * Processes 8 doubles (64 bytes) at a time using two 256-bit halves.
+ * Processes 8 doubles (64 bytes) at a time using 512-bit operations.
  */
 void carquet_avx512_byte_stream_split_encode_double(
     const double* values,
@@ -301,94 +350,86 @@ void carquet_avx512_byte_stream_split_encode_double(
 
     const uint8_t* src = (const uint8_t*)values;
     int64_t i = 0;
-    const __m256i s0 = _mm256_setr_epi8(
-        0, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        0, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-    const __m256i s1 = _mm256_setr_epi8(
-        1, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        1, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-    const __m256i s2 = _mm256_setr_epi8(
-        2, 10, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        2, 10, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-    const __m256i s3 = _mm256_setr_epi8(
-        3, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        3, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-    const __m256i s4 = _mm256_setr_epi8(
-        4, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        4, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-    const __m256i s5 = _mm256_setr_epi8(
-        5, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        5, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-    const __m256i s6 = _mm256_setr_epi8(
-        6, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        6, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-    const __m256i s7 = _mm256_setr_epi8(
-        7, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        7, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+
+#ifdef __AVX512VBMI__
+    /* Single vpermb transposes 8 doubles (64 bytes) into 8 byte streams.
+     * Output layout: 8 lanes of 8 bytes, each lane is one byte stream. */
+    const __m512i perm = _mm512_set_epi32(
+        0x3F372F27, 0x1F170F07,  /* stream 7 */
+        0x3E362E26, 0x1E160E06,  /* stream 6 */
+        0x3D352D25, 0x1D150D05,  /* stream 5 */
+        0x3C342C24, 0x1C140C04,  /* stream 4 */
+        0x3B332B23, 0x1B130B03,  /* stream 3 */
+        0x3A322A22, 0x1A120A02,  /* stream 2 */
+        0x39312921, 0x19110901,  /* stream 1 */
+        0x38302820, 0x18100800); /* stream 0 */
+
+    for (; i + 8 <= count; i += 8) {
+        __m512i v = _mm512_loadu_si512((const __m512i*)(src + i * 8));
+        __m512i transposed = _mm512_permutexvar_epi8(perm, v);
+
+        /* Extract 8 bytes per stream from the 512-bit result.
+         * After permutation, the result is organized as:
+         * bytes  0-7:  stream 0 (byte 0 from each of 8 doubles)
+         * bytes  8-15: stream 1
+         * ... etc */
+        _mm_storel_epi64((__m128i*)(output + 0 * count + i),
+                         _mm512_castsi512_si128(transposed));
+        _mm_storel_epi64((__m128i*)(output + 1 * count + i),
+                         _mm_srli_si128(_mm512_castsi512_si128(transposed), 8));
+        __m128i lane1 = _mm512_extracti32x4_epi32(transposed, 1);
+        _mm_storel_epi64((__m128i*)(output + 2 * count + i), lane1);
+        _mm_storel_epi64((__m128i*)(output + 3 * count + i),
+                         _mm_srli_si128(lane1, 8));
+        __m128i lane2 = _mm512_extracti32x4_epi32(transposed, 2);
+        _mm_storel_epi64((__m128i*)(output + 4 * count + i), lane2);
+        _mm_storel_epi64((__m128i*)(output + 5 * count + i),
+                         _mm_srli_si128(lane2, 8));
+        __m128i lane3 = _mm512_extracti32x4_epi32(transposed, 3);
+        _mm_storel_epi64((__m128i*)(output + 6 * count + i), lane3);
+        _mm_storel_epi64((__m128i*)(output + 7 * count + i),
+                         _mm_srli_si128(lane3, 8));
+    }
+#else
+    /* Non-VBMI: use AVX2-style shuffle approach with 256-bit halves */
+    const __m256i sh0 = _mm256_setr_epi8(0,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 0,8,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+    const __m256i sh1 = _mm256_setr_epi8(1,9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 1,9,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+    const __m256i sh2 = _mm256_setr_epi8(2,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 2,10,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+    const __m256i sh3 = _mm256_setr_epi8(3,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 3,11,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+    const __m256i sh4 = _mm256_setr_epi8(4,12,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 4,12,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+    const __m256i sh5 = _mm256_setr_epi8(5,13,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 5,13,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+    const __m256i sh6 = _mm256_setr_epi8(6,14,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 6,14,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+    const __m256i sh7 = _mm256_setr_epi8(7,15,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 7,15,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
 
     for (; i + 8 <= count; i += 8) {
         __m256i lo = _mm256_loadu_si256((const __m256i*)(src + i * 8));
         __m256i hi = _mm256_loadu_si256((const __m256i*)(src + i * 8 + 32));
 
-        __m256i out0_lo = _mm256_shuffle_epi8(lo, s0);
-        __m256i out1_lo = _mm256_shuffle_epi8(lo, s1);
-        __m256i out2_lo = _mm256_shuffle_epi8(lo, s2);
-        __m256i out3_lo = _mm256_shuffle_epi8(lo, s3);
-        __m256i out4_lo = _mm256_shuffle_epi8(lo, s4);
-        __m256i out5_lo = _mm256_shuffle_epi8(lo, s5);
-        __m256i out6_lo = _mm256_shuffle_epi8(lo, s6);
-        __m256i out7_lo = _mm256_shuffle_epi8(lo, s7);
-        __m256i out0_hi = _mm256_shuffle_epi8(hi, s0);
-        __m256i out1_hi = _mm256_shuffle_epi8(hi, s1);
-        __m256i out2_hi = _mm256_shuffle_epi8(hi, s2);
-        __m256i out3_hi = _mm256_shuffle_epi8(hi, s3);
-        __m256i out4_hi = _mm256_shuffle_epi8(hi, s4);
-        __m256i out5_hi = _mm256_shuffle_epi8(hi, s5);
-        __m256i out6_hi = _mm256_shuffle_epi8(hi, s6);
-        __m256i out7_hi = _mm256_shuffle_epi8(hi, s7);
+        /* For each byte position, shuffle both halves and combine to 8 bytes */
+        #define DO_STREAM(B, SH) do { \
+            __m256i slo = _mm256_shuffle_epi8(lo, SH); \
+            __m256i shi = _mm256_shuffle_epi8(hi, SH); \
+            uint32_t wlo = (uint32_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(slo)); \
+            uint32_t whi_lane = (uint32_t)_mm_cvtsi128_si32(_mm256_extracti128_si256(slo, 1)); \
+            uint32_t who = (uint32_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(shi)); \
+            uint32_t who_lane = (uint32_t)_mm_cvtsi128_si32(_mm256_extracti128_si256(shi, 1)); \
+            uint64_t val = (uint64_t)(uint16_t)wlo | ((uint64_t)(uint16_t)whi_lane << 16) | \
+                          ((uint64_t)(uint16_t)who << 32) | ((uint64_t)(uint16_t)who_lane << 48); \
+            memcpy(output + (B) * count + i, &val, sizeof(uint64_t)); \
+        } while(0)
 
-        uint64_t t0 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out0_lo), 0) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out0_lo, 1), 0) << 16) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out0_hi), 0) << 32) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out0_hi, 1), 0) << 48);
-        uint64_t t1 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out1_lo), 0) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out1_lo, 1), 0) << 16) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out1_hi), 0) << 32) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out1_hi, 1), 0) << 48);
-        uint64_t t2 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out2_lo), 0) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out2_lo, 1), 0) << 16) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out2_hi), 0) << 32) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out2_hi, 1), 0) << 48);
-        uint64_t t3 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out3_lo), 0) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out3_lo, 1), 0) << 16) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out3_hi), 0) << 32) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out3_hi, 1), 0) << 48);
-        uint64_t t4 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out4_lo), 0) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out4_lo, 1), 0) << 16) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out4_hi), 0) << 32) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out4_hi, 1), 0) << 48);
-        uint64_t t5 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out5_lo), 0) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out5_lo, 1), 0) << 16) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out5_hi), 0) << 32) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out5_hi, 1), 0) << 48);
-        uint64_t t6 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out6_lo), 0) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out6_lo, 1), 0) << 16) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out6_hi), 0) << 32) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out6_hi, 1), 0) << 48);
-        uint64_t t7 = (uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out7_lo), 0) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out7_lo, 1), 0) << 16) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_castsi256_si128(out7_hi), 0) << 32) |
-                      ((uint64_t)(uint16_t)_mm_extract_epi16(_mm256_extracti128_si256(out7_hi, 1), 0) << 48);
+        DO_STREAM(0, sh0);
+        DO_STREAM(1, sh1);
+        DO_STREAM(2, sh2);
+        DO_STREAM(3, sh3);
+        DO_STREAM(4, sh4);
+        DO_STREAM(5, sh5);
+        DO_STREAM(6, sh6);
+        DO_STREAM(7, sh7);
 
-        memcpy(output + 0 * count + i, &t0, sizeof(t0));
-        memcpy(output + 1 * count + i, &t1, sizeof(t1));
-        memcpy(output + 2 * count + i, &t2, sizeof(t2));
-        memcpy(output + 3 * count + i, &t3, sizeof(t3));
-        memcpy(output + 4 * count + i, &t4, sizeof(t4));
-        memcpy(output + 5 * count + i, &t5, sizeof(t5));
-        memcpy(output + 6 * count + i, &t6, sizeof(t6));
-        memcpy(output + 7 * count + i, &t7, sizeof(t7));
+        #undef DO_STREAM
     }
+#endif
 
     for (; i < count; i++) {
         for (int b = 0; b < 8; b++) {
@@ -399,7 +440,7 @@ void carquet_avx512_byte_stream_split_encode_double(
 
 /**
  * Decode byte stream split doubles using AVX-512.
- * Processes 8 doubles (64 bytes) at a time via 128-bit interleave stages.
+ * Processes 8 doubles (64 bytes) at a time using 512-bit operations.
  */
 void carquet_avx512_byte_stream_split_decode_double(
     const uint8_t* data,
@@ -409,63 +450,92 @@ void carquet_avx512_byte_stream_split_decode_double(
     uint8_t* dst = (uint8_t*)values;
     int64_t i = 0;
 
+#ifdef __AVX512VBMI__
+    /* VBMI path: load 8 bytes from each of 8 streams into __m512i, single vpermb.
+     * Input layout:
+     *   bytes  0-7:  stream 0
+     *   bytes  8-15: stream 1
+     *   bytes 16-23: stream 2
+     *   bytes 24-31: stream 3
+     *   bytes 32-39: stream 4
+     *   bytes 40-47: stream 5
+     *   bytes 48-55: stream 6
+     *   bytes 56-63: stream 7
+     * Output: double[k] = {s0[k], s1[k], s2[k], s3[k], s4[k], s5[k], s6[k], s7[k]}
+     *   output byte 8*k+j = input byte j*8+k */
+    const __m512i perm = _mm512_set_epi32(
+        0x3F372F27, 0x1F170F07,  /* double 7 */
+        0x3E362E26, 0x1E160E06,  /* double 6 */
+        0x3D352D25, 0x1D150D05,  /* double 5 */
+        0x3C342C24, 0x1C140C04,  /* double 4 */
+        0x3B332B23, 0x1B130B03,  /* double 3 */
+        0x3A322A22, 0x1A120A02,  /* double 2 */
+        0x39312921, 0x19110901,  /* double 1 */
+        0x38302820, 0x18100800); /* double 0 */
+
     for (; i + 8 <= count; i += 8) {
-        uint64_t b0, b1, b2, b3, b4, b5, b6, b7;
-        memcpy(&b0, data + 0 * count + i, sizeof(b0));
-        memcpy(&b1, data + 1 * count + i, sizeof(b1));
-        memcpy(&b2, data + 2 * count + i, sizeof(b2));
-        memcpy(&b3, data + 3 * count + i, sizeof(b3));
-        memcpy(&b4, data + 4 * count + i, sizeof(b4));
-        memcpy(&b5, data + 5 * count + i, sizeof(b5));
-        memcpy(&b6, data + 6 * count + i, sizeof(b6));
-        memcpy(&b7, data + 7 * count + i, sizeof(b7));
+        /* Pack 8 streams into one __m512i using 64-bit lane loads */
+        __m128i p01 = _mm_unpacklo_epi64(
+            _mm_loadl_epi64((const __m128i*)(data + 0 * count + i)),
+            _mm_loadl_epi64((const __m128i*)(data + 1 * count + i)));
+        __m128i p23 = _mm_unpacklo_epi64(
+            _mm_loadl_epi64((const __m128i*)(data + 2 * count + i)),
+            _mm_loadl_epi64((const __m128i*)(data + 3 * count + i)));
+        __m128i p45 = _mm_unpacklo_epi64(
+            _mm_loadl_epi64((const __m128i*)(data + 4 * count + i)),
+            _mm_loadl_epi64((const __m128i*)(data + 5 * count + i)));
+        __m128i p67 = _mm_unpacklo_epi64(
+            _mm_loadl_epi64((const __m128i*)(data + 6 * count + i)),
+            _mm_loadl_epi64((const __m128i*)(data + 7 * count + i)));
 
-        __m128i s0 = _mm_cvtsi64_si128((long long)b0);
-        __m128i s1 = _mm_cvtsi64_si128((long long)b1);
-        __m128i s2 = _mm_cvtsi64_si128((long long)b2);
-        __m128i s3 = _mm_cvtsi64_si128((long long)b3);
-        __m128i s4 = _mm_cvtsi64_si128((long long)b4);
-        __m128i s5 = _mm_cvtsi64_si128((long long)b5);
-        __m128i s6 = _mm_cvtsi64_si128((long long)b6);
-        __m128i s7 = _mm_cvtsi64_si128((long long)b7);
+        __m512i combined = _mm512_castsi128_si512(p01);
+        combined = _mm512_inserti32x4(combined, p23, 1);
+        combined = _mm512_inserti32x4(combined, p45, 2);
+        combined = _mm512_inserti32x4(combined, p67, 3);
 
-        __m128i u01_lo = _mm_unpacklo_epi8(s0, s1);
-        __m128i u01_hi = _mm_unpackhi_epi8(s0, s1);
-        __m128i u23_lo = _mm_unpacklo_epi8(s2, s3);
-        __m128i u23_hi = _mm_unpackhi_epi8(s2, s3);
-        __m128i u45_lo = _mm_unpacklo_epi8(s4, s5);
-        __m128i u45_hi = _mm_unpackhi_epi8(s4, s5);
-        __m128i u67_lo = _mm_unpacklo_epi8(s6, s7);
-        __m128i u67_hi = _mm_unpackhi_epi8(s6, s7);
-
-        __m128i r0 = _mm_unpacklo_epi16(u01_lo, u23_lo);
-        __m128i r1 = _mm_unpackhi_epi16(u01_lo, u23_lo);
-        __m128i r2 = _mm_unpacklo_epi16(u01_hi, u23_hi);
-        __m128i r3 = _mm_unpackhi_epi16(u01_hi, u23_hi);
-        __m128i r4 = _mm_unpacklo_epi16(u45_lo, u67_lo);
-        __m128i r5 = _mm_unpackhi_epi16(u45_lo, u67_lo);
-        __m128i r6 = _mm_unpacklo_epi16(u45_hi, u67_hi);
-        __m128i r7 = _mm_unpackhi_epi16(u45_hi, u67_hi);
-
-        __m128i d0 = _mm_unpacklo_epi32(r0, r4);
-        __m128i d1 = _mm_unpackhi_epi32(r0, r4);
-        __m128i d2 = _mm_unpacklo_epi32(r1, r5);
-        __m128i d3 = _mm_unpackhi_epi32(r1, r5);
-        __m128i d4 = _mm_unpacklo_epi32(r2, r6);
-        __m128i d5 = _mm_unpackhi_epi32(r2, r6);
-        __m128i d6 = _mm_unpacklo_epi32(r3, r7);
-        __m128i d7 = _mm_unpackhi_epi32(r3, r7);
-
-        _mm_storeu_si128((__m128i*)(dst + i * 8 +  0), d0);
-        _mm_storeu_si128((__m128i*)(dst + i * 8 + 16), d1);
-        _mm_storeu_si128((__m128i*)(dst + i * 8 + 32), d2);
-        _mm_storeu_si128((__m128i*)(dst + i * 8 + 48), d3);
-        _mm_storeu_si128((__m128i*)(dst + i * 8 + 64), d4);
-        _mm_storeu_si128((__m128i*)(dst + i * 8 + 80), d5);
-        _mm_storeu_si128((__m128i*)(dst + i * 8 + 96), d6);
-        _mm_storeu_si128((__m128i*)(dst + i * 8 + 112), d7);
+        __m512i result = _mm512_permutexvar_epi8(perm, combined);
+        _mm512_storeu_si512((__m512i*)(dst + i * 8), result);
     }
+#else
+    /* Non-VBMI: use 128-bit unpack cascade for 8 doubles, plus 512-bit stores */
+    for (; i + 8 <= count; i += 8) {
+        __m128i s0 = _mm_loadl_epi64((const __m128i*)(data + 0 * count + i));
+        __m128i s1 = _mm_loadl_epi64((const __m128i*)(data + 1 * count + i));
+        __m128i s2 = _mm_loadl_epi64((const __m128i*)(data + 2 * count + i));
+        __m128i s3 = _mm_loadl_epi64((const __m128i*)(data + 3 * count + i));
+        __m128i s4 = _mm_loadl_epi64((const __m128i*)(data + 4 * count + i));
+        __m128i s5 = _mm_loadl_epi64((const __m128i*)(data + 5 * count + i));
+        __m128i s6 = _mm_loadl_epi64((const __m128i*)(data + 6 * count + i));
+        __m128i s7 = _mm_loadl_epi64((const __m128i*)(data + 7 * count + i));
 
+        /* Stage 1: interleave bytes */
+        __m128i u01 = _mm_unpacklo_epi8(s0, s1);
+        __m128i u23 = _mm_unpacklo_epi8(s2, s3);
+        __m128i u45 = _mm_unpacklo_epi8(s4, s5);
+        __m128i u67 = _mm_unpacklo_epi8(s6, s7);
+
+        /* Stage 2: interleave 16-bit words */
+        __m128i v0 = _mm_unpacklo_epi16(u01, u23);
+        __m128i v1 = _mm_unpackhi_epi16(u01, u23);
+        __m128i v2 = _mm_unpacklo_epi16(u45, u67);
+        __m128i v3 = _mm_unpackhi_epi16(u45, u67);
+
+        /* Stage 3: interleave 32-bit dwords */
+        __m128i d0 = _mm_unpacklo_epi32(v0, v2);
+        __m128i d1 = _mm_unpackhi_epi32(v0, v2);
+        __m128i d2 = _mm_unpacklo_epi32(v1, v3);
+        __m128i d3 = _mm_unpackhi_epi32(v1, v3);
+
+        /* Use 512-bit store: combine 4 x 128-bit results into one 512-bit write */
+        __m512i out = _mm512_castsi128_si512(d0);
+        out = _mm512_inserti32x4(out, d1, 1);
+        out = _mm512_inserti32x4(out, d2, 2);
+        out = _mm512_inserti32x4(out, d3, 3);
+        _mm512_storeu_si512((__m512i*)(dst + i * 8), out);
+    }
+#endif
+
+    /* Scalar tail */
     for (; i < count; i++) {
         for (int b = 0; b < 8; b++) {
             dst[i * 8 + b] = data[b * count + i];
@@ -802,6 +872,9 @@ void carquet_avx512_memcpy(void* dest, const void* src, size_t n) {
 uint32_t carquet_avx512_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
     size_t i = 0;
 
+    /* Standard CRC32C convention: pre-invert, process, post-invert */
+    crc = ~crc;
+
 #ifdef __x86_64__
     for (; i + 8 <= len; i += 8) {
         uint64_t val;
@@ -827,7 +900,7 @@ uint32_t carquet_avx512_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
         crc = _mm_crc32_u8(crc, data[i]);
     }
 
-    return crc;
+    return ~crc;
 }
 
 void carquet_avx512_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset) {

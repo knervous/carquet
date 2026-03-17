@@ -237,7 +237,7 @@ void carquet_writer_options_init(carquet_writer_options_t* options) {
     options->compression = CARQUET_COMPRESSION_UNCOMPRESSED;
     options->compression_level = 0;
     options->row_group_size = 128 * 1024 * 1024;  /* 128 MB */
-    options->page_size = 1024 * 1024;              /* 1 MB */
+    options->page_size = 1024 * 1024;               /* 1 MB */
     options->write_statistics = true;
     options->write_crc = true;
     options->write_page_index = false;
@@ -555,10 +555,6 @@ static carquet_status_t ensure_row_group(carquet_writer_t* writer) {
     }
 
     size_t target_page_size = (size_t)writer->options.page_size;
-    if (writer->options.compression == CARQUET_COMPRESSION_ZSTD &&
-        target_page_size == 1024 * 1024) {
-        target_page_size = 4 * 1024 * 1024;
-    }
 
     writer->current_row_group = carquet_row_group_writer_create(
         NULL,  /* Schema not used directly */
