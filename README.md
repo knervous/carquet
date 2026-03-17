@@ -23,10 +23,10 @@
 - **Pure C11** with three external dependencies (zstd, zlib, lz4) -- all auto-fetched by CMake
 - **~200KB binary** vs ~50MB+ for Arrow
 - **Built-in CLI** for file inspection (`schema`, `info`, `head`, `tail`, `stat`, ...) and C code generation (`codegen`)
-- **40x faster reads** than Arrow C++ on uncompressed data (mmap zero-copy), **170x faster** than PyArrow
-- **1.5-2.6x faster compressed reads** than Arrow C++ on the same file (cross-read benchmark)
-- **Writes 1.02-1.76x faster** than Arrow C++ across codecs and platforms
-- Reads 100M uncompressed rows in **2.3ms** (83 GB/s throughput on Apple M3)
+- **70x faster reads** than Arrow C++ on uncompressed data (mmap zero-copy), **150x faster** than PyArrow
+- **1.2-2.6x faster compressed reads** than Arrow C++ on the same file (cross-read benchmark)
+- **Writes 1.0-2.3x faster** than Arrow C++ across codecs and platforms
+- Reads 10M uncompressed rows in **0.25ms** (mmap zero-copy on Apple M3)
 - Full Parquet spec: all types, encodings, compression codecs, nested schemas, bloom filters, page indexes
 - SIMD-optimized (SSE4.2, AVX2, AVX-512, NEON, SVE) with runtime detection and scalar fallbacks
 - PyArrow, DuckDB, Spark compatible out of the box
@@ -38,10 +38,10 @@ Carquet vs Arrow C++ 23.0.1 at 10M rows (the most representative size). Higher r
 | | x86 (Xeon D-1531) | | ARM (Apple M3) | |
 |---|---|---|---|---|
 | **Codec** | **Write** | **Read** | **Write** | **Read** |
-| snappy | **1.55x** | **1.25x** | **1.16x** | **1.34x** |
-| zstd | **1.31x** | **1.04x** | **1.76x** | **1.16x** |
-| lz4 | **1.02x** | 0.83x | **1.13x** | **1.26x** |
-| none | **1.13x** | **40.6x**\* | **1.46x** | **34.3x**\* |
+| snappy | **1.55x** | **1.25x** | **1.10x** | **1.53x** |
+| zstd | **1.31x** | **1.04x** | **1.37x** | **1.28x** |
+| lz4 | **1.02x** | 0.83x | **1.25x** | 0.96x |
+| none | **1.13x** | **40.6x**\* | **1.33x** | **70.4x**\* |
 
 \* Uncompressed reads use mmap zero-copy -- see note below.
 
@@ -123,77 +123,74 @@ Both libraries read the **same** Parquet file — the fairest apples-to-apples c
 
 *MacBook Air M3, 16GB RAM, macOS 26.2, Arrow C++ 23.0.1, PyArrow 23.0.1 -- ZSTD level 1*
 
-#### 100M rows vs Arrow C++
-
-| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | R throughput | Arrow C++ Read | R ratio | Size |
-|-------|--------------|-----------------|---------|-------------|-------------|----------------|---------|------|
-| none | **973.0ms** | 2203.7ms | **2.26x** | **2.29ms** | 83.3 GB/s | 103.9ms | **45.4x**\* | 1907.4MB |
-| snappy | **2275.1ms** | 2403.5ms | **1.06x** | **143.2ms** | 8.7 GB/s | 151.7ms | **1.06x** | 1250.6MB |
-| zstd | **2604.0ms** | 3381.8ms | **1.30x** | 241.1ms | 3.9 GB/s | **216.6ms** | 0.90x | 952.1MB |
-| lz4 | **2067.2ms** | 2418.0ms | **1.17x** | **103.4ms** | 11.9 GB/s | 107.0ms | **1.03x** | 1229.3MB |
-
 #### 10M rows vs Arrow C++
 
-| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | R throughput | Arrow C++ Read | R ratio | Size |
-|-------|--------------|-----------------|---------|-------------|-------------|----------------|---------|------|
-| none | **102.8ms** | 150.4ms | **1.46x** | **0.29ms** | 65.8 GB/s | 9.96ms | **34.3x**\* | 190.7MB |
-| snappy | **213.8ms** | 248.6ms | **1.16x** | **14.87ms** | 8.4 GB/s | 19.92ms | **1.34x** | 125.1MB |
-| zstd | **195.7ms** | 344.2ms | **1.76x** | **24.29ms** | 3.9 GB/s | 28.12ms | **1.16x** | 95.3MB |
-| lz4 | **218.5ms** | 247.6ms | **1.13x** | **11.30ms** | 10.6 GB/s | 14.25ms | **1.26x** | 122.9MB |
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio | Size |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|------|
+| none | **99.4ms** | 131.9ms | **1.33x** | **0.25ms** | 17.59ms | **70.4x**\* | 190.7MB |
+| snappy | **231.0ms** | 253.1ms | **1.10x** | **16.15ms** | 24.75ms | **1.53x** | 125.1MB |
+| zstd | **253.3ms** | 347.5ms | **1.37x** | **22.91ms** | 29.38ms | **1.28x** | 95.3MB |
+| lz4 | **198.3ms** | 248.8ms | **1.25x** | 18.90ms | **18.05ms** | 0.96x | 122.9MB |
 
 #### 1M rows vs Arrow C++
 
-| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | R throughput | Arrow C++ Read | R ratio |
-|-------|--------------|-----------------|---------|-------------|-------------|----------------|---------|
-| none | **7.23ms** | 13.98ms | **1.93x** | **0.05ms** | 38.2 GB/s | 1.17ms | **23.4x**\* |
-| snappy | **13.42ms** | 24.84ms | **1.85x** | **1.59ms** | 7.9 GB/s | 2.02ms | **1.27x** |
-| zstd | **15.56ms** | 34.69ms | **2.23x** | **2.44ms** | 3.9 GB/s | 2.78ms | **1.14x** |
-| lz4 | **13.06ms** | 25.03ms | **1.92x** | **1.36ms** | 9.2 GB/s | 1.34ms | 0.99x |
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | **7.57ms** | 12.91ms | **1.71x** | **0.05ms** | 1.77ms | **35.4x**\* |
+| snappy | **13.43ms** | 24.50ms | **1.82x** | **1.52ms** | 2.55ms | **1.68x** |
+| zstd | **15.05ms** | 34.12ms | **2.27x** | **2.29ms** | 3.06ms | **1.34x** |
+| lz4 | **13.09ms** | 25.11ms | **1.92x** | **1.03ms** | 1.74ms | **1.69x** |
 
 #### 100K rows vs Arrow C++
 
-| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | R throughput | Arrow C++ Read | R ratio |
-|-------|--------------|-----------------|---------|-------------|-------------|----------------|---------|
-| none | **1.01ms** | 1.56ms | **1.54x** | **0.02ms** | 95.5 GB/s | 0.11ms | **5.50x**\* |
-| snappy | **1.58ms** | 2.50ms | **1.58x** | **0.35ms** | 3.6 GB/s | 0.52ms | **1.49x** |
-| zstd | **1.69ms** | 3.53ms | **2.09x** | **0.63ms** | 1.5 GB/s | 0.69ms | **1.10x** |
-| lz4 | **1.56ms** | 2.46ms | **1.58x** | **0.25ms** | 4.9 GB/s | 0.28ms | **1.12x** |
+| Codec | Carquet Write | Arrow C++ Write | W ratio | Carquet Read | Arrow C++ Read | R ratio |
+|-------|--------------|-----------------|---------|-------------|----------------|---------|
+| none | **1.13ms** | 1.56ms | **1.38x** | **0.02ms** | 0.23ms | **11.5x**\* |
+| snappy | **1.64ms** | 2.50ms | **1.52x** | **0.37ms** | 0.90ms | **2.43x** |
+| zstd | **1.69ms** | 3.52ms | **2.08x** | **0.64ms** | 1.31ms | **2.05x** |
+| lz4 | **1.58ms** | 2.49ms | **1.58x** | **0.25ms** | 0.57ms | **2.28x** |
 
-#### 100M rows vs PyArrow
+#### Same-file cross-read (10M rows)
 
-| Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
-|-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **973.0ms** | 2059.0ms | **2.12x** | **2.29ms** | 457.9ms | **200.0x**\* |
-| snappy | **2275.1ms** | 2927.8ms | **1.29x** | **143.2ms** | 786.9ms | **5.50x** |
-| zstd | **2604.0ms** | 3955.2ms | **1.52x** | **241.1ms** | 1004.7ms | **4.17x** |
-| lz4 | **2067.2ms** | 3008.9ms | **1.46x** | **103.4ms** | 605.9ms | **5.86x** |
+Both libraries read the **same** Parquet file — the fairest apples-to-apples comparison.
+
+| Codec | Writer | Carquet Read | Arrow C++ Read | Ratio |
+|-------|--------|-------------|----------------|-------|
+| none | Carquet | **0.36ms** | 18.33ms | **50.9x**\* |
+| none | Arrow | **1.01ms** | 17.60ms | **17.4x**\* |
+| snappy | Carquet | **20.54ms** | 24.52ms | **1.19x** |
+| snappy | Arrow | **14.91ms** | 23.65ms | **1.59x** |
+| zstd | Carquet | **23.11ms** | 34.71ms | **1.50x** |
+| zstd | Arrow | **22.03ms** | 29.87ms | **1.36x** |
+| lz4 | Carquet | **10.96ms** | 18.54ms | **1.69x** |
+| lz4 | Arrow | **10.54ms** | 17.43ms | **1.65x** |
 
 #### 10M rows vs PyArrow
 
 | Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
 |-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **102.8ms** | 180.9ms | **1.76x** | **0.29ms** | 33.32ms | **114.9x**\* |
-| snappy | **213.8ms** | 299.5ms | **1.40x** | **14.87ms** | 44.31ms | **2.98x** |
-| zstd | **195.7ms** | 401.7ms | **2.05x** | **24.29ms** | 56.43ms | **2.32x** |
-| lz4 | **218.5ms** | 323.8ms | **1.48x** | **11.30ms** | 38.29ms | **3.39x** |
+| none | **99.4ms** | 193.4ms | **1.95x** | **0.25ms** | 37.64ms | **150.6x**\* |
+| snappy | **231.0ms** | 306.3ms | **1.33x** | **16.15ms** | 48.01ms | **2.97x** |
+| zstd | **253.3ms** | 405.7ms | **1.60x** | **22.91ms** | 61.63ms | **2.69x** |
+| lz4 | **198.3ms** | 309.4ms | **1.56x** | **18.90ms** | 40.09ms | **2.12x** |
 
 #### 1M rows vs PyArrow
 
 | Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
 |-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **7.23ms** | 18.35ms | **2.54x** | **0.05ms** | 2.66ms | **53.2x**\* |
-| snappy | **13.42ms** | 31.17ms | **2.32x** | **1.59ms** | 3.65ms | **2.30x** |
-| zstd | **15.56ms** | 39.84ms | **2.56x** | **2.44ms** | 4.60ms | **1.89x** |
-| lz4 | **13.06ms** | 31.10ms | **2.38x** | **1.36ms** | 3.06ms | **2.25x** |
+| none | **7.57ms** | 18.41ms | **2.43x** | **0.05ms** | 2.63ms | **52.6x**\* |
+| snappy | **13.43ms** | 30.73ms | **2.29x** | **1.52ms** | 3.65ms | **2.40x** |
+| zstd | **15.05ms** | 39.84ms | **2.65x** | **2.29ms** | 4.43ms | **1.93x** |
+| lz4 | **13.09ms** | 30.27ms | **2.31x** | **1.03ms** | 3.10ms | **3.01x** |
 
 #### 100K rows vs PyArrow
 
 | Codec | Carquet Write | PyArrow Write | W ratio | Carquet Read | PyArrow Read | R ratio |
 |-------|--------------|---------------|---------|-------------|--------------|---------|
-| none | **1.01ms** | 1.96ms | **1.94x** | **0.02ms** | 0.23ms | **11.5x**\* |
-| snappy | **1.58ms** | 2.99ms | **1.89x** | **0.35ms** | 0.59ms | **1.69x** |
-| zstd | **1.69ms** | 4.22ms | **2.50x** | **0.63ms** | 0.80ms | **1.27x** |
-| lz4 | **1.56ms** | 3.02ms | **1.94x** | **0.25ms** | 0.40ms | **1.60x** |
+| none | **1.13ms** | 1.95ms | **1.73x** | **0.02ms** | 0.23ms | **11.5x**\* |
+| snappy | **1.64ms** | 2.98ms | **1.82x** | **0.37ms** | 0.59ms | **1.59x** |
+| zstd | **1.69ms** | 4.15ms | **2.46x** | **0.64ms** | 0.81ms | **1.27x** |
+| lz4 | **1.58ms** | 3.05ms | **1.93x** | **0.25ms** | 0.40ms | **1.60x** |
 
 \* Zero-copy mmap path
 

@@ -12,11 +12,11 @@
 #include <arm_acle.h>
 
 static uint32_t crc32_arm_impl(uint32_t crc, const uint8_t* data, size_t length) {
-    /* Process 8 bytes at a time */
+    /* Process 8 bytes at a time using CRC32C (Castagnoli) intrinsics */
     while (length >= 8) {
         uint64_t val;
         __builtin_memcpy(&val, data, 8);
-        crc = __crc32d(crc, val);
+        crc = __crc32cd(crc, val);
         data += 8;
         length -= 8;
     }
@@ -25,7 +25,7 @@ static uint32_t crc32_arm_impl(uint32_t crc, const uint8_t* data, size_t length)
     if (length >= 4) {
         uint32_t val;
         __builtin_memcpy(&val, data, 4);
-        crc = __crc32w(crc, val);
+        crc = __crc32cw(crc, val);
         data += 4;
         length -= 4;
     }
@@ -34,14 +34,14 @@ static uint32_t crc32_arm_impl(uint32_t crc, const uint8_t* data, size_t length)
     if (length >= 2) {
         uint16_t val;
         __builtin_memcpy(&val, data, 2);
-        crc = __crc32h(crc, val);
+        crc = __crc32ch(crc, val);
         data += 2;
         length -= 2;
     }
 
     /* Process remaining byte */
     if (length >= 1) {
-        crc = __crc32b(crc, *data);
+        crc = __crc32cb(crc, *data);
     }
 
     return crc;

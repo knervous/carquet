@@ -1057,6 +1057,8 @@ int64_t carquet_neon_find_run_length_i32(const int32_t* values, int64_t count) {
 uint32_t carquet_neon_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
     size_t i = 0;
 
+    crc = ~crc;
+
     /* Process 32 bytes at a time (unrolled) */
     for (; i + 32 <= len; i += 32) {
         uint64_t v0, v1, v2, v3;
@@ -1098,7 +1100,7 @@ uint32_t carquet_neon_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
         crc = __crc32cb(crc, data[i]);
     }
 
-    return crc;
+    return ~crc;
 }
 
 #else
