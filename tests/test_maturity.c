@@ -799,8 +799,7 @@ static int test_auto_row_group_flush_aligned_batches(void) {
         TEST_FAIL("auto_row_group_flush_aligned_batches", "writer creation failed");
     }
 
-    const int NUM_ROW_GROUPS = 3;
-    const int ROWS_PER_GROUP = 10;
+    enum { NUM_ROW_GROUPS = 3, ROWS_PER_GROUP = 10 };
     int32_t ids[ROWS_PER_GROUP];
     double values[ROWS_PER_GROUP];
 

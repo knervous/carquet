@@ -723,7 +723,7 @@ void carquet_column_reader_free(carquet_column_reader_t* reader) {
     if (!reader) return;
 
     free(reader->page_buffer);
-    free(reader->page_data_for_values);
+    carquet_column_clear_retained_pages(reader);
     if (reader->dictionary_ownership == CARQUET_DATA_OWNED) {
         free(reader->dictionary_data);
     }

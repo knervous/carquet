@@ -113,6 +113,16 @@ struct carquet_reader {
  * ============================================================================
  */
 
+/**
+ * Node in the BYTE_ARRAY page retention list.
+ * Flexible array member holds the actual page bytes.
+ */
+typedef struct carquet_retained_page {
+    struct carquet_retained_page* next;
+    size_t size;
+    uint8_t data[];
+} carquet_retained_page_t;
+
 struct carquet_column_reader {
     carquet_reader_t* file_reader;
     int32_t row_group_index;
@@ -146,8 +156,14 @@ struct carquet_column_reader {
     uint32_t* dictionary_offsets;  /* Offset cache for O(1) BYTE_ARRAY lookup */
     carquet_data_ownership_t dictionary_ownership; /* OWNED or VIEW */
 
-    /* Retained page data for BYTE_ARRAY value pointers */
-    uint8_t* page_data_for_values;
+    /* Retained page data for BYTE_ARRAY value pointers.
+     * When a BYTE_ARRAY PLAIN page is decoded, the resulting
+     * carquet_byte_array_t.data pointers reference bytes inside the
+     * (decompressed or file) page buffer. A single batch read may span
+     * multiple pages, so we must keep EVERY page buffer alive until the
+     * batch is consumed. We accumulate them in a singly linked list that
+     * is flushed on row-group reset and column-reader free. */
+    struct carquet_retained_page* retained_pages;
 
     /* Current page state for partial reads */
     bool page_loaded;           /* Is a page currently loaded? */
@@ -211,6 +227,23 @@ bool carquet_page_is_zero_copy_eligible(
 carquet_status_t carquet_column_ensure_page_loaded(
     carquet_column_reader_t* reader,
     carquet_error_t* error);
+
+/**
+ * Retain a copy of a page data buffer on the column reader's retention list.
+ * Returns the pointer to the retained bytes (stable until the retention list
+ * is flushed) on success, or NULL on out-of-memory.
+ * BYTE_ARRAY PLAIN decoding uses this so that carquet_byte_array_t.data
+ * pointers remain valid across page boundaries within a batch.
+ */
+uint8_t* carquet_column_retain_page(
+    carquet_column_reader_t* reader,
+    const uint8_t* src,
+    size_t size);
+
+/**
+ * Free and clear the retained page list on the column reader.
+ */
+void carquet_column_clear_retained_pages(carquet_column_reader_t* reader);
 
 /* ============================================================================
  * Page Decompression (shared between page_reader and batch_reader)

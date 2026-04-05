@@ -564,9 +564,8 @@ static void reset_column_reader_for_row_group(
     }
     col_reader->decoded_ownership = CARQUET_DATA_OWNED;
 
-    /* Free BYTE_ARRAY page data retention buffer */
-    free(col_reader->page_data_for_values);
-    col_reader->page_data_for_values = NULL;
+    /* Free BYTE_ARRAY page data retention list */
+    carquet_column_clear_retained_pages(col_reader);
 
     /* Keep reusable buffers: decoded_values, decoded_def_levels,
      * decoded_rep_levels, indices_buffer, decompress_buffer.

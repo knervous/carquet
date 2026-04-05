@@ -238,6 +238,32 @@ static bool page_values_can_be_viewed_directly(
 #endif
 }
 
+void carquet_column_clear_retained_pages(carquet_column_reader_t* reader) {
+    carquet_retained_page_t* p = reader->retained_pages;
+    while (p) {
+        carquet_retained_page_t* next = p->next;
+        free(p);
+        p = next;
+    }
+    reader->retained_pages = NULL;
+}
+
+uint8_t* carquet_column_retain_page(
+    carquet_column_reader_t* reader,
+    const uint8_t* src,
+    size_t size) {
+    carquet_retained_page_t* node =
+        (carquet_retained_page_t*)malloc(sizeof(carquet_retained_page_t) + size);
+    if (!node) return NULL;
+    node->next = reader->retained_pages;
+    node->size = size;
+    if (size > 0 && src != NULL) {
+        memcpy(node->data, src, size);
+    }
+    reader->retained_pages = node;
+    return node->data;
+}
+
 static void release_decoded_level_buffers(carquet_column_reader_t* reader) {
     free(reader->decoded_def_levels);
     free(reader->decoded_rep_levels);
@@ -1614,18 +1640,18 @@ static carquet_status_t load_next_page_mmap(
 
     /* For BYTE_ARRAY PLAIN columns with compressed data, retain a copy of the
      * decompressed buffer since carquet_byte_array_t.data pointers reference it.
-     * The decompression buffer itself is reused across pages, so we must copy. */
+     * The decompression buffer is reused across pages, AND a single batch read
+     * may span multiple pages, so every page must be retained until the batch
+     * is consumed (list is flushed on row-group reset / reader close). */
     if (decompressed && reader->type == CARQUET_PHYSICAL_BYTE_ARRAY &&
         page_encoding == CARQUET_ENCODING_PLAIN) {
-        free(reader->page_data_for_values);
-        reader->page_data_for_values = malloc(page_size);
-        if (!reader->page_data_for_values) {
+        uint8_t* retained = carquet_column_retain_page(reader, decompressed, page_size);
+        if (!retained) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to retain page data");
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
-        memcpy(reader->page_data_for_values, decompressed, page_size);
         /* Fixup BYTE_ARRAY pointers to reference the retained copy */
-        ptrdiff_t offset = reader->page_data_for_values - decompressed;
+        ptrdiff_t offset = retained - decompressed;
         carquet_byte_array_t* ba = (carquet_byte_array_t*)reader->decoded_values;
         for (int64_t i = 0; i < decoded_count; i++) {
             if (ba[i].data) {
@@ -1867,21 +1893,20 @@ static carquet_status_t load_next_page_fread(
     }
 
     /* For BYTE_ARRAY PLAIN columns, the decoded carquet_byte_array_t structs
-     * have .data pointers into the page data buffer. Retain the buffer so
-     * these pointers remain valid until the next page is loaded. */
+     * have .data pointers into the page data buffer. Retain every page buffer
+     * so those pointers stay valid across page boundaries within a batch;
+     * the retention list is flushed on row-group reset / reader close. */
     bool retain = (reader->type == CARQUET_PHYSICAL_BYTE_ARRAY &&
                    page_encoding == CARQUET_ENCODING_PLAIN);
 
     if (retain) {
-        free(reader->page_data_for_values);
-        reader->page_data_for_values = malloc(page_size);
-        if (!reader->page_data_for_values) {
+        uint8_t* retained = carquet_column_retain_page(reader, page_data, page_size);
+        if (!retained) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to retain page data");
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
-        memcpy(reader->page_data_for_values, page_data, page_size);
 
-        ptrdiff_t offset = reader->page_data_for_values - page_data;
+        ptrdiff_t offset = retained - page_data;
         carquet_byte_array_t* ba = (carquet_byte_array_t*)reader->decoded_values;
         for (int64_t i = 0; i < decoded_count; i++) {
             if (ba[i].data) {
