@@ -57,7 +57,10 @@ extern carquet_status_t carquet_row_group_writer_add_column(
     carquet_physical_type_t type,
     int16_t max_def_level,
     int16_t max_rep_level,
-    int32_t type_length);
+    int32_t type_length,
+    carquet_encoding_t encoding,
+    carquet_compression_t compression,
+    int32_t compression_level);
 
 extern carquet_status_t carquet_row_group_writer_write_column(
     carquet_row_group_writer_t* writer,
@@ -212,12 +215,15 @@ struct carquet_writer {
     int32_t num_kv_metadata;
     int32_t kv_metadata_capacity;
 
-    /* Per-column overrides */
-    carquet_encoding_t* column_encoding_overrides;  /* NULL = use default */
-    carquet_compression_t* column_compression_overrides;  /* NULL = use global */
-    int32_t* column_compression_levels;  /* NULL = use global */
-    bool* column_statistics_overrides;  /* NULL = use global */
-    bool* column_bloom_filter_overrides;  /* NULL = use global */
+    /* Per-column overrides. _set flags distinguish "not overridden" from an
+       overriding value of 0 (PLAIN / UNCOMPRESSED are both 0 in their enums). */
+    carquet_encoding_t* column_encoding_overrides;
+    bool* column_encoding_override_set;
+    carquet_compression_t* column_compression_overrides;
+    int32_t* column_compression_levels;
+    bool* column_compression_override_set;
+    bool* column_statistics_overrides;
+    bool* column_bloom_filter_overrides;
     bool column_overrides_allocated;
 
     /* Buffer writer support */
@@ -445,6 +451,14 @@ static carquet_status_t store_schema_elements(
     return CARQUET_OK;
 }
 
+static carquet_compression_t effective_column_compression(
+    const carquet_writer_t* writer, int32_t column_index);
+static int32_t effective_column_compression_level(
+    const carquet_writer_t* writer, int32_t column_index);
+static carquet_encoding_t effective_column_encoding(
+    const carquet_writer_t* writer, int32_t column_index,
+    carquet_physical_type_t type, carquet_compression_t compression);
+
 static carquet_status_t build_column_metadata_cache(
     carquet_writer_t* writer,
     const carquet_schema_t* schema) {
@@ -486,12 +500,10 @@ static carquet_status_t build_column_metadata_cache(
             }
         }
 
+        carquet_physical_type_t phys = schema->elements[elem_idx].type;
+        carquet_compression_t col_comp = effective_column_compression(writer, i);
         writer->column_encodings[i][0] =
-            (writer->options.compression != CARQUET_COMPRESSION_UNCOMPRESSED &&
-             (schema->elements[elem_idx].type == CARQUET_PHYSICAL_FLOAT ||
-              schema->elements[elem_idx].type == CARQUET_PHYSICAL_DOUBLE))
-                ? CARQUET_ENCODING_BYTE_STREAM_SPLIT
-                : CARQUET_ENCODING_PLAIN;
+            effective_column_encoding(writer, i, phys, col_comp);
         writer->column_encodings[i][1] = CARQUET_ENCODING_RLE;
     }
 
@@ -502,20 +514,18 @@ static carquet_status_t ensure_column_overrides(carquet_writer_t* writer) {
     if (writer->column_overrides_allocated) return CARQUET_OK;
     int32_t n = writer->num_columns;
     writer->column_encoding_overrides = calloc(n, sizeof(carquet_encoding_t));
+    writer->column_encoding_override_set = calloc(n, sizeof(bool));
     writer->column_compression_overrides = calloc(n, sizeof(carquet_compression_t));
     writer->column_compression_levels = calloc(n, sizeof(int32_t));
+    writer->column_compression_override_set = calloc(n, sizeof(bool));
     writer->column_statistics_overrides = calloc(n, sizeof(bool));
     writer->column_bloom_filter_overrides = calloc(n, sizeof(bool));
-    if (!writer->column_encoding_overrides || !writer->column_compression_overrides ||
-        !writer->column_compression_levels || !writer->column_statistics_overrides ||
-        !writer->column_bloom_filter_overrides) {
+    if (!writer->column_encoding_overrides || !writer->column_encoding_override_set ||
+        !writer->column_compression_overrides || !writer->column_compression_levels ||
+        !writer->column_compression_override_set ||
+        !writer->column_statistics_overrides || !writer->column_bloom_filter_overrides) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
-    /* Initialize to "use defaults" (0 = no override for encoding/compression,
-       true matches global defaults for stats, false for bloom) */
-    memset(writer->column_encoding_overrides, 0, n * sizeof(carquet_encoding_t));
-    memset(writer->column_compression_overrides, 0, n * sizeof(carquet_compression_t));
-    memset(writer->column_compression_levels, 0, n * sizeof(int32_t));
     for (int32_t i = 0; i < n; i++) {
         writer->column_statistics_overrides[i] = writer->options.write_statistics;
         writer->column_bloom_filter_overrides[i] = writer->options.write_bloom_filters;
@@ -526,16 +536,54 @@ static carquet_status_t ensure_column_overrides(carquet_writer_t* writer) {
 
 static void free_column_overrides(carquet_writer_t* writer) {
     free(writer->column_encoding_overrides);
+    free(writer->column_encoding_override_set);
     free(writer->column_compression_overrides);
     free(writer->column_compression_levels);
+    free(writer->column_compression_override_set);
     free(writer->column_statistics_overrides);
     free(writer->column_bloom_filter_overrides);
     writer->column_encoding_overrides = NULL;
+    writer->column_encoding_override_set = NULL;
     writer->column_compression_overrides = NULL;
     writer->column_compression_levels = NULL;
+    writer->column_compression_override_set = NULL;
     writer->column_statistics_overrides = NULL;
     writer->column_bloom_filter_overrides = NULL;
     writer->column_overrides_allocated = false;
+}
+
+static carquet_compression_t effective_column_compression(
+    const carquet_writer_t* writer, int32_t column_index) {
+    if (writer->column_overrides_allocated &&
+        writer->column_compression_override_set[column_index]) {
+        return writer->column_compression_overrides[column_index];
+    }
+    return writer->options.compression;
+}
+
+static int32_t effective_column_compression_level(
+    const carquet_writer_t* writer, int32_t column_index) {
+    if (writer->column_overrides_allocated &&
+        writer->column_compression_override_set[column_index]) {
+        return writer->column_compression_levels[column_index];
+    }
+    return writer->options.compression_level;
+}
+
+static carquet_encoding_t effective_column_encoding(
+    const carquet_writer_t* writer,
+    int32_t column_index,
+    carquet_physical_type_t type,
+    carquet_compression_t compression) {
+    if (writer->column_overrides_allocated &&
+        writer->column_encoding_override_set[column_index]) {
+        return writer->column_encoding_overrides[column_index];
+    }
+    if (compression != CARQUET_COMPRESSION_UNCOMPRESSED &&
+        (type == CARQUET_PHYSICAL_FLOAT || type == CARQUET_PHYSICAL_DOUBLE)) {
+        return CARQUET_ENCODING_BYTE_STREAM_SPLIT;
+    }
+    return CARQUET_ENCODING_PLAIN;
 }
 
 static void free_kv_metadata(carquet_writer_t* writer) {
@@ -575,16 +623,25 @@ static carquet_status_t ensure_row_group(carquet_writer_t* writer) {
         writer->options.write_crc,
         writer->options.compression_level);
 
-    /* Add all columns to the row group writer */
+    /* Add all columns to the row group writer, resolving any per-column
+       encoding/compression overrides into explicit values */
     for (int32_t i = 0; i < writer->num_columns; i++) {
         writer_column_def_t* col = &writer->columns[i];
+        carquet_compression_t col_comp = effective_column_compression(writer, i);
+        int32_t col_level = effective_column_compression_level(writer, i);
+        carquet_encoding_t col_enc = effective_column_encoding(
+            writer, i, col->physical_type, col_comp);
+
         carquet_status_t status = carquet_row_group_writer_add_column(
             writer->current_row_group,
             col->name,
             col->physical_type,
             col->max_def_level,
             col->max_rep_level,
-            col->type_length);
+            col->type_length,
+            col_enc,
+            col_comp,
+            col_level);
 
         if (status != CARQUET_OK) {
             carquet_row_group_writer_destroy(writer->current_row_group);
@@ -1446,6 +1503,7 @@ carquet_status_t carquet_writer_set_column_encoding(
     if (status != CARQUET_OK) return status;
 
     writer->column_encoding_overrides[column_index] = encoding;
+    writer->column_encoding_override_set[column_index] = true;
     return CARQUET_OK;
 }
 
@@ -1465,6 +1523,7 @@ carquet_status_t carquet_writer_set_column_compression(
 
     writer->column_compression_overrides[column_index] = codec;
     writer->column_compression_levels[column_index] = level;
+    writer->column_compression_override_set[column_index] = true;
     return CARQUET_OK;
 }
 

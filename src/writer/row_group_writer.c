@@ -131,18 +131,6 @@ typedef struct finalized_column_chunk {
     carquet_status_t status;
 } finalized_column_chunk_t;
 
-static carquet_encoding_t choose_column_encoding(
-    carquet_physical_type_t type,
-    carquet_compression_t compression) {
-
-    if (compression != CARQUET_COMPRESSION_UNCOMPRESSED &&
-        (type == CARQUET_PHYSICAL_FLOAT || type == CARQUET_PHYSICAL_DOUBLE)) {
-        return CARQUET_ENCODING_BYTE_STREAM_SPLIT;
-    }
-
-    return CARQUET_ENCODING_PLAIN;
-}
-
 static bool can_parallel_finalize(const carquet_row_group_writer_t* writer) {
 #ifdef _OPENMP
     return writer && writer->num_columns > 1 && !writer->write_page_index;
@@ -259,7 +247,10 @@ carquet_status_t carquet_row_group_writer_add_column(
     carquet_physical_type_t type,
     int16_t max_def_level,
     int16_t max_rep_level,
-    int32_t type_length) {
+    int32_t type_length,
+    carquet_encoding_t encoding,
+    carquet_compression_t compression,
+    int32_t compression_level) {
 
     if (!writer || !name) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
@@ -285,18 +276,16 @@ carquet_status_t carquet_row_group_writer_add_column(
     }
     writer->column_infos = new_infos;
 
-    /* Create column writer */
-    carquet_encoding_t encoding = choose_column_encoding(type, writer->compression);
-
+    /* Create column writer with caller-resolved encoding/compression */
     carquet_column_writer_internal_t* col_writer = carquet_column_writer_create(
         type,
         encoding,
-        writer->compression,
+        compression,
         max_def_level,
         max_rep_level,
         type_length,
         writer->target_page_size,
-        writer->compression_level);
+        compression_level);
 
     if (!col_writer) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
@@ -318,7 +307,7 @@ carquet_status_t carquet_row_group_writer_add_column(
     memset(&writer->column_infos[writer->num_columns], 0, sizeof(column_chunk_info_t));
     writer->column_infos[writer->num_columns].type = type;
     writer->column_infos[writer->num_columns].encoding = encoding;
-    writer->column_infos[writer->num_columns].compression = writer->compression;
+    writer->column_infos[writer->num_columns].compression = compression;
     writer->column_infos[writer->num_columns].type_length = type_length;
     writer->column_infos[writer->num_columns].path = carquet_heap_strdup(name);
     if (!writer->column_infos[writer->num_columns].path) {

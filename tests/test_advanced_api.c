@@ -322,19 +322,78 @@ static int test_per_column_options(void) {
     carquet_writer_t* w = carquet_writer_create(TEMP_FILE, schema, &opts, &err);
     if (!w) TEST_FAIL("per_column", "create failed");
 
-    /* Set column 0 to uncompressed */
+    /* Override column 0 to UNCOMPRESSED (enum value 0) — the overridden value
+       happens to match the "unset" sentinel, so this exercises the regression
+       where overrides with a 0-valued enum were being silently ignored. */
     carquet_status_t st = carquet_writer_set_column_compression(
         w, 0, CARQUET_COMPRESSION_UNCOMPRESSED, 0);
     if (st != CARQUET_OK) TEST_FAIL("per_column", "set_compression failed");
 
-    st = carquet_writer_set_column_statistics(w, 1, false);
-    if (st != CARQUET_OK) TEST_FAIL("per_column", "set_statistics failed");
+    /* Override column 1 to SNAPPY with explicit BYTE_STREAM_SPLIT encoding */
+    st = carquet_writer_set_column_compression(w, 1, CARQUET_COMPRESSION_SNAPPY, 0);
+    if (st != CARQUET_OK) TEST_FAIL("per_column", "set_compression 1 failed");
+    st = carquet_writer_set_column_encoding(w, 1, CARQUET_ENCODING_BYTE_STREAM_SPLIT);
+    if (st != CARQUET_OK) TEST_FAIL("per_column", "set_encoding 1 failed");
+
+    /* Override column 2 to PLAIN encoding (enum value 0) — same 0-sentinel
+       regression for encoding */
+    st = carquet_writer_set_column_encoding(w, 2, CARQUET_ENCODING_PLAIN);
+    if (st != CARQUET_OK) TEST_FAIL("per_column", "set_encoding 2 failed");
 
     /* Invalid column index */
     st = carquet_writer_set_column_encoding(w, 99, CARQUET_ENCODING_PLAIN);
     if (st == CARQUET_OK) TEST_FAIL("per_column", "should reject invalid index");
 
-    carquet_writer_abort(w);
+    /* Write data and close so we can read the metadata back */
+    int64_t ids[N_ROWS];
+    double vals[N_ROWS];
+    for (int i = 0; i < N_ROWS; i++) { ids[i] = i; vals[i] = i * 1.5; }
+    st = carquet_writer_write_batch(w, 0, ids, N_ROWS, NULL, NULL);
+    if (st != CARQUET_OK) TEST_FAIL("per_column", "write 0 failed");
+    st = carquet_writer_write_batch(w, 1, vals, N_ROWS, NULL, NULL);
+    if (st != CARQUET_OK) TEST_FAIL("per_column", "write 1 failed");
+
+    carquet_byte_array_t labels[N_ROWS];
+    int16_t def[N_ROWS];
+    int non_null = 0;
+    for (int i = 0; i < N_ROWS; i++) {
+        if (i % 2 == 0) {
+            def[i] = 1;
+            labels[non_null].data = (uint8_t*)"abc";
+            labels[non_null].length = 3;
+            non_null++;
+        } else {
+            def[i] = 0;
+        }
+    }
+    st = carquet_writer_write_batch(w, 2, labels, N_ROWS, def, NULL);
+    if (st != CARQUET_OK) TEST_FAIL("per_column", "write 2 failed");
+    st = carquet_writer_close(w);
+    if (st != CARQUET_OK) TEST_FAIL("per_column", "close failed");
+
+    carquet_reader_t* r = carquet_reader_open(TEMP_FILE, NULL, NULL);
+    if (!r) TEST_FAIL("per_column", "read open failed");
+
+    carquet_column_chunk_metadata_t m0, m1, m2;
+    if (carquet_reader_column_chunk_metadata(r, 0, 0, &m0) != CARQUET_OK ||
+        carquet_reader_column_chunk_metadata(r, 0, 1, &m1) != CARQUET_OK ||
+        carquet_reader_column_chunk_metadata(r, 0, 2, &m2) != CARQUET_OK) {
+        TEST_FAIL("per_column", "column_chunk_metadata failed");
+    }
+
+    if (m0.codec != CARQUET_COMPRESSION_UNCOMPRESSED)
+        TEST_FAIL("per_column", "col 0 codec override not applied");
+    if (m1.codec != CARQUET_COMPRESSION_SNAPPY)
+        TEST_FAIL("per_column", "col 1 codec override not applied");
+    if (m2.codec != CARQUET_COMPRESSION_ZSTD)
+        TEST_FAIL("per_column", "col 2 codec should fall back to global");
+
+    if (m1.encodings[0] != CARQUET_ENCODING_BYTE_STREAM_SPLIT)
+        TEST_FAIL("per_column", "col 1 encoding override not applied");
+    if (m2.encodings[0] != CARQUET_ENCODING_PLAIN)
+        TEST_FAIL("per_column", "col 2 encoding override not applied");
+
+    carquet_reader_close(r);
     carquet_schema_free(schema);
     TEST_PASS("per_column");
     return 0;
