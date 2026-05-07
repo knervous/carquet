@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdint.h>
 
 #include "core/arena.h"
 #include "core/buffer.h"
@@ -135,6 +136,23 @@ static int test_arena_save_restore(void) {
     return 0;
 }
 
+static int test_arena_overflow_rejected(void) {
+    carquet_arena_t arena;
+    if (carquet_arena_init(&arena) != CARQUET_OK) {
+        TEST_FAIL("arena_overflow_rejected", "init failed");
+    }
+
+    void* p = carquet_arena_alloc(&arena, SIZE_MAX);
+    if (p != NULL) {
+        carquet_arena_destroy(&arena);
+        TEST_FAIL("arena_overflow_rejected", "oversized allocation succeeded");
+    }
+
+    carquet_arena_destroy(&arena);
+    TEST_PASS("arena_overflow_rejected");
+    return 0;
+}
+
 /* ============================================================================
  * Buffer Tests
  * ============================================================================
@@ -212,6 +230,23 @@ static int test_buffer_reader(void) {
     assert(carquet_buffer_reader_remaining(&reader) == 0);
 
     TEST_PASS("buffer_reader");
+    return 0;
+}
+
+static int test_buffer_append_overflow_rejected(void) {
+    carquet_buffer_t buf;
+    uint8_t storage[8] = {0};
+    uint8_t byte = 1;
+
+    carquet_buffer_init_wrap(&buf, storage, sizeof(storage));
+    if (carquet_buffer_append(&buf, &byte, SIZE_MAX) != CARQUET_ERROR_OUT_OF_MEMORY) {
+        TEST_FAIL("buffer_append_overflow_rejected", "overflow append was not rejected");
+    }
+    if (carquet_buffer_size(&buf) != sizeof(storage)) {
+        TEST_FAIL("buffer_append_overflow_rejected", "buffer size changed after failed append");
+    }
+
+    TEST_PASS("buffer_append_overflow_rejected");
     return 0;
 }
 
@@ -504,11 +539,13 @@ int main(void) {
     failures += test_arena_basic();
     failures += test_arena_large_allocation();
     failures += test_arena_save_restore();
+    failures += test_arena_overflow_rejected();
 
     /* Buffer tests */
     failures += test_buffer_basic();
     failures += test_buffer_integers();
     failures += test_buffer_reader();
+    failures += test_buffer_append_overflow_rejected();
 
     /* Endian tests */
     failures += test_endian_read_write();

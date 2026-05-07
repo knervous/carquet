@@ -551,6 +551,17 @@ carquet_status_t carquet_page_writer_add_values(
     }
 
     carquet_status_t status = CARQUET_OK;
+    size_t values_size_before = writer->values_buffer.size;
+    size_t def_size_before = writer->def_levels_buffer.size;
+    size_t rep_size_before = writer->rep_levels_buffer.size;
+    int64_t num_values_before = writer->num_values;
+    int64_t num_nulls_before = writer->num_nulls;
+    bool has_min_max_before = writer->has_min_max;
+    size_t min_max_size_before = writer->min_max_size;
+    uint8_t min_value_before[sizeof(writer->min_value)];
+    uint8_t max_value_before[sizeof(writer->max_value)];
+    memcpy(min_value_before, writer->min_value, sizeof(min_value_before));
+    memcpy(max_value_before, writer->max_value, sizeof(max_value_before));
 
     /* Count nulls and non-null values */
     int64_t num_non_null = num_values;
@@ -567,14 +578,17 @@ carquet_status_t carquet_page_writer_add_values(
         status = encode_levels(def_levels, num_values, writer->max_def_level,
                                &writer->def_levels_buffer);
         if (status != CARQUET_OK) {
-            return status;
+            goto fail;
         }
     }
 
     /* Encode repetition levels */
     if (writer->max_rep_level > 0 && rep_levels) {
-        encode_levels(rep_levels, num_values, writer->max_rep_level,
-                      &writer->rep_levels_buffer);
+        status = encode_levels(rep_levels, num_values, writer->max_rep_level,
+                               &writer->rep_levels_buffer);
+        if (status != CARQUET_OK) {
+            goto fail;
+        }
     }
 
     /* Encode values using PLAIN encoding.
@@ -653,7 +667,23 @@ carquet_status_t carquet_page_writer_add_values(
             status = CARQUET_ERROR_NOT_IMPLEMENTED;
     }
 
+    if (status != CARQUET_OK) {
+        goto fail;
+    }
+
     writer->num_values += num_values;
+    return status;
+
+fail:
+    writer->values_buffer.size = values_size_before;
+    writer->def_levels_buffer.size = def_size_before;
+    writer->rep_levels_buffer.size = rep_size_before;
+    writer->num_values = num_values_before;
+    writer->num_nulls = num_nulls_before;
+    writer->has_min_max = has_min_max_before;
+    writer->min_max_size = min_max_size_before;
+    memcpy(writer->min_value, min_value_before, sizeof(writer->min_value));
+    memcpy(writer->max_value, max_value_before, sizeof(writer->max_value));
     return status;
 }
 

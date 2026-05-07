@@ -17,7 +17,14 @@
 
 #define N_ROWS 5000
 
-static const char* TEMP_FILE = "/tmp/test_advanced_api.parquet";
+static const char* get_temp_file(void) {
+    static char path[1024] = {0};
+    if (path[0] == 0) {
+        carquet_test_temp_path(path, sizeof(path), "test_advanced_api");
+    }
+    return path;
+}
+#define TEMP_FILE (get_temp_file())
 
 static carquet_schema_t* make_schema(void) {
     carquet_schema_t* s = carquet_schema_create(NULL);

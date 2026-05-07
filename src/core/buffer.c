@@ -29,6 +29,14 @@ static size_t next_power_of_two(size_t n) {
     return n + 1;
 }
 
+static int add_overflows_size(size_t a, size_t b, size_t* out) {
+    if (a > SIZE_MAX - b) {
+        return 1;
+    }
+    *out = a + b;
+    return 0;
+}
+
 static carquet_status_t ensure_capacity(carquet_buffer_t* buf, size_t needed) {
     if (needed <= buf->capacity) {
         return CARQUET_OK;
@@ -40,6 +48,9 @@ static carquet_status_t ensure_capacity(carquet_buffer_t* buf, size_t needed) {
     }
 
     size_t new_capacity = next_power_of_two(needed);
+    if (new_capacity < needed) {
+        new_capacity = needed;
+    }
     if (new_capacity < CARQUET_BUFFER_DEFAULT_CAPACITY) {
         new_capacity = CARQUET_BUFFER_DEFAULT_CAPACITY;
     }
@@ -184,7 +195,12 @@ carquet_status_t carquet_buffer_append(carquet_buffer_t* buf,
     }
     assert(data != NULL);
 
-    carquet_status_t status = ensure_capacity(buf, buf->size + size);
+    size_t needed;
+    if (add_overflows_size(buf->size, size, &needed)) {
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+
+    carquet_status_t status = ensure_capacity(buf, needed);
     if (CARQUET_FAILED(status)) {
         return status;
     }
@@ -206,7 +222,12 @@ carquet_status_t carquet_buffer_append_fill(carquet_buffer_t* buf,
         return CARQUET_OK;
     }
 
-    carquet_status_t status = ensure_capacity(buf, buf->size + count);
+    size_t needed;
+    if (add_overflows_size(buf->size, count, &needed)) {
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
+
+    carquet_status_t status = ensure_capacity(buf, needed);
     if (CARQUET_FAILED(status)) {
         return status;
     }
@@ -253,7 +274,12 @@ uint8_t* carquet_buffer_advance(carquet_buffer_t* buf, size_t size) {
         return NULL;
     }
 
-    carquet_status_t status = ensure_capacity(buf, buf->size + size);
+    size_t needed;
+    if (add_overflows_size(buf->size, size, &needed)) {
+        return NULL;
+    }
+
+    carquet_status_t status = ensure_capacity(buf, needed);
     if (CARQUET_FAILED(status)) {
         return NULL;
     }

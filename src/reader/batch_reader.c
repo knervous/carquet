@@ -30,6 +30,8 @@
 extern void carquet_dispatch_build_null_bitmap(const int16_t* def_levels, int64_t count,
                                                 int16_t max_def_level, uint8_t* null_bitmap);
 
+#define CARQUET_MAX_PAGE_PAYLOAD_SIZE (256ULL * 1024 * 1024)
+
 /* ============================================================================
  * Internal Structures
  * ============================================================================
@@ -1005,23 +1007,27 @@ static void coalesced_read_column_range(
         parquet_page_header_t hdr;
         size_t hdr_size;
         if (parquet_parse_page_header(ptr, max_hdr, &hdr, &hdr_size, NULL) != CARQUET_OK)
-            break;
+            goto fallback;
 
-        if (hdr.type != CARQUET_PAGE_DATA && hdr.type != CARQUET_PAGE_DATA_V2)
-            break;
+        if (hdr.type != CARQUET_PAGE_DATA)
+            goto fallback;
 
-        int32_t num_values = (hdr.type == CARQUET_PAGE_DATA_V2)
-            ? hdr.data_page_header_v2.num_values
-            : hdr.data_page_header.num_values;
-        carquet_encoding_t encoding = (hdr.type == CARQUET_PAGE_DATA_V2)
-            ? hdr.data_page_header_v2.encoding
-            : hdr.data_page_header.encoding;
+        int32_t num_values = hdr.data_page_header.num_values;
+        carquet_encoding_t encoding = hdr.data_page_header.encoding;
 
-        if (num_values <= 0 || total_values + num_values > max_values) break;
+        if (num_values <= 0 || total_values + num_values > max_values) goto fallback;
 
         const uint8_t* compressed = ptr + hdr_size;
         size_t comp_size = (size_t)hdr.compressed_page_size;
         size_t uncomp_size = (size_t)hdr.uncompressed_page_size;
+        if (hdr.compressed_page_size <= 0 ||
+            hdr.uncompressed_page_size < 0 ||
+            comp_size > CARQUET_MAX_PAGE_PAYLOAD_SIZE ||
+            uncomp_size > CARQUET_MAX_PAGE_PAYLOAD_SIZE ||
+            hdr_size > remaining ||
+            comp_size > remaining - hdr_size) {
+            goto fallback;
+        }
 
         if (encoding == CARQUET_ENCODING_PLAIN) {
             /* Decompress directly to output — data IS the final values */
@@ -1142,12 +1148,19 @@ static int32_t plan_coalesced_column_splits(
         if (parquet_parse_page_header(ptr, max_hdr, &hdr, &hdr_size, NULL) != CARQUET_OK)
             return 0;
 
-        if (hdr.type != CARQUET_PAGE_DATA && hdr.type != CARQUET_PAGE_DATA_V2)
+        if (hdr.type != CARQUET_PAGE_DATA)
             return 0;
 
-        int32_t num_values = (hdr.type == CARQUET_PAGE_DATA_V2)
-            ? hdr.data_page_header_v2.num_values
-            : hdr.data_page_header.num_values;
+        if (hdr.compressed_page_size <= 0 ||
+            hdr.uncompressed_page_size < 0 ||
+            (size_t)hdr.compressed_page_size > CARQUET_MAX_PAGE_PAYLOAD_SIZE ||
+            (size_t)hdr.uncompressed_page_size > CARQUET_MAX_PAGE_PAYLOAD_SIZE ||
+            hdr_size > remaining ||
+            (size_t)hdr.compressed_page_size > remaining - hdr_size) {
+            return 0;
+        }
+
+        int32_t num_values = hdr.data_page_header.num_values;
         if (num_values <= 0) return 0;
 
         values_so_far += num_values;

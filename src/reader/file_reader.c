@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 
 /* External functions from metadata modules */
 extern carquet_status_t carquet_bloom_filter_read(carquet_bloom_filter_t** filter_out,
@@ -597,7 +598,12 @@ carquet_status_t carquet_reader_prebuffer(
             col_start = meta->dictionary_page_offset;
         }
 
-        int64_t col_end = meta->data_page_offset + meta->total_compressed_size;
+        if (col_start < 0 || meta->total_compressed_size < 0 ||
+            col_start > INT64_MAX - meta->total_compressed_size) {
+            continue;
+        }
+
+        int64_t col_end = col_start + meta->total_compressed_size;
 
         if (col_start < min_offset) min_offset = col_start;
         if (col_end > max_end) max_end = col_end;
@@ -620,7 +626,8 @@ carquet_status_t carquet_reader_prebuffer(
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
-    if (fseek(reader->file, (long)min_offset, SEEK_SET) != 0) {
+    if (min_offset > LONG_MAX ||
+        fseek(reader->file, (long)min_offset, SEEK_SET) != 0) {
         free(buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek for prebuffer");
         return CARQUET_ERROR_FILE_SEEK;
@@ -868,7 +875,9 @@ static carquet_status_t reader_read_bytes(
     }
 
     /* Bounds check */
-    if (offset < 0 || (size_t)(offset + size) > reader->file_size) {
+    if (offset < 0 || offset > INT64_MAX - (int64_t)size ||
+        (size_t)offset > reader->file_size ||
+        (size_t)size > reader->file_size - (size_t)offset) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ,
             "Read at offset %lld size %d exceeds file size %lld",
             (long long)offset, size, (long long)reader->file_size);

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.1
+
+- Hardened page reader bounds checks for mmap and fread paths, including page payload spans, page sizes, and offset arithmetic.
+- Fixed compressed Data Page V2 handling in the fread reader path by decompressing only the compressed data section while preserving uncompressed level bytes.
+- Improved malformed-input resistance with checked allocation/growth arithmetic in core buffer and arena helpers.
+- Tightened batch-reader coalesced reads so unsupported or suspicious page layouts fall back to the standard page reader.
+- Made page writer value appends transactional on encode failure, preventing partial page state from leaking into later writes.
+
 ## v0.4.0
 
 ### New Features

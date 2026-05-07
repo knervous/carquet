@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 
 #if defined(CARQUET_ARCH_ARM) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
 #include <arm_neon.h>
@@ -73,6 +74,10 @@ extern carquet_status_t carquet_byte_stream_split_decode_double(
     double* values,
     int64_t count);
 
+static bool checked_add_size(size_t a, size_t b, size_t* out);
+static bool checked_mul_size(size_t a, size_t b, size_t* out);
+static bool checked_add_i64(int64_t a, int64_t b, int64_t* out);
+
 /* ============================================================================
  * Pre-buffered I/O Helper
  * ============================================================================
@@ -84,17 +89,34 @@ extern carquet_status_t carquet_byte_stream_split_decode_double(
  */
 static size_t prebuf_read_at(carquet_reader_t* file_reader,
                              int64_t offset, void* buf, size_t size) {
+    if (offset < 0 || size > (size_t)INT64_MAX) {
+        return 0;
+    }
+
+    size_t start = (size_t)offset;
+    size_t end = 0;
+    if (!checked_add_size(start, size, &end)) {
+        return 0;
+    }
+    size_t prebuf_start = file_reader->prebuffer.file_offset >= 0
+                        ? (size_t)file_reader->prebuffer.file_offset : 0;
+    size_t prebuf_end = 0;
+    bool prebuf_end_ok = checked_add_size(prebuf_start, file_reader->prebuffer.size,
+                                          &prebuf_end);
+
     /* Check prebuffer cache first */
     if (file_reader->prebuffer.data &&
         offset >= file_reader->prebuffer.file_offset &&
-        offset + (int64_t)size <=
-            file_reader->prebuffer.file_offset + (int64_t)file_reader->prebuffer.size) {
+        prebuf_end_ok &&
+        start >= prebuf_start &&
+        end <= prebuf_end) {
         memcpy(buf, file_reader->prebuffer.data +
                (offset - file_reader->prebuffer.file_offset), size);
         return size;
     }
 
     /* Fall back to fseek + fread */
+    if (offset > LONG_MAX) return 0;
     if (fseek(file_reader->file, (long)offset, SEEK_SET) != 0) return 0;
     return fread(buf, 1, size, file_reader->file);
 }
@@ -151,6 +173,129 @@ carquet_status_t carquet_decompress_page(
  * Utility Functions
  * ============================================================================
  */
+
+#define CARQUET_MAX_PAGE_PAYLOAD_SIZE (256ULL * 1024 * 1024)
+
+static bool checked_add_size(size_t a, size_t b, size_t* out) {
+    if (a > SIZE_MAX - b) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
+static bool checked_mul_size(size_t a, size_t b, size_t* out) {
+    if (a != 0 && b > SIZE_MAX / a) {
+        return false;
+    }
+    *out = a * b;
+    return true;
+}
+
+static bool checked_add_i64(int64_t a, int64_t b, int64_t* out) {
+    if ((b > 0 && a > INT64_MAX - b) ||
+        (b < 0 && a < INT64_MIN - b)) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
+static carquet_status_t validate_page_payload_size(
+    const parquet_page_header_t* header,
+    bool allow_empty,
+    carquet_error_t* error) {
+
+    if (header->compressed_page_size < 0 ||
+        (!allow_empty && header->compressed_page_size == 0) ||
+        (size_t)header->compressed_page_size > CARQUET_MAX_PAGE_PAYLOAD_SIZE ||
+        header->uncompressed_page_size < 0 ||
+        (size_t)header->uncompressed_page_size > CARQUET_MAX_PAGE_PAYLOAD_SIZE) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Page size out of range");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
+
+    if (header->type == CARQUET_PAGE_DATA_V2) {
+        const parquet_data_page_header_v2_t* v2h = &header->data_page_header_v2;
+        if (v2h->num_values <= 0 ||
+            v2h->repetition_levels_byte_length < 0 ||
+            v2h->definition_levels_byte_length < 0) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Invalid V2 page header");
+            return CARQUET_ERROR_INVALID_PAGE;
+        }
+
+        size_t levels_size;
+        if (!checked_add_size((size_t)v2h->repetition_levels_byte_length,
+                              (size_t)v2h->definition_levels_byte_length,
+                              &levels_size) ||
+            levels_size > (size_t)header->compressed_page_size ||
+            levels_size > (size_t)header->uncompressed_page_size) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "V2 level sizes exceed page size");
+            return CARQUET_ERROR_DECODE;
+        }
+    } else if (header->type == CARQUET_PAGE_DATA) {
+        if (header->data_page_header.num_values <= 0) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Invalid data page value count");
+            return CARQUET_ERROR_INVALID_PAGE;
+        }
+    } else if (header->type == CARQUET_PAGE_DICTIONARY) {
+        if (header->dictionary_page_header.num_values < 0) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Invalid dictionary value count");
+            return CARQUET_ERROR_INVALID_PAGE;
+        }
+    }
+
+    return CARQUET_OK;
+}
+
+static carquet_status_t validate_page_payload_span(
+    const carquet_reader_t* file_reader,
+    int64_t page_offset,
+    size_t header_size,
+    int32_t compressed_size,
+    carquet_error_t* error) {
+
+    if (page_offset < 0 || (size_t)page_offset > file_reader->file_size) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Page offset out of range");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
+
+    size_t offset = (size_t)page_offset;
+    size_t payload_start;
+    size_t payload_end;
+    if (!checked_add_size(offset, header_size, &payload_start) ||
+        !checked_add_size(payload_start, (size_t)compressed_size, &payload_end) ||
+        payload_end > file_reader->file_size) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Page payload exceeds file size");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
+
+    return CARQUET_OK;
+}
+
+static carquet_status_t ensure_decompress_capacity(
+    carquet_column_reader_t* reader,
+    size_t needed,
+    const char* message,
+    carquet_error_t* error) {
+
+    if (needed > CARQUET_MAX_PAGE_PAYLOAD_SIZE) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Page size out of range");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
+
+    if (needed > reader->decompress_capacity) {
+        uint8_t* new_buf = realloc(reader->decompress_buffer, needed);
+        if (!new_buf) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "%s", message);
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        reader->decompress_buffer = new_buf;
+        reader->decompress_capacity = needed;
+    }
+
+    return CARQUET_OK;
+}
 
 static inline int bit_width_for_max(int max_val) {
     if (max_val == 0) return 0;
@@ -279,7 +424,13 @@ static carquet_status_t ensure_decoded_page_buffers(
 
     bool need_def_levels = reader->max_def_level > 0;
     bool need_rep_levels = reader->max_rep_level > 0;
-    size_t values_buffer_size = value_size * (size_t)num_values;
+    size_t values_buffer_size = 0;
+
+    if (num_values < 0 ||
+        !checked_mul_size(value_size, (size_t)num_values, &values_buffer_size)) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Decode buffer size overflow");
+        return CARQUET_ERROR_OUT_OF_MEMORY;
+    }
 
     if (reader->decoded_ownership == CARQUET_DATA_VIEW) {
         reader->decoded_values = NULL;
@@ -389,6 +540,11 @@ carquet_status_t carquet_read_dictionary_page(
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
+    if (header->num_values < 0) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Invalid dictionary value count");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
+
     /* Allocate dictionary storage */
     size_t value_size = 0;
     switch (reader->type) {
@@ -464,7 +620,14 @@ carquet_status_t carquet_read_dictionary_page(
         }
     } else {
         /* Fixed size values */
-        size_t dict_size = value_size * header->num_values;
+        size_t dict_size = 0;
+        if (!checked_mul_size(value_size, (size_t)header->num_values, &dict_size)) {
+            if (ownership == CARQUET_DATA_OWNED) {
+                free(page_data);
+            }
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Dictionary size overflow");
+            return CARQUET_ERROR_DECODE;
+        }
         if (dict_size > page_size) {
             if (ownership == CARQUET_DATA_OWNED) {
                 free(page_data);
@@ -1169,6 +1332,99 @@ static size_t get_value_size(carquet_physical_type_t type, int32_t type_length) 
     }
 }
 
+static carquet_status_t prepare_data_page_payload(
+    carquet_column_reader_t* reader,
+    const parquet_column_metadata_t* col_meta,
+    const parquet_page_header_t* page_header,
+    const uint8_t* compressed,
+    const uint8_t** page_data,
+    size_t* page_size,
+    bool* used_decompress_buffer,
+    carquet_error_t* error) {
+
+    bool is_v2 = (page_header->type == CARQUET_PAGE_DATA_V2);
+    carquet_status_t status;
+
+    *page_data = NULL;
+    *page_size = 0;
+    *used_decompress_buffer = false;
+
+    status = validate_page_payload_size(page_header, false, error);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
+    if (is_v2) {
+        const parquet_data_page_header_v2_t* v2h = &page_header->data_page_header_v2;
+        size_t levels_size = (size_t)v2h->repetition_levels_byte_length +
+                             (size_t)v2h->definition_levels_byte_length;
+        size_t compressed_data_size = (size_t)page_header->compressed_page_size - levels_size;
+        bool data_is_compressed = v2h->is_compressed &&
+                                  col_meta->codec != CARQUET_COMPRESSION_UNCOMPRESSED;
+
+        if (data_is_compressed) {
+            size_t uncompressed_data_size =
+                (size_t)page_header->uncompressed_page_size - levels_size;
+            size_t total_needed = levels_size + uncompressed_data_size;
+
+            status = ensure_decompress_capacity(
+                reader, total_needed, "Failed to allocate V2 decompress buffer", error);
+            if (status != CARQUET_OK) {
+                return status;
+            }
+
+            if (levels_size > 0) {
+                memcpy(reader->decompress_buffer, compressed, levels_size);
+            }
+
+            size_t decompressed_data_size = 0;
+            status = carquet_decompress_page(col_meta->codec,
+                compressed + levels_size, compressed_data_size,
+                reader->decompress_buffer + levels_size, uncompressed_data_size,
+                &decompressed_data_size);
+            if (status != CARQUET_OK) {
+                CARQUET_SET_ERROR(error, status, "Failed to decompress V2 page data");
+                return status;
+            }
+
+            *page_data = reader->decompress_buffer;
+            *page_size = levels_size + decompressed_data_size;
+            *used_decompress_buffer = true;
+            return CARQUET_OK;
+        }
+
+        *page_data = compressed;
+        *page_size = (size_t)page_header->compressed_page_size;
+        return CARQUET_OK;
+    }
+
+    if (col_meta->codec == CARQUET_COMPRESSION_UNCOMPRESSED) {
+        *page_data = compressed;
+        *page_size = (size_t)page_header->compressed_page_size;
+        return CARQUET_OK;
+    }
+
+    status = ensure_decompress_capacity(
+        reader, (size_t)page_header->uncompressed_page_size,
+        "Failed to allocate decompress buffer", error);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
+    status = carquet_decompress_page(col_meta->codec,
+        compressed, (size_t)page_header->compressed_page_size,
+        reader->decompress_buffer, (size_t)page_header->uncompressed_page_size,
+        page_size);
+    if (status != CARQUET_OK) {
+        CARQUET_SET_ERROR(error, status, "Failed to decompress page");
+        return status;
+    }
+
+    *page_data = reader->decompress_buffer;
+    *used_decompress_buffer = true;
+    return CARQUET_OK;
+}
+
 /* ============================================================================
  * Helper: Load dictionary page (mmap path)
  * ============================================================================
@@ -1203,6 +1459,16 @@ static carquet_status_t load_dictionary_page_mmap(
     if (page_header.type != CARQUET_PAGE_DICTIONARY) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Expected dictionary page");
         return CARQUET_ERROR_INVALID_PAGE;
+    }
+
+    status = validate_page_payload_size(&page_header, true, error);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+    status = validate_page_payload_span(file_reader, dict_offset, header_size,
+                                        page_header.compressed_page_size, error);
+    if (status != CARQUET_OK) {
+        return status;
     }
 
     /* Get pointer to compressed data */
@@ -1263,8 +1529,14 @@ static carquet_status_t load_dictionary_page_mmap(
      * dictionary-encoded columns. The reliable offset is always right
      * after the dictionary page: dict_offset + header + compressed data. */
     if (status == CARQUET_OK) {
-        reader->data_start_offset = dict_offset + (int64_t)header_size +
-                                    page_header.compressed_page_size;
+        int64_t data_start;
+        if (!checked_add_i64(dict_offset, (int64_t)header_size, &data_start) ||
+            !checked_add_i64(data_start, (int64_t)page_header.compressed_page_size,
+                             &data_start)) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Dictionary page offset overflow");
+            return CARQUET_ERROR_INVALID_PAGE;
+        }
+        reader->data_start_offset = data_start;
     }
 
     if (col_meta->codec != CARQUET_COMPRESSION_UNCOMPRESSED && status != CARQUET_OK) {
@@ -1308,6 +1580,16 @@ static carquet_status_t load_dictionary_page_fread(
         return CARQUET_ERROR_INVALID_PAGE;
     }
 
+    status = validate_page_payload_size(&page_header, true, error);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+    status = validate_page_payload_span(file_reader, dict_offset, header_size,
+                                        page_header.compressed_page_size, error);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
     /* Read compressed data (from prebuffer cache or file) */
     uint8_t* compressed = malloc(page_header.compressed_page_size);
     if (!compressed) {
@@ -1315,7 +1597,12 @@ static carquet_status_t load_dictionary_page_fread(
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
-    int64_t dict_data_offset = dict_offset + (int64_t)header_size;
+    int64_t dict_data_offset;
+    if (!checked_add_i64(dict_offset, (int64_t)header_size, &dict_data_offset)) {
+        free(compressed);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Dictionary page offset overflow");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
     if (prebuf_read_at(file_reader, dict_data_offset,
                        compressed, page_header.compressed_page_size) !=
         (size_t)page_header.compressed_page_size) {
@@ -1375,9 +1662,15 @@ static carquet_status_t load_dictionary_page_fread(
      * dictionary-encoded columns. The reliable offset is always right
      * after the dictionary page: dict_offset + header + compressed data. */
     if (status == CARQUET_OK) {
-        reader->data_start_offset = col_meta->dictionary_page_offset +
-                                    (int64_t)header_size +
-                                    page_header.compressed_page_size;
+        int64_t data_start;
+        if (!checked_add_i64(col_meta->dictionary_page_offset,
+                             (int64_t)header_size, &data_start) ||
+            !checked_add_i64(data_start, (int64_t)page_header.compressed_page_size,
+                             &data_start)) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Dictionary page offset overflow");
+            return CARQUET_ERROR_INVALID_PAGE;
+        }
+        reader->data_start_offset = data_start;
     }
 
     if (status != CARQUET_OK) {
@@ -1413,7 +1706,11 @@ static carquet_status_t load_next_page_mmap(
     }
 
     /* Parse page header directly from mmap */
-    int64_t page_offset = reader->data_start_offset + reader->current_page;
+    int64_t page_offset;
+    if (!checked_add_i64(reader->data_start_offset, reader->current_page, &page_offset)) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Data page offset overflow");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
     if (page_offset < 0 || (size_t)page_offset >= file_reader->file_size) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Data page offset out of range");
         return CARQUET_ERROR_INVALID_PAGE;
@@ -1433,6 +1730,16 @@ static carquet_status_t load_next_page_mmap(
     if (page_header.type != CARQUET_PAGE_DATA && page_header.type != CARQUET_PAGE_DATA_V2) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Expected data page");
         return CARQUET_ERROR_INVALID_PAGE;
+    }
+
+    status = validate_page_payload_size(&page_header, false, error);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+    status = validate_page_payload_span(file_reader, page_offset, header_size,
+                                        page_header.compressed_page_size, error);
+    if (status != CARQUET_OK) {
+        return status;
     }
 
     /* Get pointer to page data in mmap */
@@ -1504,95 +1811,21 @@ static carquet_status_t load_next_page_mmap(
 
     const uint8_t* page_data;
     size_t page_size;
-    uint8_t* decompressed = NULL;
+    bool used_decompress_buffer = false;
 
-    if (is_v2) {
-        /* V2: levels are uncompressed, only data portion is compressed.
-         * Layout: [rep_levels | def_levels | data]
-         * We need to decompress only the data portion. */
-        const parquet_data_page_header_v2_t* v2h = &page_header.data_page_header_v2;
-        size_t levels_size = (size_t)v2h->repetition_levels_byte_length +
-                             (size_t)v2h->definition_levels_byte_length;
-        size_t compressed_data_size = (size_t)page_header.compressed_page_size - levels_size;
-
-        if (levels_size > (size_t)page_header.compressed_page_size) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "V2 level sizes exceed page size");
-            return CARQUET_ERROR_DECODE;
-        }
-
-        bool data_is_compressed = v2h->is_compressed &&
-                                  col_meta->codec != CARQUET_COMPRESSION_UNCOMPRESSED;
-
-        if (data_is_compressed) {
-            /* Decompress only the data portion, keeping levels uncompressed */
-            size_t uncompressed_data_size = (size_t)page_header.uncompressed_page_size - levels_size;
-            size_t total_needed = levels_size + uncompressed_data_size;
-
-            if (total_needed > reader->decompress_capacity) {
-                uint8_t* new_buf = realloc(reader->decompress_buffer, total_needed);
-                if (!new_buf) {
-                    CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate V2 decompress buffer");
-                    return CARQUET_ERROR_OUT_OF_MEMORY;
-                }
-                reader->decompress_buffer = new_buf;
-                reader->decompress_capacity = total_needed;
-            }
-            decompressed = reader->decompress_buffer;
-
-            /* Copy uncompressed levels as-is */
-            memcpy(decompressed, page_data_ptr, levels_size);
-
-            /* Decompress data portion */
-            size_t decompressed_data_size;
-            status = carquet_decompress_page(col_meta->codec,
-                page_data_ptr + levels_size, compressed_data_size,
-                decompressed + levels_size, uncompressed_data_size,
-                &decompressed_data_size);
-
-            if (status != CARQUET_OK) {
-                CARQUET_SET_ERROR(error, status, "Failed to decompress V2 page data");
-                return status;
-            }
-            page_data = decompressed;
-            page_size = levels_size + decompressed_data_size;
-        } else {
-            /* No compression — use data directly */
-            page_data = page_data_ptr;
-            page_size = page_header.compressed_page_size;
-        }
-    } else {
-        /* V1: entire page is compressed together */
-        if (col_meta->codec == CARQUET_COMPRESSION_UNCOMPRESSED) {
-            page_data = page_data_ptr;
-            page_size = page_header.compressed_page_size;
-        } else {
-            /* Must decompress - reuse buffer across pages when possible */
-            size_t needed = page_header.uncompressed_page_size;
-            if (needed > reader->decompress_capacity) {
-                uint8_t* new_buf = realloc(reader->decompress_buffer, needed);
-                if (!new_buf) {
-                    CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate decompress buffer");
-                    return CARQUET_ERROR_OUT_OF_MEMORY;
-                }
-                reader->decompress_buffer = new_buf;
-                reader->decompress_capacity = needed;
-            }
-            decompressed = reader->decompress_buffer;
-
-            status = carquet_decompress_page(col_meta->codec,
-                page_data_ptr, page_header.compressed_page_size,
-                decompressed, page_header.uncompressed_page_size, &page_size);
-
-            if (status != CARQUET_OK) {
-                CARQUET_SET_ERROR(error, status, "Failed to decompress page");
-                return status;
-            }
-            page_data = decompressed;
-        }
+    status = prepare_data_page_payload(reader, col_meta, &page_header, page_data_ptr,
+                                       &page_data, &page_size, &used_decompress_buffer,
+                                       error);
+    if (status != CARQUET_OK) {
+        return status;
     }
 
     if (!is_v2 && page_values_can_be_viewed_directly(reader, page_encoding)) {
-        size_t required_bytes = value_size * (size_t)num_values;
+        size_t required_bytes = 0;
+        if (!checked_mul_size(value_size, (size_t)num_values, &required_bytes)) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Page payload size overflow");
+            return CARQUET_ERROR_DECODE;
+        }
         if (page_size < required_bytes) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Truncated PLAIN page payload");
             return CARQUET_ERROR_DECODE;
@@ -1638,30 +1871,30 @@ static carquet_status_t load_next_page_mmap(
             &decoded_count, error);
     }
 
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
     /* For BYTE_ARRAY PLAIN columns with compressed data, retain a copy of the
      * decompressed buffer since carquet_byte_array_t.data pointers reference it.
      * The decompression buffer is reused across pages, AND a single batch read
      * may span multiple pages, so every page must be retained until the batch
      * is consumed (list is flushed on row-group reset / reader close). */
-    if (decompressed && reader->type == CARQUET_PHYSICAL_BYTE_ARRAY &&
+    if (used_decompress_buffer && reader->type == CARQUET_PHYSICAL_BYTE_ARRAY &&
         page_encoding == CARQUET_ENCODING_PLAIN) {
-        uint8_t* retained = carquet_column_retain_page(reader, decompressed, page_size);
+        uint8_t* retained = carquet_column_retain_page(reader, page_data, page_size);
         if (!retained) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to retain page data");
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
         /* Fixup BYTE_ARRAY pointers to reference the retained copy */
-        ptrdiff_t offset = retained - decompressed;
+        ptrdiff_t offset = retained - page_data;
         carquet_byte_array_t* ba = (carquet_byte_array_t*)reader->decoded_values;
         for (int64_t i = 0; i < decoded_count; i++) {
             if (ba[i].data) {
                 ba[i].data = ba[i].data + offset;
             }
         }
-    }
-
-    if (status != CARQUET_OK) {
-        return status;
     }
 
     reader->page_loaded = true;
@@ -1695,7 +1928,11 @@ static carquet_status_t load_next_page_fread(
 
     /* Read page header (from prebuffer cache or file) */
     int64_t data_offset = reader->data_start_offset;
-    int64_t page_file_offset = data_offset + reader->current_page;
+    int64_t page_file_offset;
+    if (!checked_add_i64(data_offset, reader->current_page, &page_file_offset)) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Data page offset overflow");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
 
     uint8_t header_buf[256];
     size_t header_read = prebuf_read_at(file_reader, page_file_offset,
@@ -1718,11 +1955,15 @@ static carquet_status_t load_next_page_fread(
         return CARQUET_ERROR_INVALID_PAGE;
     }
 
-    /* Reject absurdly large page sizes from malformed metadata (max 256 MB) */
-    if (page_header.compressed_page_size <= 0 ||
-        (size_t)page_header.compressed_page_size > (256ULL * 1024 * 1024)) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Page size out of range");
-        return CARQUET_ERROR_INVALID_PAGE;
+    status = validate_page_payload_size(&page_header, false, error);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
+    status = validate_page_payload_span(file_reader, page_file_offset, header_size,
+                                        page_header.compressed_page_size, error);
+    if (status != CARQUET_OK) {
+        return status;
     }
 
     /* Read compressed page data into a reusable buffer (from prebuffer or file) */
@@ -1738,7 +1979,11 @@ static carquet_status_t load_next_page_fread(
     reader->page_buffer_size = (size_t)page_header.compressed_page_size;
     uint8_t* compressed = reader->page_buffer;
 
-    int64_t page_data_offset = page_file_offset + (int64_t)header_size;
+    int64_t page_data_offset;
+    if (!checked_add_i64(page_file_offset, (int64_t)header_size, &page_data_offset)) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Data page offset overflow");
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
     if (prebuf_read_at(file_reader, page_data_offset,
                        compressed, page_header.compressed_page_size) !=
         (size_t)page_header.compressed_page_size) {
@@ -1758,40 +2003,6 @@ static carquet_status_t load_next_page_fread(
         }
     }
 
-    /* Decompress if needed */
-    uint8_t* page_data;
-    size_t page_size;
-
-    if (col_meta->codec == CARQUET_COMPRESSION_UNCOMPRESSED) {
-        page_data = compressed;
-        page_size = page_header.compressed_page_size;
-    } else {
-        size_t needed = (size_t)page_header.uncompressed_page_size;
-        if (needed > reader->decompress_capacity) {
-            uint8_t* new_buffer = realloc(reader->decompress_buffer, needed);
-            if (!new_buffer) {
-                CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate decompress buffer");
-                return CARQUET_ERROR_OUT_OF_MEMORY;
-            }
-            reader->decompress_buffer = new_buffer;
-            reader->decompress_capacity = needed;
-        }
-        page_data = reader->decompress_buffer;
-        if (!page_data) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate decompress buffer");
-            return CARQUET_ERROR_OUT_OF_MEMORY;
-        }
-
-        status = carquet_decompress_page(col_meta->codec,
-            compressed, page_header.compressed_page_size,
-            page_data, page_header.uncompressed_page_size, &page_size);
-
-        if (status != CARQUET_OK) {
-            CARQUET_SET_ERROR(error, status, "Failed to decompress page");
-            return status;
-        }
-    }
-
     /* Extract num_values and encoding from the correct header union member */
     bool is_v2 = (page_header.type == CARQUET_PAGE_DATA_V2);
     int32_t num_values = is_v2 ? page_header.data_page_header_v2.num_values
@@ -1800,54 +2011,24 @@ static carquet_status_t load_next_page_fread(
                                              : page_header.data_page_header.encoding;
     size_t value_size = get_value_size(reader->type, reader->type_length);
 
-    /* V2 pages: decompress only the data portion (levels are uncompressed) */
-    if (is_v2 && col_meta->codec != CARQUET_COMPRESSION_UNCOMPRESSED) {
-        const parquet_data_page_header_v2_t* v2h = &page_header.data_page_header_v2;
-        size_t levels_size = (size_t)v2h->repetition_levels_byte_length +
-                             (size_t)v2h->definition_levels_byte_length;
-
-        if (levels_size > page_size) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "V2 level sizes exceed page size");
-            return CARQUET_ERROR_DECODE;
-        }
-
-        if (v2h->is_compressed) {
-            size_t compressed_data_size = page_size - levels_size;
-            size_t uncompressed_data_size = (size_t)page_header.uncompressed_page_size - levels_size;
-            size_t total_needed = levels_size + uncompressed_data_size;
-
-            if (total_needed > reader->decompress_capacity) {
-                uint8_t* new_buffer = realloc(reader->decompress_buffer, total_needed);
-                if (!new_buffer) {
-                    CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate V2 decompress buffer");
-                    return CARQUET_ERROR_OUT_OF_MEMORY;
-                }
-                reader->decompress_buffer = new_buffer;
-                reader->decompress_capacity = total_needed;
-            }
-
-            /* Copy uncompressed levels, decompress data portion */
-            memcpy(reader->decompress_buffer, page_data, levels_size);
-
-            size_t decompressed_data_size;
-            status = carquet_decompress_page(col_meta->codec,
-                page_data + levels_size, compressed_data_size,
-                reader->decompress_buffer + levels_size, uncompressed_data_size,
-                &decompressed_data_size);
-
-            if (status != CARQUET_OK) {
-                CARQUET_SET_ERROR(error, status, "Failed to decompress V2 page data");
-                return status;
-            }
-
-            page_data = reader->decompress_buffer;
-            page_size = levels_size + decompressed_data_size;
-        }
-        /* else: is_compressed==false means data is also uncompressed, use as-is */
+    /* Decompress if needed. V2 pages keep level bytes uncompressed and only
+     * decompress the data tail, so both fread and mmap paths share this helper. */
+    const uint8_t* page_data;
+    size_t page_size;
+    bool used_decompress_buffer = false;
+    status = prepare_data_page_payload(reader, col_meta, &page_header, compressed,
+                                       &page_data, &page_size, &used_decompress_buffer,
+                                       error);
+    if (status != CARQUET_OK) {
+        return status;
     }
 
     if (!is_v2 && page_values_can_be_viewed_directly(reader, page_encoding)) {
-        size_t required_bytes = value_size * (size_t)num_values;
+        size_t required_bytes = 0;
+        if (!checked_mul_size(value_size, (size_t)num_values, &required_bytes)) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Page payload size overflow");
+            return CARQUET_ERROR_DECODE;
+        }
         if (page_size < required_bytes) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Truncated PLAIN page payload");
             return CARQUET_ERROR_DECODE;
@@ -1856,7 +2037,7 @@ static carquet_status_t load_next_page_fread(
         if (reader->decoded_ownership == CARQUET_DATA_OWNED) {
             free(reader->decoded_values);
         }
-        reader->decoded_values = page_data;
+        reader->decoded_values = (uint8_t*)page_data;
         reader->decoded_ownership = CARQUET_DATA_VIEW;
         reader->decoded_capacity = 0;
         release_decoded_level_buffers(reader);
@@ -1892,6 +2073,10 @@ static carquet_status_t load_next_page_fread(
             &decoded_count, error);
     }
 
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
     /* For BYTE_ARRAY PLAIN columns, the decoded carquet_byte_array_t structs
      * have .data pointers into the page data buffer. Retain every page buffer
      * so those pointers stay valid across page boundaries within a batch;
@@ -1913,10 +2098,6 @@ static carquet_status_t load_next_page_fread(
                 ba[i].data = ba[i].data + offset;
             }
         }
-    }
-
-    if (status != CARQUET_OK) {
-        return status;
     }
 
     /* Update page tracking state */
