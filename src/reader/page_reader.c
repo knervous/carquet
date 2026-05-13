@@ -741,16 +741,9 @@ carquet_status_t carquet_read_data_page_v1(
     switch (header->encoding) {
         case CARQUET_ENCODING_PLAIN:
             {
-                /* For BYTE_ARRAY, carquet writes all num_values entries
-                 * (including length-0 entries for nulls) so that values[i]
-                 * aligns with def_levels[i].  For fixed-size types, only
-                 * non_null_count values are stored on disk. */
-                int32_t decode_count =
-                    (reader->type == CARQUET_PHYSICAL_BYTE_ARRAY)
-                        ? num_values : non_null_count;
                 int64_t bytes = carquet_decode_plain(
                     ptr, remaining, reader->type, reader->type_length,
-                    values, decode_count);
+                    values, non_null_count);
                 if (bytes < 0) {
                     status = CARQUET_ERROR_DECODE;
                 }
@@ -791,17 +784,13 @@ carquet_status_t carquet_read_data_page_v1(
                 ptr++;
                 remaining--;
 
-                /* Decode num_values indices (not non_null_count) because
-                 * carquet's writer emits an index for every logical row
-                 * (including null positions).  This keeps values[i] aligned
-                 * with def_levels[i] so the caller can index both arrays
-                 * with the same offset. */
+                int32_t encoded_count = non_null_count;
 
                 /* Dictionary preservation: decode indices directly into output */
                 if (reader->preserve_dictionary) {
                     uint32_t* out_indices = (uint32_t*)values;
                     int64_t decoded = carquet_rle_decode_all(
-                        ptr, remaining, bit_width, out_indices, num_values);
+                        ptr, remaining, bit_width, out_indices, encoded_count);
                     if (decoded < 0) {
                         CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Failed to decode dictionary indices");
                         return CARQUET_ERROR_DECODE;
@@ -811,37 +800,37 @@ carquet_status_t carquet_read_data_page_v1(
 
                 /* Use reusable indices buffer to avoid per-page allocation */
                 uint32_t* indices;
-                if ((size_t)num_values <= reader->indices_capacity) {
+                if ((size_t)encoded_count <= reader->indices_capacity) {
                     indices = reader->indices_buffer;
                 } else {
                     /* Need larger buffer - reallocate */
                     free(reader->indices_buffer);
-                    reader->indices_buffer = malloc((size_t)num_values * sizeof(uint32_t));
+                    reader->indices_buffer = malloc((size_t)encoded_count * sizeof(uint32_t));
                     if (!reader->indices_buffer) {
                         reader->indices_capacity = 0;
                         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate indices");
                         return CARQUET_ERROR_OUT_OF_MEMORY;
                     }
-                    reader->indices_capacity = num_values;
+                    reader->indices_capacity = encoded_count;
                     indices = reader->indices_buffer;
                 }
 
                 int64_t decoded = carquet_rle_decode_all(
-                    ptr, remaining, bit_width, indices, num_values);
+                    ptr, remaining, bit_width, indices, encoded_count);
 
                 if (decoded < 0) {
                     CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Failed to decode dictionary indices");
                     return CARQUET_ERROR_DECODE;
                 }
 
-                /* Look up values from dictionary for all num_values positions */
+                /* Look up dictionary values for the dense non-null stream */
                 if (reader->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
                     /* BYTE_ARRAY: dictionary is stored as length-prefixed values */
                     carquet_byte_array_t* out = (carquet_byte_array_t*)values;
 
                     /* Use O(1) offset table lookup (built when dictionary was read) */
                     if (reader->dictionary_offsets) {
-                        for (int32_t i = 0; i < num_values; i++) {
+                        for (int32_t i = 0; i < encoded_count; i++) {
                             int32_t idx = (int32_t)indices[i];
                             if (idx < 0 || idx >= reader->dictionary_count) {
                                 status = CARQUET_ERROR_DECODE;
@@ -857,7 +846,7 @@ carquet_status_t carquet_read_data_page_v1(
                         }
                     } else {
                         /* Fallback: scan each time (shouldn't happen for new readers) */
-                        for (int32_t i = 0; i < num_values; i++) {
+                        for (int32_t i = 0; i < encoded_count; i++) {
                             int32_t idx = (int32_t)indices[i];
                             if (idx < 0 || idx >= reader->dictionary_count) {
                                 status = CARQUET_ERROR_DECODE;
@@ -881,7 +870,7 @@ carquet_status_t carquet_read_data_page_v1(
                             if (!carquet_dispatch_checked_gather_i32(
                                     (const int32_t*)reader->dictionary_data,
                                     reader->dictionary_count,
-                                    indices, num_values, (int32_t*)values)) {
+                                    indices, encoded_count, (int32_t*)values)) {
                                 CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
                                                   "Dictionary index out of bounds");
                                 return CARQUET_ERROR_DECODE;
@@ -891,7 +880,7 @@ carquet_status_t carquet_read_data_page_v1(
                             if (!carquet_dispatch_checked_gather_i64(
                                     (const int64_t*)reader->dictionary_data,
                                     reader->dictionary_count,
-                                    indices, num_values, (int64_t*)values)) {
+                                    indices, encoded_count, (int64_t*)values)) {
                                 CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
                                                   "Dictionary index out of bounds");
                                 return CARQUET_ERROR_DECODE;
@@ -901,7 +890,7 @@ carquet_status_t carquet_read_data_page_v1(
                             if (!carquet_dispatch_checked_gather_float(
                                     (const float*)reader->dictionary_data,
                                     reader->dictionary_count,
-                                    indices, num_values, (float*)values)) {
+                                    indices, encoded_count, (float*)values)) {
                                 CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
                                                   "Dictionary index out of bounds");
                                 return CARQUET_ERROR_DECODE;
@@ -911,7 +900,7 @@ carquet_status_t carquet_read_data_page_v1(
                             if (!carquet_dispatch_checked_gather_double(
                                     (const double*)reader->dictionary_data,
                                     reader->dictionary_count,
-                                    indices, num_values, (double*)values)) {
+                                    indices, encoded_count, (double*)values)) {
                                 CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
                                                   "Dictionary index out of bounds");
                                 return CARQUET_ERROR_DECODE;
@@ -929,12 +918,12 @@ carquet_status_t carquet_read_data_page_v1(
                                     reader->dictionary_data,
                                     reader->dictionary_count,
                                     indices,
-                                    num_values,
+                                    encoded_count,
                                     value_size,
                                     out);
 #else
                                 ok = true;
-                                for (int32_t i = 0; i < num_values; i++) {
+                                for (int32_t i = 0; i < encoded_count; i++) {
                                     uint32_t idx = indices[i];
                                     if (idx >= (uint32_t)reader->dictionary_count) {
                                         ok = false;
@@ -1093,12 +1082,9 @@ carquet_status_t carquet_read_data_page_v2(
     switch (header->encoding) {
         case CARQUET_ENCODING_PLAIN:
             {
-                int32_t decode_count =
-                    (reader->type == CARQUET_PHYSICAL_BYTE_ARRAY)
-                        ? num_values : non_null_count;
                 int64_t bytes = carquet_decode_plain(
                     ptr, remaining, reader->type, reader->type_length,
-                    values, decode_count);
+                    values, non_null_count);
                 if (bytes < 0) {
                     status = CARQUET_ERROR_DECODE;
                 }
@@ -1138,12 +1124,13 @@ carquet_status_t carquet_read_data_page_v2(
                 int bit_width = ptr[0];
                 ptr++;
                 remaining--;
+                int32_t encoded_count = non_null_count;
 
                 /* Dictionary preservation: decode indices directly into output */
                 if (reader->preserve_dictionary) {
                     uint32_t* out_indices = (uint32_t*)values;
                     int64_t decoded = carquet_rle_decode_all(
-                        ptr, remaining, bit_width, out_indices, num_values);
+                        ptr, remaining, bit_width, out_indices, encoded_count);
                     if (decoded < 0) {
                         CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Failed to decode dictionary indices");
                         return CARQUET_ERROR_DECODE;
@@ -1153,22 +1140,22 @@ carquet_status_t carquet_read_data_page_v2(
 
                 /* Use reusable indices buffer */
                 uint32_t* indices;
-                if ((size_t)num_values <= reader->indices_capacity) {
+                if ((size_t)encoded_count <= reader->indices_capacity) {
                     indices = reader->indices_buffer;
                 } else {
                     free(reader->indices_buffer);
-                    reader->indices_buffer = malloc((size_t)num_values * sizeof(uint32_t));
+                    reader->indices_buffer = malloc((size_t)encoded_count * sizeof(uint32_t));
                     if (!reader->indices_buffer) {
                         reader->indices_capacity = 0;
                         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate indices");
                         return CARQUET_ERROR_OUT_OF_MEMORY;
                     }
-                    reader->indices_capacity = num_values;
+                    reader->indices_capacity = encoded_count;
                     indices = reader->indices_buffer;
                 }
 
                 int64_t decoded = carquet_rle_decode_all(
-                    ptr, remaining, bit_width, indices, num_values);
+                    ptr, remaining, bit_width, indices, encoded_count);
 
                 if (decoded < 0) {
                     CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Failed to decode dictionary indices");
@@ -1180,7 +1167,7 @@ carquet_status_t carquet_read_data_page_v2(
                     carquet_byte_array_t* out = (carquet_byte_array_t*)values;
 
                     if (reader->dictionary_offsets) {
-                        for (int32_t i = 0; i < num_values; i++) {
+                        for (int32_t i = 0; i < encoded_count; i++) {
                             int32_t idx = (int32_t)indices[i];
                             if (idx < 0 || idx >= reader->dictionary_count) {
                                 status = CARQUET_ERROR_DECODE;
@@ -1193,7 +1180,7 @@ carquet_status_t carquet_read_data_page_v2(
                             out[i].length = (int32_t)len;
                         }
                     } else {
-                        for (int32_t i = 0; i < num_values; i++) {
+                        for (int32_t i = 0; i < encoded_count; i++) {
                             int32_t idx = (int32_t)indices[i];
                             if (idx < 0 || idx >= reader->dictionary_count) {
                                 status = CARQUET_ERROR_DECODE;
@@ -1215,7 +1202,7 @@ carquet_status_t carquet_read_data_page_v2(
                             if (!carquet_dispatch_checked_gather_i32(
                                     (const int32_t*)reader->dictionary_data,
                                     reader->dictionary_count,
-                                    indices, num_values, (int32_t*)values)) {
+                                    indices, encoded_count, (int32_t*)values)) {
                                 CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
                                                   "Dictionary index out of bounds");
                                 return CARQUET_ERROR_DECODE;
@@ -1225,7 +1212,7 @@ carquet_status_t carquet_read_data_page_v2(
                             if (!carquet_dispatch_checked_gather_i64(
                                     (const int64_t*)reader->dictionary_data,
                                     reader->dictionary_count,
-                                    indices, num_values, (int64_t*)values)) {
+                                    indices, encoded_count, (int64_t*)values)) {
                                 CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
                                                   "Dictionary index out of bounds");
                                 return CARQUET_ERROR_DECODE;
@@ -1235,7 +1222,7 @@ carquet_status_t carquet_read_data_page_v2(
                             if (!carquet_dispatch_checked_gather_float(
                                     (const float*)reader->dictionary_data,
                                     reader->dictionary_count,
-                                    indices, num_values, (float*)values)) {
+                                    indices, encoded_count, (float*)values)) {
                                 CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
                                                   "Dictionary index out of bounds");
                                 return CARQUET_ERROR_DECODE;
@@ -1245,7 +1232,7 @@ carquet_status_t carquet_read_data_page_v2(
                             if (!carquet_dispatch_checked_gather_double(
                                     (const double*)reader->dictionary_data,
                                     reader->dictionary_count,
-                                    indices, num_values, (double*)values)) {
+                                    indices, encoded_count, (double*)values)) {
                                 CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
                                                   "Dictionary index out of bounds");
                                 return CARQUET_ERROR_DECODE;
@@ -1262,11 +1249,11 @@ carquet_status_t carquet_read_data_page_v2(
                                 ok = gather_fixed_dictionary_values_neon(
                                     reader->dictionary_data,
                                     reader->dictionary_count,
-                                    indices, num_values,
+                                    indices, encoded_count,
                                     value_size, out);
 #else
                                 ok = true;
-                                for (int32_t i = 0; i < num_values; i++) {
+                                for (int32_t i = 0; i < encoded_count; i++) {
                                     uint32_t idx = indices[i];
                                     if (idx >= (uint32_t)reader->dictionary_count) {
                                         ok = false;
@@ -1330,6 +1317,20 @@ static size_t get_value_size(carquet_physical_type_t type, int32_t type_length) 
         default:
             return 0;
     }
+}
+
+static int32_t count_present_levels(
+    const int16_t* def_levels,
+    int32_t count,
+    int16_t max_def_level) {
+
+    int32_t present = 0;
+    for (int32_t i = 0; i < count; i++) {
+        if (def_levels[i] == max_def_level) {
+            present++;
+        }
+    }
+    return present;
 }
 
 static carquet_status_t prepare_data_page_payload(
@@ -2202,11 +2203,26 @@ carquet_status_t carquet_read_next_page(
         return CARQUET_OK;
     }
 
-    /* Copy values from decoded buffers */
+    /* Copy values from decoded buffers. Optional columns store a dense stream
+     * of present values; definition levels preserve the logical row shape. */
     size_t value_size = get_value_size(reader->type, reader->type_length);
     size_t offset = (size_t)reader->page_values_read * value_size;
+    int32_t values_to_copy = to_copy;
 
-    memcpy(values, (uint8_t*)reader->decoded_values + offset, (size_t)to_copy * value_size);
+    if (reader->decoded_def_levels && reader->max_def_level > 0) {
+        int32_t dense_start = count_present_levels(
+            reader->decoded_def_levels,
+            reader->page_values_read,
+            reader->max_def_level);
+        values_to_copy = count_present_levels(
+            reader->decoded_def_levels + reader->page_values_read,
+            to_copy,
+            reader->max_def_level);
+        offset = (size_t)dense_start * value_size;
+    }
+
+    memcpy(values, (uint8_t*)reader->decoded_values + offset,
+           (size_t)values_to_copy * value_size);
 
     if (def_levels) {
         if (reader->decoded_def_levels) {

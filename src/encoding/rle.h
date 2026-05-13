@@ -272,8 +272,8 @@ int64_t carquet_rle_decode_levels_prefixed(
  * intermediate int16_t[] buffer and subsequent build_null_bitmap pass.
  *
  * Bitmap convention (matches build_null_bitmap):
- * bit set (1) = value IS null (def_level == 0),
- * bit clear (0) = value is NOT null (def_level == 1).
+ * bit set (1) = value is present (def_level == 1),
+ * bit clear (0) = value is null (def_level == 0).
  *
  * @param input Input RLE data (no length prefix)
  * @param input_size Size of input data

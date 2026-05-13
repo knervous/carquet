@@ -73,6 +73,58 @@ static int create_test_file(int64_t num_rows) {
     return create_test_file_with_page_size(num_rows, 0);
 }
 
+static int create_compressed_optional_file(void) {
+    carquet_error_t error = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(&error);
+    if (!schema) return 1;
+
+    carquet_schema_add_column(schema, "maybe_id", CARQUET_PHYSICAL_INT32,
+                              NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
+
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.compression = CARQUET_COMPRESSION_ZSTD;
+    opts.row_group_size = 10;
+
+    carquet_writer_t* writer = carquet_writer_create(TEST_FILE, schema, &opts, &error);
+    if (!writer) {
+        carquet_schema_free(schema);
+        return 1;
+    }
+
+    for (int rg = 0; rg < 2; rg++) {
+        int32_t values[5];
+        int16_t def[10];
+        int nn = 0;
+
+        for (int i = 0; i < 10; i++) {
+            int global = rg * 10 + i;
+            if ((global % 2) == 0) {
+                def[i] = 1;
+                values[nn++] = global * 10;
+            } else {
+                def[i] = 0;
+            }
+        }
+
+        if (carquet_writer_write_batch(writer, 0, values, 10, def, NULL) != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            carquet_schema_free(schema);
+            return 1;
+        }
+
+        if (rg == 0 && carquet_writer_new_row_group(writer) != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            carquet_schema_free(schema);
+            return 1;
+        }
+    }
+
+    carquet_status_t status = carquet_writer_close(writer);
+    carquet_schema_free(schema);
+    return status == CARQUET_OK ? 0 : 1;
+}
+
 /* ============================================================================
  * Test: mmap reader opens correctly
  * ============================================================================
@@ -416,6 +468,90 @@ static int test_mmap_batch_reader_page_aligned(void) {
 }
 
 /* ============================================================================
+ * Test: compressed mmap batch reader keeps optional nulls intact
+ * ============================================================================
+ */
+
+static int test_mmap_compressed_optional_batch(void) {
+    const char* name = "mmap_compressed_optional_batch";
+    carquet_error_t error = CARQUET_ERROR_INIT;
+
+    if (create_compressed_optional_file() != 0) {
+        TEST_FAIL(name, "Failed to create test file");
+    }
+
+    carquet_reader_options_t reader_opts;
+    carquet_reader_options_init(&reader_opts);
+    reader_opts.use_mmap = true;
+
+    carquet_reader_t* reader = carquet_reader_open(TEST_FILE, &reader_opts, &error);
+    if (!reader) {
+        TEST_FAIL(name, "Failed to open reader");
+    }
+
+    carquet_batch_reader_config_t config;
+    carquet_batch_reader_config_init(&config);
+    config.batch_size = 20;
+
+    carquet_batch_reader_t* batch_reader = carquet_batch_reader_create(reader, &config, &error);
+    if (!batch_reader) {
+        carquet_reader_close(reader);
+        TEST_FAIL(name, "Failed to create batch reader");
+    }
+
+    int64_t total = 0;
+    carquet_status_t status;
+    carquet_row_batch_t* batch = NULL;
+    while ((status = carquet_batch_reader_next(batch_reader, &batch)) == CARQUET_OK && batch) {
+        const void* data = NULL;
+        const uint8_t* null_bitmap = NULL;
+        int64_t n = 0;
+
+        if (carquet_row_batch_column(batch, 0, &data, &null_bitmap, &n) != CARQUET_OK ||
+            !data || !null_bitmap || n <= 0) {
+            carquet_row_batch_free(batch);
+            carquet_batch_reader_free(batch_reader);
+            carquet_reader_close(reader);
+            TEST_FAIL(name, "Failed to read optional batch column");
+        }
+
+        const int32_t* values = (const int32_t*)data;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t row = total + i;
+            int is_present = (null_bitmap[i / 8] >> (i % 8)) & 1;
+            if ((row % 2) == 0) {
+                if (!is_present || values[i] != row * 10) {
+                    carquet_row_batch_free(batch);
+                    carquet_batch_reader_free(batch_reader);
+                    carquet_reader_close(reader);
+                    TEST_FAIL(name, "present optional value mismatch");
+                }
+            } else if (is_present || values[i] != 0) {
+                carquet_row_batch_free(batch);
+                carquet_batch_reader_free(batch_reader);
+                carquet_reader_close(reader);
+                TEST_FAIL(name, "null optional value mismatch");
+            }
+        }
+
+        total += n;
+        carquet_row_batch_free(batch);
+        batch = NULL;
+    }
+
+    if (status != CARQUET_ERROR_END_OF_DATA || total != 20) {
+        carquet_batch_reader_free(batch_reader);
+        carquet_reader_close(reader);
+        TEST_FAIL(name, "Unexpected optional batch result");
+    }
+
+    carquet_batch_reader_free(batch_reader);
+    carquet_reader_close(reader);
+    TEST_PASS(name);
+    return 0;
+}
+
+/* ============================================================================
  * Test: Compare mmap vs fread results
  * ============================================================================
  */
@@ -541,6 +677,7 @@ int main(void) {
     failures += test_mmap_read_data();
     failures += test_mmap_batch_reader();
     failures += test_mmap_batch_reader_page_aligned();
+    failures += test_mmap_compressed_optional_batch();
     failures += test_mmap_vs_fread();
     failures += test_fread_fallback();
 

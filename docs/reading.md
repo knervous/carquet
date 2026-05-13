@@ -139,6 +139,44 @@ Use footer-only helpers when you do not need to build a full reader:
 - `carquet_get_file_info()`
 - `carquet_validate_file()`
 
+### Column Statistics
+
+`carquet_reader_column_statistics()` returns aggregated stats for a single (row group, column). The `min_value` / `max_value` fields are raw bytes — interpret them according to the column's physical type.
+
+```c
+carquet_column_statistics_t s;
+if (carquet_reader_column_statistics(reader, /*row_group=*/0, /*column=*/0, &s)
+        == CARQUET_OK && s.has_min_max) {
+    /* Fixed-width numeric types: cast directly. */
+    int64_t min_id = *(const int64_t*)s.min_value;
+    int64_t max_id = *(const int64_t*)s.max_value;
+    printf("id [%lld, %lld] nulls=%lld\n",
+           (long long)min_id, (long long)max_id, (long long)s.null_count);
+}
+```
+
+For `BYTE_ARRAY` columns the payload is the bytes themselves with length in `min_value_size` / `max_value_size` — **not** a `carquet_byte_array_t` struct:
+
+```c
+if (s.has_min_max) {
+    printf("min=%.*s max=%.*s\n",
+           s.min_value_size, (const char*)s.min_value,
+           s.max_value_size, (const char*)s.max_value);
+}
+```
+
+Long byte-array max values written by carquet are truncated at 32 bytes and incremented, so the stored bound is an upper bound but not necessarily an exact value present in the column.
+
+To prune row groups in bulk, pass a typed value to `carquet_reader_filter_row_groups()`:
+
+```c
+int32_t threshold = 5000;
+int32_t matches[64];
+int32_t n = carquet_reader_filter_row_groups(
+    reader, /*column=*/0, CARQUET_COMPARE_GT,
+    &threshold, sizeof(threshold), matches, 64);
+```
+
 ## Metadata, Bloom Filters, and Page Indexes
 
 Carquet exposes the optional metadata structures that many readers hide:

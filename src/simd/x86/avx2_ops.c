@@ -1187,7 +1187,7 @@ void carquet_avx2_build_null_bitmap(const int16_t* def_levels, int64_t count,
 
     for (int64_t b = 0; b + 1 < full_bytes; b += 2) {
         __m256i levels = _mm256_loadu_si256((const __m256i*)(def_levels + i));
-        __m256i cmp = _mm256_cmpgt_epi16(max_vec, levels);
+        __m256i cmp = _mm256_cmpeq_epi16(levels, max_vec);
         __m128i lo = _mm256_castsi256_si128(cmp);
         __m128i hi = _mm256_extracti128_si256(cmp, 1);
         __m128i packed = _mm_packs_epi16(lo, hi);
@@ -1200,20 +1200,20 @@ void carquet_avx2_build_null_bitmap(const int16_t* def_levels, int64_t count,
     for (int64_t b = (full_bytes & ~1LL); b < full_bytes; b++) {
         __m128i levels = _mm_loadu_si128((const __m128i*)(def_levels + i));
         __m128i max128 = _mm256_castsi256_si128(max_vec);
-        __m128i cmp = _mm_cmplt_epi16(levels, max128);
+        __m128i cmp = _mm_cmpeq_epi16(levels, max128);
         __m128i packed = _mm_packs_epi16(cmp, zero);
         null_bitmap[b] = (uint8_t)_mm_movemask_epi8(packed);
         i += 8;
     }
 
     if (i < count) {
-        uint8_t null_bits = 0;
+        uint8_t present_bits = 0;
         for (int64_t j = 0; i + j < count && j < 8; j++) {
-            if (def_levels[i + j] < max_def_level) {
-                null_bits |= (uint8_t)(1u << j);
+            if (def_levels[i + j] == max_def_level) {
+                present_bits |= (uint8_t)(1u << j);
             }
         }
-        null_bitmap[full_bytes] = null_bits;
+        null_bitmap[full_bytes] = present_bits;
     }
 }
 

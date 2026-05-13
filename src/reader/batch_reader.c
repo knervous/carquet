@@ -746,7 +746,18 @@ carquet_batch_reader_t* carquet_batch_reader_create(
     for (int32_t r = 0; r < batch_reader->rg_order_len; r++) {
         total_pipeline_rows += reader->metadata.row_groups[batch_reader->rg_order[r]].num_rows;
     }
-    if (reader->mmap_data != NULL &&
+    bool pipeline_safe = true;
+    for (int32_t ci = 0; ci < batch_reader->num_projected; ci++) {
+        int32_t file_col = batch_reader->projected_columns[ci];
+        if (reader->schema->max_def_levels[file_col] > 0 ||
+            reader->schema->max_rep_levels[file_col] > 0) {
+            pipeline_safe = false;
+            break;
+        }
+    }
+
+    if (pipeline_safe &&
+        reader->mmap_data != NULL &&
         (batch_reader->rg_order_len > 1 || total_pipeline_rows >= 500000)) {
         bool has_compression = false;
         const parquet_file_metadata_t* meta = &reader->metadata;
@@ -795,14 +806,12 @@ carquet_batch_reader_t* carquet_batch_reader_create(
                     batch_reader->pipeline_count = 0;
                     batch_reader->pipeline_active = true;
 
-                    /* Allocate per-reader task args.  Each column may be split
-                     * into up to num_threads segments for parallel decompression,
-                     * so the worst case is depth * np * max_splits_per_column. */
+                    /* Allocate per-reader task args.  The pipeline currently
+                     * submits one task per projected column.  Intra-column
+                     * splitting needs per-task scratch buffers before it can
+                     * safely share column readers. */
                     int32_t np = batch_reader->num_projected;
-                    int32_t max_splits = pt;
-                    if (np > 0 && max_splits > pt / np)
-                        max_splits = pt / np;
-                    if (max_splits < 2) max_splits = 2;
+                    int32_t max_splits = 1;
                     batch_reader->task_args_capacity = depth * np * (max_splits + 1);
                     batch_reader->task_args = calloc(batch_reader->task_args_capacity,
                                                      sizeof(bulk_read_arg_t));
@@ -1273,14 +1282,9 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
         }
 #endif
 
-        /* Submit tasks for parallel decompression.  Each compressed column
-         * is split into up to N page-aligned segments (N ≈ num_threads /
-         * num_columns) so that all worker threads stay busy even when the
-         * file has very few row groups. */
-        int32_t max_splits_per_col = br->pool->num_threads;
-        if (br->num_projected > 0)
-            max_splits_per_col = br->pool->num_threads / br->num_projected;
-        if (max_splits_per_col < 2) max_splits_per_col = 2;
+        /* Submit one task per compressed column.  Sharing a column reader
+         * across split tasks would race on its reusable decompression buffer. */
+        int32_t max_splits_per_col = 1;
 
         /* Bound by task_args space available for this pipeline slot */
         int32_t tasks_per_slot = br->task_args_capacity / (br->pipeline_depth > 0 ? br->pipeline_depth : 1);

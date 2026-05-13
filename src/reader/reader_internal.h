@@ -201,6 +201,13 @@ carquet_schema_t* build_schema(
     carquet_error_t* error);
 
 /**
+ * Validate a row group index against a reader's loaded metadata.
+ */
+bool carquet_reader_row_group_index_valid(
+    const carquet_reader_t* reader,
+    int32_t row_group_index);
+
+/**
  * Open file with memory mapping.
  * Returns mmap_info on success, NULL on failure (fallback to fread).
  */

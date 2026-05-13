@@ -103,12 +103,59 @@ typedef struct carquet_page_writer {
     bool write_crc;          /* Compute and write CRC32 for pages */
     bool write_statistics;   /* Write min/max statistics in page header */
 
-    /* Statistics tracking */
+    /* Statistics tracking.
+     *
+     * min_value / max_value are heap-allocated so arbitrary-length BYTE_ARRAY
+     * and FIXED_LEN_BYTE_ARRAY values fit. For fixed-size numeric types the
+     * bytes are the raw little-endian representation. For BOOLEAN they are
+     * 1-byte 0/1. min and max can have different sizes (byte arrays).
+     */
     bool has_min_max;
-    uint8_t min_value[64];
-    uint8_t max_value[64];
+    uint8_t* min_value;
+    size_t min_value_size;
+    size_t min_value_capacity;
+    uint8_t* max_value;
+    size_t max_value_size;
+    size_t max_value_capacity;
+
+    /* BOOLEAN stats are accumulated as flags and collapsed at the end. */
+    bool bool_seen_false;
+    bool bool_seen_true;
+
+    /* Compatibility alias: many code paths use a single "size" when the type
+     * has fixed-width stats. Numeric paths set both _size fields equal. */
     size_t min_max_size;
 } carquet_page_writer_t;
+
+static carquet_status_t stats_grow(uint8_t** buf, size_t* cap, size_t need) {
+    if (need <= *cap) return CARQUET_OK;
+    size_t new_cap = *cap == 0 ? 64 : *cap;
+    while (new_cap < need) new_cap *= 2;
+    uint8_t* p = realloc(*buf, new_cap);
+    if (!p) return CARQUET_ERROR_OUT_OF_MEMORY;
+    *buf = p;
+    *cap = new_cap;
+    return CARQUET_OK;
+}
+
+static carquet_status_t stats_set_min(carquet_page_writer_t* w,
+                                       const void* src, size_t size) {
+    carquet_status_t s = stats_grow(&w->min_value, &w->min_value_capacity, size);
+    if (s != CARQUET_OK) return s;
+    memcpy(w->min_value, src, size);
+    w->min_value_size = size;
+    return CARQUET_OK;
+}
+
+static carquet_status_t stats_set_max(carquet_page_writer_t* w,
+                                       const void* src, size_t size) {
+    carquet_status_t s = stats_grow(&w->max_value, &w->max_value_capacity, size);
+    if (s != CARQUET_OK) return s;
+    memcpy(w->max_value, src, size);
+    w->max_value_size = size;
+    return CARQUET_OK;
+}
+
 
 /* Forward declaration for internal use */
 void carquet_page_writer_destroy(carquet_page_writer_t* writer);
@@ -164,6 +211,8 @@ void carquet_page_writer_destroy(carquet_page_writer_t* writer) {
         carquet_buffer_destroy(&writer->staging_buffer);
         carquet_buffer_destroy(&writer->page_buffer);
         carquet_buffer_destroy(&writer->compress_buffer);
+        free(writer->min_value);
+        free(writer->max_value);
         free(writer);
     }
 }
@@ -178,6 +227,9 @@ void carquet_page_writer_reset(carquet_page_writer_t* writer) {
     writer->num_values = 0;
     writer->num_nulls = 0;
     writer->has_min_max = false;
+    writer->min_max_size = 0;
+    writer->bool_seen_false = false;
+    writer->bool_seen_true = false;
 }
 
 /* ============================================================================
@@ -248,23 +300,30 @@ static carquet_status_t encode_levels(
  * ============================================================================
  */
 
+static carquet_status_t stats_set_fixed(carquet_page_writer_t* writer,
+                                         const void* min_src, const void* max_src,
+                                         size_t size) {
+    carquet_status_t s = stats_set_min(writer, min_src, size);
+    if (s != CARQUET_OK) return s;
+    s = stats_set_max(writer, max_src, size);
+    if (s != CARQUET_OK) return s;
+    writer->min_max_size = size;
+    writer->has_min_max = true;
+    return CARQUET_OK;
+}
+
 static void update_statistics_i32(carquet_page_writer_t* writer,
                                    const int32_t* values, int64_t count) {
     if (count <= 0) return;
+    int32_t chunk_min, chunk_max;
+    carquet_dispatch_minmax_i32(values, count, &chunk_min, &chunk_max);
     if (!writer->has_min_max) {
-        int32_t min_v, max_v;
-        carquet_dispatch_minmax_i32(values, count, &min_v, &max_v);
-        writer->has_min_max = true;
-        writer->min_max_size = sizeof(int32_t);
-        memcpy(writer->min_value, &min_v, sizeof(min_v));
-        memcpy(writer->max_value, &max_v, sizeof(max_v));
+        stats_set_fixed(writer, &chunk_min, &chunk_max, sizeof(int32_t));
         return;
     }
     int32_t min_v, max_v;
-    int32_t chunk_min, chunk_max;
     memcpy(&min_v, writer->min_value, sizeof(min_v));
     memcpy(&max_v, writer->max_value, sizeof(max_v));
-    carquet_dispatch_minmax_i32(values, count, &chunk_min, &chunk_max);
     if (chunk_min < min_v) min_v = chunk_min;
     if (chunk_max > max_v) max_v = chunk_max;
     memcpy(writer->min_value, &min_v, sizeof(min_v));
@@ -274,20 +333,15 @@ static void update_statistics_i32(carquet_page_writer_t* writer,
 static void update_statistics_i64(carquet_page_writer_t* writer,
                                    const int64_t* values, int64_t count) {
     if (count <= 0) return;
+    int64_t chunk_min, chunk_max;
+    carquet_dispatch_minmax_i64(values, count, &chunk_min, &chunk_max);
     if (!writer->has_min_max) {
-        int64_t min_v, max_v;
-        carquet_dispatch_minmax_i64(values, count, &min_v, &max_v);
-        writer->has_min_max = true;
-        writer->min_max_size = sizeof(int64_t);
-        memcpy(writer->min_value, &min_v, sizeof(min_v));
-        memcpy(writer->max_value, &max_v, sizeof(max_v));
+        stats_set_fixed(writer, &chunk_min, &chunk_max, sizeof(int64_t));
         return;
     }
     int64_t min_v, max_v;
-    int64_t chunk_min, chunk_max;
     memcpy(&min_v, writer->min_value, sizeof(min_v));
     memcpy(&max_v, writer->max_value, sizeof(max_v));
-    carquet_dispatch_minmax_i64(values, count, &chunk_min, &chunk_max);
     if (chunk_min < min_v) min_v = chunk_min;
     if (chunk_max > max_v) max_v = chunk_max;
     memcpy(writer->min_value, &min_v, sizeof(min_v));
@@ -297,20 +351,15 @@ static void update_statistics_i64(carquet_page_writer_t* writer,
 static void update_statistics_float(carquet_page_writer_t* writer,
                                      const float* values, int64_t count) {
     if (count <= 0) return;
+    float chunk_min, chunk_max;
+    carquet_dispatch_minmax_float(values, count, &chunk_min, &chunk_max);
     if (!writer->has_min_max) {
-        float min_v, max_v;
-        carquet_dispatch_minmax_float(values, count, &min_v, &max_v);
-        writer->has_min_max = true;
-        writer->min_max_size = sizeof(float);
-        memcpy(writer->min_value, &min_v, sizeof(min_v));
-        memcpy(writer->max_value, &max_v, sizeof(max_v));
+        stats_set_fixed(writer, &chunk_min, &chunk_max, sizeof(float));
         return;
     }
     float min_v, max_v;
-    float chunk_min, chunk_max;
     memcpy(&min_v, writer->min_value, sizeof(min_v));
     memcpy(&max_v, writer->max_value, sizeof(max_v));
-    carquet_dispatch_minmax_float(values, count, &chunk_min, &chunk_max);
     if (chunk_min < min_v) min_v = chunk_min;
     if (chunk_max > max_v) max_v = chunk_max;
     memcpy(writer->min_value, &min_v, sizeof(min_v));
@@ -320,24 +369,95 @@ static void update_statistics_float(carquet_page_writer_t* writer,
 static void update_statistics_double(carquet_page_writer_t* writer,
                                       const double* values, int64_t count) {
     if (count <= 0) return;
+    double chunk_min, chunk_max;
+    carquet_dispatch_minmax_double(values, count, &chunk_min, &chunk_max);
     if (!writer->has_min_max) {
-        double min_v, max_v;
-        carquet_dispatch_minmax_double(values, count, &min_v, &max_v);
-        writer->has_min_max = true;
-        writer->min_max_size = sizeof(double);
-        memcpy(writer->min_value, &min_v, sizeof(min_v));
-        memcpy(writer->max_value, &max_v, sizeof(max_v));
+        stats_set_fixed(writer, &chunk_min, &chunk_max, sizeof(double));
         return;
     }
     double min_v, max_v;
-    double chunk_min, chunk_max;
     memcpy(&min_v, writer->min_value, sizeof(min_v));
     memcpy(&max_v, writer->max_value, sizeof(max_v));
-    carquet_dispatch_minmax_double(values, count, &chunk_min, &chunk_max);
     if (chunk_min < min_v) min_v = chunk_min;
     if (chunk_max > max_v) max_v = chunk_max;
     memcpy(writer->min_value, &min_v, sizeof(min_v));
     memcpy(writer->max_value, &max_v, sizeof(max_v));
+}
+
+static void update_statistics_boolean(carquet_page_writer_t* writer,
+                                       const uint8_t* values, int64_t count) {
+    if (count <= 0) return;
+    for (int64_t i = 0; i < count; i++) {
+        if (values[i]) writer->bool_seen_true = true;
+        else writer->bool_seen_false = true;
+        if (writer->bool_seen_true && writer->bool_seen_false) break;
+    }
+    if (!writer->bool_seen_true && !writer->bool_seen_false) return;
+
+    uint8_t min_b = writer->bool_seen_false ? 0 : 1;
+    uint8_t max_b = writer->bool_seen_true ? 1 : 0;
+    stats_set_fixed(writer, &min_b, &max_b, 1);
+}
+
+/* Lexicographic compare for unsigned byte sequences. */
+static int lex_compare(const uint8_t* a, size_t alen,
+                       const uint8_t* b, size_t blen) {
+    size_t n = alen < blen ? alen : blen;
+    int c = memcmp(a, b, n);
+    if (c != 0) return c;
+    if (alen < blen) return -1;
+    if (alen > blen) return 1;
+    return 0;
+}
+
+static void update_statistics_byte_array(carquet_page_writer_t* writer,
+                                          const carquet_byte_array_t* values,
+                                          int64_t count) {
+    for (int64_t i = 0; i < count; i++) {
+        const uint8_t* v = values[i].data;
+        size_t vlen = (size_t)values[i].length;
+        if (!v) continue;
+
+        if (!writer->has_min_max) {
+            if (stats_set_min(writer, v, vlen) != CARQUET_OK) return;
+            if (stats_set_max(writer, v, vlen) != CARQUET_OK) return;
+            writer->has_min_max = true;
+            continue;
+        }
+
+        if (lex_compare(v, vlen,
+                        writer->min_value, writer->min_value_size) < 0) {
+            if (stats_set_min(writer, v, vlen) != CARQUET_OK) return;
+        }
+        if (lex_compare(v, vlen,
+                        writer->max_value, writer->max_value_size) > 0) {
+            if (stats_set_max(writer, v, vlen) != CARQUET_OK) return;
+        }
+    }
+}
+
+static void update_statistics_flba(carquet_page_writer_t* writer,
+                                    const uint8_t* values,
+                                    int64_t count,
+                                    int32_t type_length) {
+    if (type_length <= 0 || count <= 0) return;
+    size_t tl = (size_t)type_length;
+    for (int64_t i = 0; i < count; i++) {
+        const uint8_t* v = values + i * tl;
+        if (!writer->has_min_max) {
+            if (stats_set_min(writer, v, tl) != CARQUET_OK) return;
+            if (stats_set_max(writer, v, tl) != CARQUET_OK) return;
+            writer->has_min_max = true;
+            writer->min_max_size = tl;
+            continue;
+        }
+        if (memcmp(v, writer->min_value, tl) < 0) {
+            memcpy(writer->min_value, v, tl);
+        }
+        if (memcmp(v, writer->max_value, tl) > 0) {
+            memcpy(writer->max_value, v, tl);
+        }
+    }
 }
 
 static carquet_status_t encode_plain_i32_with_stats(
@@ -352,19 +472,14 @@ static carquet_status_t encode_plain_i32_with_stats(
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
     carquet_dispatch_copy_minmax_i32(values, count, (int32_t*)dest, &min_v, &max_v);
-    if (!writer->has_min_max) {
-        writer->has_min_max = true;
-        writer->min_max_size = sizeof(min_v);
-    } else {
+    if (writer->has_min_max) {
         int32_t cur_min, cur_max;
         memcpy(&cur_min, writer->min_value, sizeof(cur_min));
         memcpy(&cur_max, writer->max_value, sizeof(cur_max));
         if (cur_min < min_v) min_v = cur_min;
         if (cur_max > max_v) max_v = cur_max;
     }
-    memcpy(writer->min_value, &min_v, sizeof(min_v));
-    memcpy(writer->max_value, &max_v, sizeof(max_v));
-    return CARQUET_OK;
+    return stats_set_fixed(writer, &min_v, &max_v, sizeof(min_v));
 #else
     carquet_status_t status = carquet_encode_plain_int32(values, count, &writer->values_buffer);
     if (status == CARQUET_OK) {
@@ -386,19 +501,14 @@ static carquet_status_t encode_plain_i64_with_stats(
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
     carquet_dispatch_copy_minmax_i64(values, count, (int64_t*)dest, &min_v, &max_v);
-    if (!writer->has_min_max) {
-        writer->has_min_max = true;
-        writer->min_max_size = sizeof(min_v);
-    } else {
+    if (writer->has_min_max) {
         int64_t cur_min, cur_max;
         memcpy(&cur_min, writer->min_value, sizeof(cur_min));
         memcpy(&cur_max, writer->max_value, sizeof(cur_max));
         if (cur_min < min_v) min_v = cur_min;
         if (cur_max > max_v) max_v = cur_max;
     }
-    memcpy(writer->min_value, &min_v, sizeof(min_v));
-    memcpy(writer->max_value, &max_v, sizeof(max_v));
-    return CARQUET_OK;
+    return stats_set_fixed(writer, &min_v, &max_v, sizeof(min_v));
 #else
     carquet_status_t status = carquet_encode_plain_int64(values, count, &writer->values_buffer);
     if (status == CARQUET_OK) {
@@ -420,19 +530,14 @@ static carquet_status_t encode_plain_float_with_stats(
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
     carquet_dispatch_copy_minmax_float(values, count, (float*)dest, &min_v, &max_v);
-    if (!writer->has_min_max) {
-        writer->has_min_max = true;
-        writer->min_max_size = sizeof(min_v);
-    } else {
+    if (writer->has_min_max) {
         float cur_min, cur_max;
         memcpy(&cur_min, writer->min_value, sizeof(cur_min));
         memcpy(&cur_max, writer->max_value, sizeof(cur_max));
         if (cur_min < min_v) min_v = cur_min;
         if (cur_max > max_v) max_v = cur_max;
     }
-    memcpy(writer->min_value, &min_v, sizeof(min_v));
-    memcpy(writer->max_value, &max_v, sizeof(max_v));
-    return CARQUET_OK;
+    return stats_set_fixed(writer, &min_v, &max_v, sizeof(min_v));
 #else
     carquet_status_t status = carquet_encode_plain_float(values, count, &writer->values_buffer);
     if (status == CARQUET_OK) {
@@ -454,19 +559,14 @@ static carquet_status_t encode_plain_double_with_stats(
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
     carquet_dispatch_copy_minmax_double(values, count, (double*)dest, &min_v, &max_v);
-    if (!writer->has_min_max) {
-        writer->has_min_max = true;
-        writer->min_max_size = sizeof(min_v);
-    } else {
+    if (writer->has_min_max) {
         double cur_min, cur_max;
         memcpy(&cur_min, writer->min_value, sizeof(cur_min));
         memcpy(&cur_max, writer->max_value, sizeof(cur_max));
         if (cur_min < min_v) min_v = cur_min;
         if (cur_max > max_v) max_v = cur_max;
     }
-    memcpy(writer->min_value, &min_v, sizeof(min_v));
-    memcpy(writer->max_value, &max_v, sizeof(max_v));
-    return CARQUET_OK;
+    return stats_set_fixed(writer, &min_v, &max_v, sizeof(min_v));
 #else
     carquet_status_t status = carquet_encode_plain_double(values, count, &writer->values_buffer);
     if (status == CARQUET_OK) {
@@ -558,10 +658,23 @@ carquet_status_t carquet_page_writer_add_values(
     int64_t num_nulls_before = writer->num_nulls;
     bool has_min_max_before = writer->has_min_max;
     size_t min_max_size_before = writer->min_max_size;
-    uint8_t min_value_before[sizeof(writer->min_value)];
-    uint8_t max_value_before[sizeof(writer->max_value)];
-    memcpy(min_value_before, writer->min_value, sizeof(min_value_before));
-    memcpy(max_value_before, writer->max_value, sizeof(max_value_before));
+    size_t min_size_before = writer->min_value_size;
+    size_t max_size_before = writer->max_value_size;
+    bool bool_seen_false_before = writer->bool_seen_false;
+    bool bool_seen_true_before = writer->bool_seen_true;
+
+    /* Stack snapshot of the current min/max bytes for rollback. For values
+     * exceeding STAT_SNAPSHOT_SZ (rare for primitive types and most strings)
+     * we drop the stats on failure instead of preserving them. */
+    enum { STAT_SNAPSHOT_SZ = 256 };
+    uint8_t min_snapshot[STAT_SNAPSHOT_SZ];
+    uint8_t max_snapshot[STAT_SNAPSHOT_SZ];
+    bool snapshot_ok = (min_size_before <= sizeof(min_snapshot) &&
+                        max_size_before <= sizeof(max_snapshot));
+    if (snapshot_ok && has_min_max_before) {
+        memcpy(min_snapshot, writer->min_value, min_size_before);
+        memcpy(max_snapshot, writer->max_value, max_size_before);
+    }
 
     /* Count nulls and non-null values */
     int64_t num_non_null = num_values;
@@ -603,6 +716,9 @@ carquet_status_t carquet_page_writer_add_values(
             const uint8_t* bools = (const uint8_t*)values;
             status = carquet_encode_plain_boolean(bools, num_non_null,
                                                    &writer->values_buffer);
+            if (status == CARQUET_OK && writer->write_statistics) {
+                update_statistics_boolean(writer, bools, num_non_null);
+            }
             break;
         }
 
@@ -652,6 +768,9 @@ carquet_status_t carquet_page_writer_add_values(
             const carquet_byte_array_t* arrays = (const carquet_byte_array_t*)values;
             status = carquet_encode_plain_byte_array(arrays, num_non_null,
                                                       &writer->values_buffer);
+            if (status == CARQUET_OK && writer->write_statistics) {
+                update_statistics_byte_array(writer, arrays, num_non_null);
+            }
             break;
         }
 
@@ -660,6 +779,9 @@ carquet_status_t carquet_page_writer_add_values(
             status = carquet_encode_plain_fixed_byte_array(fixed, num_non_null,
                                                             writer->type_length,
                                                             &writer->values_buffer);
+            if (status == CARQUET_OK && writer->write_statistics) {
+                update_statistics_flba(writer, fixed, num_non_null, writer->type_length);
+            }
             break;
         }
 
@@ -680,10 +802,22 @@ fail:
     writer->rep_levels_buffer.size = rep_size_before;
     writer->num_values = num_values_before;
     writer->num_nulls = num_nulls_before;
-    writer->has_min_max = has_min_max_before;
     writer->min_max_size = min_max_size_before;
-    memcpy(writer->min_value, min_value_before, sizeof(writer->min_value));
-    memcpy(writer->max_value, max_value_before, sizeof(writer->max_value));
+    writer->bool_seen_false = bool_seen_false_before;
+    writer->bool_seen_true = bool_seen_true_before;
+    if (snapshot_ok) {
+        writer->has_min_max = has_min_max_before;
+        writer->min_value_size = min_size_before;
+        writer->max_value_size = max_size_before;
+        if (has_min_max_before) {
+            memcpy(writer->min_value, min_snapshot, min_size_before);
+            memcpy(writer->max_value, max_snapshot, max_size_before);
+        }
+    } else {
+        writer->has_min_max = false;
+        writer->min_value_size = 0;
+        writer->max_value_size = 0;
+    }
     return status;
 }
 
@@ -907,9 +1041,9 @@ static carquet_status_t append_data_page_header(
         thrift_write_field_header(&enc, THRIFT_TYPE_I64, 3);
         thrift_write_i64(&enc, writer->num_nulls);
         thrift_write_field_header(&enc, THRIFT_TYPE_BINARY, 5);
-        thrift_write_binary(&enc, writer->max_value, (int32_t)writer->min_max_size);
+        thrift_write_binary(&enc, writer->max_value, (int32_t)writer->max_value_size);
         thrift_write_field_header(&enc, THRIFT_TYPE_BINARY, 6);
-        thrift_write_binary(&enc, writer->min_value, (int32_t)writer->min_max_size);
+        thrift_write_binary(&enc, writer->min_value, (int32_t)writer->min_value_size);
         thrift_write_struct_end(&enc);
     }
 
@@ -1097,20 +1231,18 @@ void carquet_page_writer_set_statistics(carquet_page_writer_t* writer, bool enab
 
 bool carquet_page_writer_get_statistics(
     const carquet_page_writer_t* writer,
-    const uint8_t** min_value,
-    const uint8_t** max_value,
-    size_t* value_size,
+    const uint8_t** min_value, size_t* min_size,
+    const uint8_t** max_value, size_t* max_size,
     int64_t* null_count) {
 
     if (!writer || !writer->has_min_max) {
         return false;
     }
-
     if (min_value) *min_value = writer->min_value;
     if (max_value) *max_value = writer->max_value;
-    if (value_size) *value_size = writer->min_max_size;
+    if (min_size) *min_size = writer->min_value_size;
+    if (max_size) *max_size = writer->max_value_size;
     if (null_count) *null_count = writer->num_nulls;
-
     return true;
 }
 

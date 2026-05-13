@@ -351,6 +351,15 @@ static int test_per_column_options(void) {
     st = carquet_writer_set_column_encoding(w, 99, CARQUET_ENCODING_PLAIN);
     if (st == CARQUET_OK) TEST_FAIL("per_column", "should reject invalid index");
 
+    /* Unsupported encodings must be rejected before metadata can diverge from
+       the bytes the writer actually emits. */
+    st = carquet_writer_set_column_encoding(w, 0, CARQUET_ENCODING_DELTA_BINARY_PACKED);
+    if (st != CARQUET_ERROR_INVALID_ENCODING)
+        TEST_FAIL("per_column", "should reject unsupported encoding");
+    st = carquet_writer_set_column_encoding(w, 0, CARQUET_ENCODING_BYTE_STREAM_SPLIT);
+    if (st != CARQUET_ERROR_INVALID_ENCODING)
+        TEST_FAIL("per_column", "should reject byte-stream split for INT64");
+
     /* Write data and close so we can read the metadata back */
     int64_t ids[N_ROWS];
     double vals[N_ROWS];
@@ -400,6 +409,32 @@ static int test_per_column_options(void) {
     if (m2.encodings[0] != CARQUET_ENCODING_PLAIN)
         TEST_FAIL("per_column", "col 2 encoding override not applied");
 
+    carquet_column_reader_t* label_reader = carquet_reader_get_column(r, 0, 2, &err);
+    if (!label_reader) TEST_FAIL("per_column", "label reader failed");
+
+    carquet_byte_array_t read_labels[N_ROWS];
+    int16_t read_def[N_ROWS];
+    int64_t label_rows = carquet_column_read_batch(
+        label_reader, read_labels, N_ROWS, read_def, NULL);
+    if (label_rows != N_ROWS) TEST_FAIL("per_column", "label row count mismatch");
+
+    int64_t label_value_index = 0;
+    for (int i = 0; i < N_ROWS; i++) {
+        if (i % 2 == 0) {
+            if (read_def[i] != 1 ||
+                read_labels[label_value_index].length != 3 ||
+                memcmp(read_labels[label_value_index].data, "abc", 3) != 0) {
+                TEST_FAIL("per_column", "nullable BYTE_ARRAY value mismatch");
+            }
+            label_value_index++;
+        } else if (read_def[i] != 0) {
+            TEST_FAIL("per_column", "nullable BYTE_ARRAY def mismatch");
+        }
+    }
+    if (label_value_index != non_null)
+        TEST_FAIL("per_column", "nullable BYTE_ARRAY sparse count mismatch");
+
+    carquet_column_reader_free(label_reader);
     carquet_reader_close(r);
     carquet_schema_free(schema);
     TEST_PASS("per_column");

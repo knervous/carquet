@@ -38,6 +38,15 @@ typedef struct column_chunk_info {
     carquet_compression_t compression;
     int32_t type_length;
     char* path;
+    /* Aggregated column statistics (mirrors row_group_writer.c). Min and max
+     * are heap-allocated and may have different sizes (BYTE_ARRAY). */
+    bool has_min_max;
+    uint8_t* min_value;
+    size_t min_value_size;
+    uint8_t* max_value;
+    size_t max_value_size;
+    int64_t null_count;
+    bool has_null_count;
 } column_chunk_info_t;
 
 extern carquet_row_group_writer_t* carquet_row_group_writer_create(
@@ -154,6 +163,16 @@ typedef struct row_group_column_info {
     int64_t offset_index_offset;
     bool has_offset_index_length;
     int32_t offset_index_length;
+    /* Aggregated column statistics */
+    bool has_statistics;
+    bool has_min_max;
+    bool has_null_count;
+    int64_t null_count;
+    /* Heap-allocated; freed when the row_group_info_t is torn down. */
+    uint8_t* min_value;
+    int32_t min_value_size;
+    uint8_t* max_value;
+    int32_t max_value_size;
 } row_group_column_info_t;
 
 typedef struct row_group_info {
@@ -586,6 +605,38 @@ static carquet_encoding_t effective_column_encoding(
     return CARQUET_ENCODING_PLAIN;
 }
 
+static bool writer_encoding_supported(
+    carquet_encoding_t encoding,
+    carquet_physical_type_t type) {
+
+    switch (encoding) {
+        case CARQUET_ENCODING_PLAIN:
+            return true;
+        case CARQUET_ENCODING_BYTE_STREAM_SPLIT:
+            return type == CARQUET_PHYSICAL_FLOAT ||
+                   type == CARQUET_PHYSICAL_DOUBLE;
+        default:
+            return false;
+    }
+}
+
+static void free_row_groups(carquet_writer_t* writer) {
+    if (!writer->row_groups) return;
+    for (int32_t i = 0; i < writer->num_row_groups; i++) {
+        row_group_info_t* rg = &writer->row_groups[i];
+        if (rg->columns) {
+            for (int32_t j = 0; j < rg->num_columns; j++) {
+                free(rg->columns[j].min_value);
+                free(rg->columns[j].max_value);
+            }
+            free(rg->columns);
+        }
+    }
+    free(writer->row_groups);
+    writer->row_groups = NULL;
+    writer->num_row_groups = 0;
+}
+
 static void free_kv_metadata(carquet_writer_t* writer) {
     if (writer->kv_metadata) {
         for (int32_t i = 0; i < writer->num_kv_metadata; i++) {
@@ -718,6 +769,39 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
         chunk->total_compressed_size = col_info->total_compressed_size;
         chunk->total_uncompressed_size = col_info->total_uncompressed_size;
         chunk->data_page_offset = col_info->file_offset;
+
+        /* Per-column statistics override may suppress emission for one column
+         * even when global write_statistics is enabled. */
+        bool emit_stats = writer->column_overrides_allocated && i < writer->num_columns
+            ? writer->column_statistics_overrides[i]
+            : writer->options.write_statistics;
+
+        if (emit_stats && (col_info->has_min_max || col_info->has_null_count)) {
+            chunk->has_statistics = true;
+            chunk->has_min_max = col_info->has_min_max;
+            chunk->has_null_count = col_info->has_null_count;
+            chunk->null_count = col_info->null_count;
+            if (col_info->has_min_max &&
+                col_info->min_value_size > 0 &&
+                col_info->max_value_size > 0) {
+                chunk->min_value = malloc(col_info->min_value_size);
+                chunk->max_value = malloc(col_info->max_value_size);
+                if (chunk->min_value && chunk->max_value) {
+                    memcpy(chunk->min_value, col_info->min_value,
+                           col_info->min_value_size);
+                    memcpy(chunk->max_value, col_info->max_value,
+                           col_info->max_value_size);
+                    chunk->min_value_size = (int32_t)col_info->min_value_size;
+                    chunk->max_value_size = (int32_t)col_info->max_value_size;
+                } else {
+                    free(chunk->min_value);
+                    free(chunk->max_value);
+                    chunk->min_value = NULL;
+                    chunk->max_value = NULL;
+                    chunk->has_min_max = false;
+                }
+            }
+        }
     }
 
     writer->num_row_groups++;
@@ -958,6 +1042,86 @@ static carquet_status_t build_file_metadata(
             dst_chunk->offset_index_offset = src_col->offset_index_offset;
             dst_chunk->has_offset_index_length = src_col->has_offset_index_length;
             dst_chunk->offset_index_length = src_col->offset_index_length;
+
+            if (src_col->has_statistics) {
+                meta->has_statistics = true;
+                parquet_statistics_t* stats = &meta->statistics;
+                memset(stats, 0, sizeof(*stats));
+
+                if (src_col->has_null_count) {
+                    stats->has_null_count = true;
+                    stats->null_count = src_col->null_count;
+                }
+
+                if (src_col->has_min_max &&
+                    src_col->min_value_size > 0 &&
+                    src_col->max_value_size > 0) {
+
+                    /* Truncate variable-length min/max per the Parquet spec
+                     * recommendation. Numeric / BOOLEAN / FLBA stats are
+                     * already at their natural fixed width so pass through. */
+                    const size_t TRUNC = 32;
+                    bool variable_len =
+                        (src_col->type == CARQUET_PHYSICAL_BYTE_ARRAY);
+
+                    int32_t min_n = (int32_t)src_col->min_value_size;
+                    int32_t max_n = (int32_t)src_col->max_value_size;
+                    bool emit_max = true;
+
+                    uint8_t* min_buf = carquet_arena_alloc(&writer->arena,
+                        (size_t)min_n);
+                    if (!min_buf) return CARQUET_ERROR_OUT_OF_MEMORY;
+                    memcpy(min_buf, src_col->min_value, (size_t)min_n);
+
+                    if (variable_len && (size_t)min_n > TRUNC) {
+                        /* Truncated prefix is lex <= original, valid as min. */
+                        min_n = (int32_t)TRUNC;
+                    }
+
+                    uint8_t* max_buf = carquet_arena_alloc(&writer->arena,
+                        (size_t)max_n);
+                    if (!max_buf) return CARQUET_ERROR_OUT_OF_MEMORY;
+                    memcpy(max_buf, src_col->max_value, (size_t)max_n);
+
+                    if (variable_len && (size_t)max_n > TRUNC) {
+                        /* Truncate then increment to ensure result >= original.
+                         * If all bytes in the prefix are 0xFF the increment
+                         * wraps and we cannot emit a valid upper bound — drop
+                         * max in that case. */
+                        size_t new_len = TRUNC;
+                        max_buf[new_len - 1]++;
+                        while (new_len > 0 && max_buf[new_len - 1] == 0) {
+                            new_len--;
+                            if (new_len > 0) max_buf[new_len - 1]++;
+                        }
+                        if (new_len == 0) {
+                            emit_max = false;
+                        } else {
+                            max_n = (int32_t)new_len;
+                        }
+                    }
+
+                    stats->min_value = min_buf;
+                    stats->min_value_len = min_n;
+                    if (emit_max) {
+                        stats->max_value = max_buf;
+                        stats->max_value_len = max_n;
+                    }
+
+                    /* Mirror to deprecated min/max fields for older readers
+                     * that ignore min_value/max_value (only for non-truncated
+                     * stats to avoid leaking truncation semantics). */
+                    if (!variable_len || (size_t)src_col->min_value_size <= TRUNC) {
+                        stats->min_deprecated = min_buf;
+                        stats->min_deprecated_len = min_n;
+                    }
+                    if (emit_max &&
+                        (!variable_len || (size_t)src_col->max_value_size <= TRUNC)) {
+                        stats->max_deprecated = max_buf;
+                        stats->max_deprecated_len = max_n;
+                    }
+                }
+            }
         }
     }
 
@@ -1354,12 +1518,7 @@ cleanup:
     free(writer->column_encodings);
 
     free(writer->column_values_written);
-    if (writer->row_groups) {
-        for (int32_t i = 0; i < writer->num_row_groups; i++) {
-            free(writer->row_groups[i].columns);
-        }
-    }
-    free(writer->row_groups);
+    free_row_groups(writer);
     free(writer->path);
 
     /* Free key-value metadata */
@@ -1426,12 +1585,7 @@ void carquet_writer_abort(carquet_writer_t* writer) {
     free(writer->column_encodings);
 
     free(writer->column_values_written);
-    if (writer->row_groups) {
-        for (int32_t i = 0; i < writer->num_row_groups; i++) {
-            free(writer->row_groups[i].columns);
-        }
-    }
-    free(writer->row_groups);
+    free_row_groups(writer);
     free(writer->path);
 
     /* Free key-value metadata */
@@ -1497,6 +1651,11 @@ carquet_status_t carquet_writer_set_column_encoding(
     /* writer is nonnull per API contract */
     if (column_index < 0 || column_index >= writer->num_columns) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (!writer_encoding_supported(
+            encoding, writer->columns[column_index].physical_type)) {
+        return CARQUET_ERROR_INVALID_ENCODING;
     }
 
     carquet_status_t status = ensure_column_overrides(writer);

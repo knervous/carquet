@@ -523,7 +523,7 @@ carquet_status_t carquet_reader_row_group_metadata(
     carquet_row_group_metadata_t* metadata) {
 
     /* reader and metadata are nonnull per API contract */
-    if (row_group_index < 0 || row_group_index >= reader->metadata.num_row_groups) {
+    if (!carquet_reader_row_group_index_valid(reader, row_group_index)) {
         return CARQUET_ERROR_ROW_GROUP_NOT_FOUND;
     }
 
@@ -561,7 +561,7 @@ carquet_status_t carquet_reader_prebuffer(
         return CARQUET_ERROR_INVALID_STATE;
     }
 
-    if (row_group_index < 0 || row_group_index >= reader->metadata.num_row_groups) {
+    if (!carquet_reader_row_group_index_valid(reader, row_group_index)) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_ROW_GROUP_NOT_FOUND,
             "Row group %d not found", row_group_index);
         return CARQUET_ERROR_ROW_GROUP_NOT_FOUND;
@@ -669,7 +669,7 @@ carquet_column_reader_t* carquet_reader_get_column(
     carquet_error_t* error) {
 
     /* reader is nonnull per API contract */
-    if (row_group_index < 0 || row_group_index >= reader->metadata.num_row_groups) {
+    if (!carquet_reader_row_group_index_valid(reader, row_group_index)) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_ROW_GROUP_NOT_FOUND,
             "Row group %d not found", row_group_index);
         return NULL;
@@ -782,7 +782,7 @@ bool carquet_reader_can_zero_copy(
     }
 
     /* Validate indices */
-    if (row_group_index < 0 || row_group_index >= reader->metadata.num_row_groups) {
+    if (!carquet_reader_row_group_index_valid(reader, row_group_index)) {
         return false;
     }
     if (column_index < 0 || column_index >= reader->schema->num_leaves) {
@@ -942,7 +942,7 @@ static const parquet_column_chunk_t* reader_get_column_chunk(
     int32_t column_index,
     carquet_error_t* error) {
 
-    if (row_group_index < 0 || row_group_index >= reader->metadata.num_row_groups) {
+    if (!carquet_reader_row_group_index_valid(reader, row_group_index)) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_ROW_GROUP_NOT_FOUND,
             "Row group %d not found", row_group_index);
         return NULL;

@@ -493,8 +493,8 @@ static int test_dispatch_null_helpers(void) {
     assert(carquet_dispatch_count_non_nulls(levels, 10, 1) == 6);
 
     carquet_dispatch_build_null_bitmap(levels, 10, 1, bitmap);
-    assert(bitmap[0] == 0xB2);
-    assert(bitmap[1] == 0x00);
+    assert(bitmap[0] == 0x4D);
+    assert(bitmap[1] == 0x03);
 
     carquet_dispatch_fill_def_levels(filled, 10, 3);
     for (int i = 0; i < 10; i++) {

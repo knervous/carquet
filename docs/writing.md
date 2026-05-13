@@ -106,6 +106,27 @@ Useful APIs before the first write:
 
 Per-column overrides must be set after writer creation and before writing data.
 
+## Column Statistics
+
+With `opts.write_statistics = true` (the default), the writer records per-row-group min/max and null counts for every primitive type — `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `BOOLEAN`, `BYTE_ARRAY`, and `FIXED_LEN_BYTE_ARRAY`. Stats are aggregated across pages and used by `carquet_reader_filter_row_groups()` for predicate pushdown.
+
+`BYTE_ARRAY` min/max are stored using lexicographic order; values longer than 32 bytes are truncated per the Parquet spec (min is truncated to a prefix; max is truncated and incremented so the stored bound is still a valid upper bound).
+
+Use `carquet_writer_set_column_statistics(writer, idx, false)` to disable stats for a single column while keeping them on globally.
+
+```c
+carquet_writer_options_t opts;
+carquet_writer_options_init(&opts);
+opts.write_statistics = true;  /* default — shown for clarity */
+
+carquet_writer_t* writer = carquet_writer_create("out.parquet", schema, &opts, &err);
+
+/* Skip stats for one column (e.g. a large opaque blob). */
+carquet_writer_set_column_statistics(writer, 2, false);
+```
+
+See [`reading.md`](./reading.md#column-statistics) for how to read these stats back and use them for predicate pushdown.
+
 ## Write to Memory Instead of a File
 
 Using an existing schema, you can write to memory and retrieve the final Parquet bytes after close:

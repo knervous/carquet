@@ -592,7 +592,7 @@ void carquet_sve_build_null_bitmap(const int16_t* def_levels, int64_t count,
     while (i < count) {
         uint8_t bits = 0;
         for (int j = 0; j < 8 && i < count; j++, i++) {
-            if (def_levels[i] < max_def_level) {
+            if (def_levels[i] == max_def_level) {
                 bits |= (uint8_t)(1u << j);
             }
         }

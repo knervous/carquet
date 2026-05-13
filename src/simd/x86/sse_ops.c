@@ -1192,7 +1192,7 @@ int64_t carquet_sse_count_non_nulls(const int16_t* def_levels, int64_t count, in
 
 /**
  * Build null bitmap from definition levels using SIMD.
- * Sets bit to 1 if def_levels[i] < max_def_level (null).
+ * Sets bit to 1 if def_levels[i] == max_def_level (present).
  */
 void carquet_sse_build_null_bitmap(const int16_t* def_levels, int64_t count,
                                     int16_t max_def_level, uint8_t* null_bitmap) {
@@ -1205,8 +1205,8 @@ void carquet_sse_build_null_bitmap(const int16_t* def_levels, int64_t count,
     int64_t full_bytes = count / 8;
     for (int64_t b = 0; b < full_bytes; b++) {
         __m128i levels = _mm_loadu_si128((const __m128i*)(def_levels + b * 8));
-        /* levels < max_def means null: result is 0x0000 or 0xFFFF per lane */
-        __m128i cmp = _mm_cmplt_epi16(levels, max_vec);
+        /* levels == max_def means present: result is 0x0000 or 0xFFFF per lane */
+        __m128i cmp = _mm_cmpeq_epi16(levels, max_vec);
         /* Pack 8 int16 results (0x0000 or 0xFFFF) to 8 int8 (0x00 or 0xFF) */
         __m128i packed = _mm_packs_epi16(cmp, zero);
         /* movemask extracts bit 7 from each byte -> 8-bit result in low byte */
@@ -1216,13 +1216,13 @@ void carquet_sse_build_null_bitmap(const int16_t* def_levels, int64_t count,
 
     /* Handle remaining bits */
     if (i < count) {
-        uint8_t null_bits = 0;
+        uint8_t present_bits = 0;
         for (int64_t j = 0; i + j < count && j < 8; j++) {
-            if (def_levels[i + j] < max_def_level) {
-                null_bits |= (1 << j);
+            if (def_levels[i + j] == max_def_level) {
+                present_bits |= (1 << j);
             }
         }
-        null_bitmap[full_bytes] = null_bits;
+        null_bitmap[full_bytes] = present_bits;
     }
 }
 

@@ -211,7 +211,7 @@ Both libraries read the **same** Parquet file — the fairest apples-to-apples c
 git clone https://github.com/Vitruves/carquet.git
 cd carquet
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
+cmake --build build -j
 ```
 
 ### Build Options

@@ -325,8 +325,21 @@ int cmd_codegen_read(FILE* out, carquet_reader_t* reader,
     } else {
         /* Default: print each row as tab-separated values */
         emit(out,
-            "    (void)row_group; (void)batch_offset; (void)dummy;\n"
-            "    for (int64_t i = 0; i < count; i++) {\n");
+            "    (void)row_group; (void)batch_offset; (void)dummy;\n");
+
+        for (int32_t c = 0; c < num_cols; c++) {
+            if (!include[c]) continue;
+            const carquet_schema_node_t* node = carquet_schema_get_element(schema,
+                schema->leaf_indices[c]);
+            bool nullable = carquet_schema_node_repetition(node) != CARQUET_REPETITION_REQUIRED;
+            if (nullable) {
+                char ident[128];
+                sanitize_ident(carquet_schema_column_name(schema, c), ident, sizeof(ident));
+                emit(out, "    int64_t %s_value_index = 0;\n", ident);
+            }
+        }
+
+        emit(out, "    for (int64_t i = 0; i < count; i++) {\n");
 
         int col_printed = 0;
         for (int32_t c = 0; c < num_cols; c++) {
@@ -349,22 +362,23 @@ int cmd_codegen_read(FILE* out, carquet_reader_t* reader,
                 /* Print value (indented inside else) */
                 switch (phys) {
                     case CARQUET_PHYSICAL_BOOLEAN:
-                        emit(out, "            printf(\"%s%%s\", %s[i] ? \"true\" : \"false\");\n", sep, ident); break;
+                        emit(out, "            printf(\"%s%%s\", %s[%s_value_index] ? \"true\" : \"false\");\n", sep, ident, ident); break;
                     case CARQUET_PHYSICAL_INT32:
-                        emit(out, "            printf(\"%s%%\" PRId32, %s[i]);\n", sep, ident); break;
+                        emit(out, "            printf(\"%s%%\" PRId32, %s[%s_value_index]);\n", sep, ident, ident); break;
                     case CARQUET_PHYSICAL_INT64:
-                        emit(out, "            printf(\"%s%%\" PRId64, %s[i]);\n", sep, ident); break;
+                        emit(out, "            printf(\"%s%%\" PRId64, %s[%s_value_index]);\n", sep, ident, ident); break;
                     case CARQUET_PHYSICAL_FLOAT:
-                        emit(out, "            printf(\"%s%%g\", (double)%s[i]);\n", sep, ident); break;
+                        emit(out, "            printf(\"%s%%g\", (double)%s[%s_value_index]);\n", sep, ident, ident); break;
                     case CARQUET_PHYSICAL_DOUBLE:
-                        emit(out, "            printf(\"%s%%g\", %s[i]);\n", sep, ident); break;
+                        emit(out, "            printf(\"%s%%g\", %s[%s_value_index]);\n", sep, ident, ident); break;
                     case CARQUET_PHYSICAL_BYTE_ARRAY:
-                        emit(out, "            printf(\"%s%%.*s\", %s[i].length, (const char*)%s[i].data);\n", sep, ident, ident); break;
+                        emit(out, "            printf(\"%s%%.*s\", %s[%s_value_index].length, (const char*)%s[%s_value_index].data);\n", sep, ident, ident, ident, ident); break;
                     case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
-                        emit(out, "            for (int32_t b = 0; b < %d; b++) printf(\"%s%%02x\", %s[i * %d + b]);\n", tl, sep, ident, tl); break;
+                        emit(out, "            for (int32_t b = 0; b < %d; b++) printf(\"%s%%02x\", %s[%s_value_index * %d + b]);\n", tl, sep, ident, ident, tl); break;
                     default:
                         emit(out, "            printf(\"%s?\");\n", sep); break;
                 }
+                emit(out, "            %s_value_index++;\n", ident);
                 emit(out, "        }\n");
             } else {
                 switch (phys) {

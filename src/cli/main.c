@@ -21,11 +21,13 @@ static void print_usage(void) {
         "  info       Print detailed file metadata\n"
         "  head       Print first N rows\n"
         "  tail       Print last N rows\n"
+        "  cat        Print rows with optional slicing and column filter\n"
         "  count      Print total row count\n"
         "  columns    List column names (one per line)\n"
         "  stat       Print column statistics\n"
         "  validate   Verify file integrity\n"
         "  sample     Print N random rows\n"
+        "  export     Write rows in another format (csv)\n"
         "  codegen    Generate C reader code\n"
         "\n"
         "Run 'carquet <command> -h' for command-specific help.\n",
@@ -145,6 +147,47 @@ static void print_help_sample(void) {
         CLI_DEFAULT_NUM_ROWS);
 }
 
+static void print_help_cat(void) {
+    fprintf(stderr,
+        "Usage: carquet cat [options] <file.parquet>\n"
+        "\n"
+        "Print rows in a tabular format with optional slicing and a column\n"
+        "filter. Unlike head/tail, supports arbitrary row offsets.\n"
+        "\n"
+        "Arguments:\n"
+        "  <file.parquet>    Input Parquet file\n"
+        "\n"
+        "Options:\n"
+        "  -n, --limit N     Number of rows to print (default: all)\n"
+        "  -s, --offset N    Skip the first N rows (default: 0)\n"
+        "  -c, --columns L   Comma-separated column names (default: all)\n"
+        "\n"
+        "Examples:\n"
+        "  carquet cat -n 1000 data.parquet\n"
+        "  carquet cat -c id,name --offset 5000 -n 100 data.parquet\n");
+}
+
+static void print_help_export(void) {
+    fprintf(stderr,
+        "Usage: carquet export [options] <file.parquet>\n"
+        "\n"
+        "Write rows to stdout in another format. Currently supports CSV.\n"
+        "Output is RFC 4180 quoted (header row + comma-separated values).\n"
+        "\n"
+        "Arguments:\n"
+        "  <file.parquet>    Input Parquet file\n"
+        "\n"
+        "Options:\n"
+        "  --format FMT      Output format: csv (default)\n"
+        "  -n, --limit N     Number of rows to export (default: all)\n"
+        "  -s, --offset N    Skip the first N rows (default: 0)\n"
+        "  -c, --columns L   Comma-separated column names (default: all)\n"
+        "\n"
+        "Examples:\n"
+        "  carquet export data.parquet > data.csv\n"
+        "  carquet export -c id,name -n 1000 data.parquet | head\n");
+}
+
 static void print_help_codegen(void) {
     fprintf(stderr,
         "Usage: carquet codegen [options]\n"
@@ -200,6 +243,70 @@ int main(int argc, char** argv) {
     if (is_help_flag(cmd) || strcmp(cmd, "help") == 0) {
         print_usage();
         return 0;
+    }
+
+    /* ── cat / export ───────────────────────────────────────────────── */
+    if (strcmp(cmd, "cat") == 0 || strcmp(cmd, "export") == 0) {
+        bool is_export = strcmp(cmd, "export") == 0;
+        for (int i = 2; i < argc; i++) {
+            if (is_help_flag(argv[i])) {
+                if (is_export) print_help_export(); else print_help_cat();
+                return 0;
+            }
+        }
+
+        row_select_opts_t opts;
+        opts.offset = 0;
+        opts.limit = -1;
+        opts.columns = NULL;
+        const char* file_path = NULL;
+        const char* format = "csv";  /* only used by export */
+
+        for (int i = 2; i < argc; i++) {
+            if ((strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--limit") == 0) && i + 1 < argc) {
+                int64_t v;
+                if (parse_int64(argv[++i], &v) != 0) {
+                    fprintf(stderr, "error: invalid --limit '%s'\n", argv[i]);
+                    return 1;
+                }
+                opts.limit = v;
+            } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--offset") == 0) && i + 1 < argc) {
+                int64_t v;
+                if (parse_int64(argv[++i], &v) != 0) {
+                    fprintf(stderr, "error: invalid --offset '%s'\n", argv[i]);
+                    return 1;
+                }
+                opts.offset = v;
+            } else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--columns") == 0) && i + 1 < argc) {
+                opts.columns = argv[++i];
+            } else if (is_export && strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+                format = argv[++i];
+            } else if (argv[i][0] != '-') {
+                file_path = argv[i];
+            } else {
+                fprintf(stderr, "error: unknown option '%s' for '%s'\n\n", argv[i], cmd);
+                if (is_export) print_help_export(); else print_help_cat();
+                return 1;
+            }
+        }
+
+        if (!file_path) {
+            fprintf(stderr, "error: no input file specified\n\n");
+            if (is_export) print_help_export(); else print_help_cat();
+            return 1;
+        }
+
+        if (is_export) {
+            export_format_t fmt;
+            if (strcmp(format, "csv") == 0) {
+                fmt = CLI_EXPORT_CSV;
+            } else {
+                fprintf(stderr, "error: unsupported --format '%s' (expected: csv)\n", format);
+                return 1;
+            }
+            return cmd_export(file_path, &opts, fmt);
+        }
+        return cmd_cat(file_path, &opts);
     }
 
     /* ── codegen ────────────────────────────────────────────────────── */

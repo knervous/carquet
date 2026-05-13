@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.4.2
+
+### Bug Fixes
+
+- **Statistics are now actually written to Parquet files**: `write_statistics = true` (the default) was silently being ignored — page-level min/max/null counts were never propagated up into the column chunk metadata, so files contained no statistics regardless of the option. Column stats now flow correctly from page → column → row group → file metadata. Existing files written with older versions are unaffected; only the writer was broken.
+- **Fixed `carquet stat` CLI segfault on string columns**: The `stat` subcommand crashed when displaying min/max for `BYTE_ARRAY` (string) columns. The bug was latent until statistics actually started being written.
+- **Fixed nullable value decoding contract**: Optional columns now consistently use a packed non-null value stream plus definition levels, including `BYTE_ARRAY`, dictionary pages, partial page reads, and generated reader code.
+- **Fixed null bitmap polarity**: Batch reader null bitmaps now consistently follow the documented convention: bit set means the value is present.
+- **Fixed compressed mmap batch-reader edge cases**: The pipeline no longer drops null information for optional/repeated columns, and intra-column split tasks no longer share mutable column-reader scratch buffers.
+- **Rejected unsupported writer encodings**: Per-column encoding overrides now fail fast for encodings the writer cannot actually emit, avoiding mismatched metadata and payloads.
+
+### New Features
+
+- **Statistics for all primitive types**: Min/max/null-count are now tracked for `BOOLEAN`, `BYTE_ARRAY`, and `FIXED_LEN_BYTE_ARRAY` in addition to the numeric types. Byte-array min/max use Parquet-spec lexicographic ordering with min/max truncation at 32 bytes for long values (max is incremented so the stored bound remains a valid upper bound).
+- **New CLI commands**:
+  - `carquet cat [-n LIMIT] [-s OFFSET] [-c COLS] <file>` — print rows with arbitrary slicing and column filtering. Fills the gap between `head`/`tail` (anchored to start/end) and `sample` (random).
+  - `carquet export [--format csv] [-n LIMIT] [-s OFFSET] [-c COLS] <file>` — write rows to stdout as RFC 4180 CSV with the same slicing/filter options. Useful for piping into shell tools or other CSV consumers.
+- **Cleaner `carquet stat` output**: columns are now auto-sized to their actual content width instead of fixed 20/30-character cells, so short numeric stats no longer create huge empty gaps and long string min/max are no longer truncated.
+
 ## v0.4.1
 
 - Hardened page reader bounds checks for mmap and fread paths, including page payload spans, page sizes, and offset arithmetic.

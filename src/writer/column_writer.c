@@ -117,11 +117,14 @@ typedef struct carquet_column_writer_internal {
     int64_t total_compressed_size;
     int32_t num_pages;
 
-    /* Min/max tracking */
+    /* Min/max tracking. Min and max may have different lengths (BYTE_ARRAY). */
     bool has_min_max;
-    uint8_t min_value[64];
-    uint8_t max_value[64];
-    size_t min_max_size;
+    uint8_t* min_value;
+    size_t min_value_size;
+    size_t min_value_capacity;
+    uint8_t* max_value;
+    size_t max_value_size;
+    size_t max_value_capacity;
 
     /* Column path for metadata */
     char** path_in_schema;
@@ -185,6 +188,8 @@ void carquet_column_writer_destroy(carquet_column_writer_internal_t* writer) {
         if (writer->page_writer) {
             carquet_page_writer_destroy(writer->page_writer);
         }
+        free(writer->min_value);
+        free(writer->max_value);
         carquet_buffer_destroy(&writer->column_buffer);
 
         /* Free path strings */
@@ -227,7 +232,8 @@ void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
     writer->total_compressed_size = 0;
     writer->num_pages = 0;
     writer->has_min_max = false;
-    writer->min_max_size = 0;
+    writer->min_value_size = 0;
+    writer->max_value_size = 0;
     writer->page_row_offset = 0;
     writer->column_file_offset = 0;
 
@@ -261,9 +267,107 @@ void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
 /* Forward declarations for page writer statistics */
 extern bool carquet_page_writer_get_statistics(
     const carquet_page_writer_t* writer,
-    const uint8_t** min_value, const uint8_t** max_value,
-    size_t* value_size, int64_t* null_count);
+    const uint8_t** min_value, size_t* min_size,
+    const uint8_t** max_value, size_t* max_size,
+    int64_t* null_count);
 extern int64_t carquet_page_writer_null_count(const carquet_page_writer_t* writer);
+
+/* Numeric/IEEE-754-aware comparison for fixed-width stat values. For
+ * variable-length and FLBA types Parquet uses unsigned lexicographic order. */
+static int compare_stat_values(carquet_physical_type_t type,
+                               const uint8_t* a, size_t alen,
+                               const uint8_t* b, size_t blen) {
+    if (alen == blen) {
+        switch (type) {
+            case CARQUET_PHYSICAL_INT32: {
+                int32_t av, bv;
+                memcpy(&av, a, sizeof(av));
+                memcpy(&bv, b, sizeof(bv));
+                return (av < bv) ? -1 : (av > bv ? 1 : 0);
+            }
+            case CARQUET_PHYSICAL_INT64: {
+                int64_t av, bv;
+                memcpy(&av, a, sizeof(av));
+                memcpy(&bv, b, sizeof(bv));
+                return (av < bv) ? -1 : (av > bv ? 1 : 0);
+            }
+            case CARQUET_PHYSICAL_FLOAT: {
+                float av, bv;
+                memcpy(&av, a, sizeof(av));
+                memcpy(&bv, b, sizeof(bv));
+                if (av < bv) return -1;
+                if (av > bv) return 1;
+                return 0;
+            }
+            case CARQUET_PHYSICAL_DOUBLE: {
+                double av, bv;
+                memcpy(&av, a, sizeof(av));
+                memcpy(&bv, b, sizeof(bv));
+                if (av < bv) return -1;
+                if (av > bv) return 1;
+                return 0;
+            }
+            default:
+                break;
+        }
+    }
+    /* BYTE_ARRAY / FLBA / mismatched sizes: lexicographic unsigned compare. */
+    size_t n = alen < blen ? alen : blen;
+    int c = memcmp(a, b, n);
+    if (c != 0) return c;
+    if (alen < blen) return -1;
+    if (alen > blen) return 1;
+    return 0;
+}
+
+static carquet_status_t column_stats_grow(uint8_t** buf, size_t* cap, size_t need) {
+    if (need <= *cap) return CARQUET_OK;
+    size_t new_cap = *cap == 0 ? 64 : *cap;
+    while (new_cap < need) new_cap *= 2;
+    uint8_t* p = realloc(*buf, new_cap);
+    if (!p) return CARQUET_ERROR_OUT_OF_MEMORY;
+    *buf = p;
+    *cap = new_cap;
+    return CARQUET_OK;
+}
+
+static void merge_page_statistics(carquet_column_writer_internal_t* writer,
+                                  const uint8_t* page_min, size_t min_size,
+                                  const uint8_t* page_max, size_t max_size) {
+    if (!page_min || !page_max || min_size == 0 || max_size == 0) {
+        return;
+    }
+
+    if (!writer->has_min_max) {
+        if (column_stats_grow(&writer->min_value, &writer->min_value_capacity,
+                              min_size) != CARQUET_OK) return;
+        if (column_stats_grow(&writer->max_value, &writer->max_value_capacity,
+                              max_size) != CARQUET_OK) return;
+        memcpy(writer->min_value, page_min, min_size);
+        memcpy(writer->max_value, page_max, max_size);
+        writer->min_value_size = min_size;
+        writer->max_value_size = max_size;
+        writer->has_min_max = true;
+        return;
+    }
+
+    if (compare_stat_values(writer->type,
+                            page_min, min_size,
+                            writer->min_value, writer->min_value_size) < 0) {
+        if (column_stats_grow(&writer->min_value, &writer->min_value_capacity,
+                              min_size) != CARQUET_OK) return;
+        memcpy(writer->min_value, page_min, min_size);
+        writer->min_value_size = min_size;
+    }
+    if (compare_stat_values(writer->type,
+                            page_max, max_size,
+                            writer->max_value, writer->max_value_size) > 0) {
+        if (column_stats_grow(&writer->max_value, &writer->max_value_capacity,
+                              max_size) != CARQUET_OK) return;
+        memcpy(writer->max_value, page_max, max_size);
+        writer->max_value_size = max_size;
+    }
+}
 
 static carquet_status_t flush_current_page(carquet_column_writer_internal_t* writer) {
     if (carquet_page_writer_num_values(writer->page_writer) == 0) {
@@ -274,16 +378,25 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
     int32_t uncompressed_size;
     int32_t compressed_size;
 
-    /* Capture per-page statistics before finalize (for page index) */
+    /* Capture per-page statistics before finalize (used for column-level
+     * aggregation and, when enabled, the column/page index). */
     const uint8_t* page_min = NULL;
     const uint8_t* page_max = NULL;
-    size_t stat_size = 0;
+    size_t min_size = 0;
+    size_t max_size = 0;
     int64_t page_null_count = 0;
-    bool has_stats = false;
+    bool has_stats = carquet_page_writer_get_statistics(
+        writer->page_writer, &page_min, &min_size, &page_max, &max_size,
+        &page_null_count);
 
-    if (writer->column_index) {
-        has_stats = carquet_page_writer_get_statistics(
-            writer->page_writer, &page_min, &page_max, &stat_size, &page_null_count);
+    if (!has_stats) {
+        page_null_count = carquet_page_writer_null_count(writer->page_writer);
+    }
+
+    /* Accumulate column-level statistics across pages */
+    writer->total_nulls += page_null_count;
+    if (has_stats) {
+        merge_page_statistics(writer, page_min, min_size, page_max, max_size);
     }
 
     size_t page_start = writer->column_buffer.size;
@@ -298,12 +411,11 @@ static carquet_status_t flush_current_page(carquet_column_writer_internal_t* wri
     /* Record page index entries before appending */
     if (writer->column_index) {
         bool is_null_page = !has_stats;
-        if (!page_null_count) page_null_count = carquet_page_writer_null_count(writer->page_writer);
         carquet_column_index_add_page(
             writer->column_index,
             page_null_count,
-            has_stats ? page_min : NULL, has_stats ? (int32_t)stat_size : 0,
-            has_stats ? page_max : NULL, has_stats ? (int32_t)stat_size : 0,
+            has_stats ? page_min : NULL, has_stats ? (int32_t)min_size : 0,
+            has_stats ? page_max : NULL, has_stats ? (int32_t)max_size : 0,
             is_null_page);
     }
 
@@ -514,6 +626,29 @@ void carquet_column_writer_set_statistics(
     if (writer && writer->page_writer) {
         carquet_page_writer_set_statistics(writer->page_writer, enabled);
     }
+}
+
+bool carquet_column_writer_get_statistics(
+    const carquet_column_writer_internal_t* writer,
+    const uint8_t** min_value,
+    size_t* min_size,
+    const uint8_t** max_value,
+    size_t* max_size,
+    int64_t* null_count) {
+    if (!writer) return false;
+    if (null_count) *null_count = writer->total_nulls;
+    if (!writer->has_min_max) {
+        if (min_value) *min_value = NULL;
+        if (max_value) *max_value = NULL;
+        if (min_size) *min_size = 0;
+        if (max_size) *max_size = 0;
+        return false;
+    }
+    if (min_value) *min_value = writer->min_value;
+    if (max_value) *max_value = writer->max_value;
+    if (min_size) *min_size = writer->min_value_size;
+    if (max_size) *max_size = writer->max_value_size;
+    return true;
 }
 
 int64_t carquet_column_writer_num_values(const carquet_column_writer_internal_t* writer) {

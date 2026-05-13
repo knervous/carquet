@@ -1439,7 +1439,7 @@ int64_t carquet_neon_count_non_nulls(const int16_t* def_levels, int64_t count, i
 
 /**
  * Build null bitmap from definition levels using NEON.
- * Sets bit to 1 if def_levels[i] < max_def_level (null).
+ * Sets bit to 1 if def_levels[i] == max_def_level (present).
  */
 void carquet_neon_build_null_bitmap(const int16_t* def_levels, int64_t count,
                                      int16_t max_def_level, uint8_t* null_bitmap) {
@@ -1452,11 +1452,11 @@ void carquet_neon_build_null_bitmap(const int16_t* def_levels, int64_t count,
     for (int64_t b = 0; b < full_bytes; b++) {
         int16x8_t levels = vld1q_s16(def_levels + b * 8);
 
-        /* levels < max_def means null */
-        uint16x8_t cmp = vcltq_s16(levels, max_vec);
+        /* levels == max_def means present */
+        uint16x8_t cmp = vceqq_s16(levels, max_vec);
 
         /* Extract one bit per lane to form a byte
-         * cmp has 0xFFFF for null, 0x0000 for non-null
+         * cmp has 0xFFFF for present, 0x0000 for null
          * We need bit 0 from lane 0, bit 1 from lane 1, etc.
          */
 
@@ -1482,13 +1482,13 @@ void carquet_neon_build_null_bitmap(const int16_t* def_levels, int64_t count,
 
     /* Handle remaining bits */
     if (i < count) {
-        uint8_t null_bits = 0;
+        uint8_t present_bits = 0;
         for (int64_t j = 0; i + j < count && j < 8; j++) {
-            if (def_levels[i + j] < max_def_level) {
-                null_bits |= (1 << j);
+            if (def_levels[i + j] == max_def_level) {
+                present_bits |= (1 << j);
             }
         }
-        null_bitmap[full_bytes] = null_bits;
+        null_bitmap[full_bytes] = present_bits;
     }
 }
 

@@ -329,20 +329,20 @@ static void scalar_build_null_bitmap(const int16_t* def_levels, int64_t count,
                                       int16_t max_def_level, uint8_t* null_bitmap) {
     int64_t full_bytes = count / 8;
     for (int64_t b = 0; b < full_bytes; b++) {
-        uint8_t null_bits = 0;
+        uint8_t present_bits = 0;
         int64_t base = b * 8;
-        if (def_levels[base + 0] < max_def_level) null_bits |= 0x01;
-        if (def_levels[base + 1] < max_def_level) null_bits |= 0x02;
-        if (def_levels[base + 2] < max_def_level) null_bits |= 0x04;
-        if (def_levels[base + 3] < max_def_level) null_bits |= 0x08;
-        if (def_levels[base + 4] < max_def_level) null_bits |= 0x10;
-        if (def_levels[base + 5] < max_def_level) null_bits |= 0x20;
-        if (def_levels[base + 6] < max_def_level) null_bits |= 0x40;
-        if (def_levels[base + 7] < max_def_level) null_bits |= 0x80;
-        null_bitmap[b] = null_bits;
+        if (def_levels[base + 0] == max_def_level) present_bits |= 0x01;
+        if (def_levels[base + 1] == max_def_level) present_bits |= 0x02;
+        if (def_levels[base + 2] == max_def_level) present_bits |= 0x04;
+        if (def_levels[base + 3] == max_def_level) present_bits |= 0x08;
+        if (def_levels[base + 4] == max_def_level) present_bits |= 0x10;
+        if (def_levels[base + 5] == max_def_level) present_bits |= 0x20;
+        if (def_levels[base + 6] == max_def_level) present_bits |= 0x40;
+        if (def_levels[base + 7] == max_def_level) present_bits |= 0x80;
+        null_bitmap[b] = present_bits;
     }
     for (int64_t j = full_bytes * 8; j < count; j++) {
-        if (def_levels[j] < max_def_level) {
+        if (def_levels[j] == max_def_level) {
             null_bitmap[j / 8] |= (1 << (j % 8));
         }
     }

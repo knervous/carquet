@@ -28,6 +28,20 @@ extern carquet_status_t carquet_read_next_page(
  * ============================================================================
  */
 
+static int64_t count_present_levels(
+    const int16_t* def_levels,
+    int64_t count,
+    int16_t max_def_level) {
+
+    int64_t present = 0;
+    for (int64_t i = 0; i < count; i++) {
+        if (def_levels[i] == max_def_level) {
+            present++;
+        }
+    }
+    return present;
+}
+
 int64_t carquet_column_read_batch(
     carquet_column_reader_t* reader,
     void* values,
@@ -55,7 +69,9 @@ int64_t carquet_column_read_batch(
 
     carquet_error_t error = CARQUET_ERROR_INIT;
     int64_t total_read = 0;
+    int64_t dense_values_read = 0;
     size_t value_size = 0;
+    int16_t* scratch_def_levels = NULL;
 
     /* Determine value size for pointer arithmetic */
     switch (reader->type) {
@@ -84,13 +100,23 @@ int64_t carquet_column_read_batch(
             return -1;
     }
 
+    if (reader->max_def_level > 0 && !def_levels) {
+        scratch_def_levels = malloc((size_t)max_values * sizeof(*scratch_def_levels));
+        if (!scratch_def_levels) {
+            return -1;
+        }
+    }
+
     /* Read pages until we have enough values or run out */
     while (total_read < max_values && reader->values_remaining > 0) {
         int64_t values_read = 0;
         int64_t to_read = max_values - total_read;
+        bool nullable = reader->max_def_level > 0;
 
-        uint8_t* value_ptr = (uint8_t*)values + total_read * value_size;
-        int16_t* def_ptr = def_levels ? def_levels + total_read : NULL;
+        uint8_t* value_ptr = (uint8_t*)values +
+            (size_t)(nullable ? dense_values_read : total_read) * value_size;
+        int16_t* def_ptr = def_levels ? def_levels + total_read :
+            (scratch_def_levels ? scratch_def_levels + total_read : NULL);
         int16_t* rep_ptr = rep_levels ? rep_levels + total_read : NULL;
 
         carquet_status_t status = carquet_read_next_page(
@@ -101,6 +127,7 @@ int64_t carquet_column_read_batch(
                 /* Return what we have so far */
                 break;
             }
+            free(scratch_def_levels);
             return -1;
         }
 
@@ -108,9 +135,16 @@ int64_t carquet_column_read_batch(
             break;
         }
 
+        if (nullable && def_ptr) {
+            dense_values_read += count_present_levels(
+                def_ptr, values_read, reader->max_def_level);
+        } else {
+            dense_values_read += values_read;
+        }
         total_read += values_read;
     }
 
+    free(scratch_def_levels);
     return total_read;
 }
 

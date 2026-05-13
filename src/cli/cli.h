@@ -31,6 +31,20 @@ int cmd_stat(const char* path);
 int cmd_validate(const char* path);
 int cmd_sample(const char* path, int64_t n);
 
+/* Options for `cat` and `export` (subset selection + slicing). */
+typedef struct row_select_opts {
+    int64_t     offset;    /* rows to skip from the start */
+    int64_t     limit;     /* -1 = all remaining */
+    const char* columns;   /* comma-separated names; NULL = all columns */
+} row_select_opts_t;
+
+typedef enum export_format {
+    CLI_EXPORT_CSV = 0,
+} export_format_t;
+
+int cmd_cat(const char* path, const row_select_opts_t* opts);
+int cmd_export(const char* path, const row_select_opts_t* opts, export_format_t fmt);
+
 /* ── Codegen ──────────────────────────────────────────────────────────── */
 
 typedef struct codegen_opts {

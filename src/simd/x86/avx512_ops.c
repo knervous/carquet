@@ -1099,7 +1099,7 @@ void carquet_avx512_build_null_bitmap(const int16_t* def_levels, int64_t count,
 
     for (; i + 32 <= count; i += 32, byte_index += 4) {
         __m512i levels = _mm512_loadu_si512((const void*)(def_levels + i));
-        __mmask32 mask = _mm512_cmp_epi16_mask(levels, max_vec, _MM_CMPINT_LT);
+        __mmask32 mask = _mm512_cmp_epi16_mask(levels, max_vec, _MM_CMPINT_EQ);
         uint32_t bits = (uint32_t)mask;
         memcpy(null_bitmap + byte_index, &bits, sizeof(bits));
     }
@@ -1107,7 +1107,7 @@ void carquet_avx512_build_null_bitmap(const int16_t* def_levels, int64_t count,
     for (; i < count; byte_index++) {
         uint8_t bits = 0;
         for (int j = 0; j < 8 && i < count; j++, i++) {
-            if (def_levels[i] < max_def_level) {
+            if (def_levels[i] == max_def_level) {
                 bits |= (uint8_t)(1u << j);
             }
         }

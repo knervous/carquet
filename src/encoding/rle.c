@@ -639,15 +639,15 @@ int64_t carquet_rle_decode_to_bitmap(
                 to_fill = max_values - count;
             }
 
-            if (rle_value == 0) {
-                /* Null: set bits in bitmap (convention: bit set = null) */
+            if (rle_value == 1) {
+                /* Present: set bits in bitmap (convention: bit set = present) */
                 for (int64_t i = 0; i < to_fill; i++) {
                     int64_t idx = count + i;
                     bitmap[idx / 8] |= (uint8_t)(1 << (idx % 8));
                 }
-            } else {
-                /* Non-null: bits stay clear (already memset to 0) */
                 nn_count += to_fill;
+            } else {
+                /* Null: bits stay clear (already memset to 0) */
             }
 
             count += to_fill;
@@ -670,10 +670,9 @@ int64_t carquet_rle_decode_to_bitmap(
 
                 for (int64_t i = 0; i < to_store; i++) {
                     uint8_t bit = (packed_byte >> i) & 1;
-                    if (bit == 0) {
-                        /* Null: set bit (convention: bit set = null) */
+                    if (bit == 1) {
+                        /* Present: set bit (convention: bit set = present) */
                         bitmap[(count + i) / 8] |= (uint8_t)(1 << ((count + i) % 8));
-                    } else {
                         nn_count++;
                     }
                 }

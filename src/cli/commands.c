@@ -12,6 +12,16 @@
 #include <inttypes.h>
 #include <time.h>
 
+/* Shared layout constants (defined early so commands above the table
+ * helpers below can reference them). */
+#define MAX_COL_WIDTH 40
+#define MAX_VALUE_BUF 256
+
+/* Forward declaration: implementation lives further down with the other
+ * tabular-output helpers. */
+static void print_dyn_table(const char* const* headers, int32_t num_cols,
+                             const char* const* cells, int64_t num_rows);
+
 /* ══════════════════════════════════════════════════════════════════════════
  * Helpers
  * ══════════════════════════════════════════════════════════════════════════ */
@@ -434,14 +444,18 @@ int cmd_stat(const char* path) {
     int32_t num_cols = carquet_reader_num_columns(reader);
     int32_t num_rgs = carquet_reader_num_row_groups(reader);
 
+    static const char* const HEADERS[] = {"Column", "Type", "Nulls", "Min", "Max"};
+    const int32_t NCOLS = 5;
+
+    char** cells = calloc((size_t)num_cols * NCOLS, sizeof(char*));
+    if (!cells) {
+        carquet_reader_close(reader);
+        return 1;
+    }
+
     for (int32_t rg = 0; rg < num_rgs; rg++) {
         if (num_rgs > 1)
             printf("Row group %d:\n", rg);
-
-        printf("  %-30s %-20s %-15s %-20s %-20s\n",
-               "Column", "Type", "Nulls", "Min", "Max");
-        printf("  %-30s %-20s %-15s %-20s %-20s\n",
-               "---", "---", "---", "---", "---");
 
         for (int32_t c = 0; c < num_cols; c++) {
             carquet_column_statistics_t stats;
@@ -455,27 +469,56 @@ int cmd_stat(const char* path) {
             cli_format_type(phys, lt, type_buf, sizeof(type_buf));
 
             char nulls[32] = "-";
-            char min_buf[64] = "-";
-            char max_buf[64] = "-";
+            char min_buf[MAX_VALUE_BUF] = "-";
+            char max_buf[MAX_VALUE_BUF] = "-";
 
             if (carquet_reader_column_statistics(reader, rg, c, &stats) == CARQUET_OK) {
                 if (stats.has_null_count)
                     snprintf(nulls, sizeof(nulls), "%" PRId64, stats.null_count);
                 if (stats.has_min_max) {
-                    cli_format_value(phys, stats.min_value, tl, lt,
-                                   min_buf, sizeof(min_buf));
-                    cli_format_value(phys, stats.max_value, tl, lt,
-                                   max_buf, sizeof(max_buf));
+                    /* stats.min_value / max_value are raw bytes for BYTE_ARRAY.
+                     * cli_format_value expects a carquet_byte_array_t* for that
+                     * physical type, so wrap the raw bytes here. */
+                    if (phys == CARQUET_PHYSICAL_BYTE_ARRAY) {
+                        carquet_byte_array_t min_ba = {
+                            .data = (uint8_t*)(uintptr_t)stats.min_value,
+                            .length = stats.min_value_size
+                        };
+                        carquet_byte_array_t max_ba = {
+                            .data = (uint8_t*)(uintptr_t)stats.max_value,
+                            .length = stats.max_value_size
+                        };
+                        cli_format_value(phys, &min_ba, tl, lt,
+                                         min_buf, sizeof(min_buf));
+                        cli_format_value(phys, &max_ba, tl, lt,
+                                         max_buf, sizeof(max_buf));
+                    } else {
+                        cli_format_value(phys, stats.min_value, tl, lt,
+                                         min_buf, sizeof(min_buf));
+                        cli_format_value(phys, stats.max_value, tl, lt,
+                                         max_buf, sizeof(max_buf));
+                    }
                 }
             }
 
-            printf("  %-30s %-20s %-15s %-20s %-20s\n",
-                   carquet_schema_column_name(schema, c),
-                   type_buf, nulls, min_buf, max_buf);
+            cells[c * NCOLS + 0] = carquet_heap_strdup(carquet_schema_column_name(schema, c));
+            cells[c * NCOLS + 1] = carquet_heap_strdup(type_buf);
+            cells[c * NCOLS + 2] = carquet_heap_strdup(nulls);
+            cells[c * NCOLS + 3] = carquet_heap_strdup(min_buf);
+            cells[c * NCOLS + 4] = carquet_heap_strdup(max_buf);
+        }
+
+        print_dyn_table(HEADERS, NCOLS, (const char* const*)cells, num_cols);
+
+        /* Free this row group's cells before reusing the buffer. */
+        for (int32_t i = 0; i < num_cols * NCOLS; i++) {
+            free(cells[i]);
+            cells[i] = NULL;
         }
         if (rg < num_rgs - 1) printf("\n");
     }
 
+    free(cells);
     carquet_reader_close(reader);
     return 0;
 }
@@ -550,9 +593,6 @@ int cmd_validate(const char* path) {
 /* ══════════════════════════════════════════════════════════════════════════
  * Table display helpers for head/tail/sample
  * ══════════════════════════════════════════════════════════════════════════ */
-
-#define MAX_COL_WIDTH 40
-#define MAX_VALUE_BUF 256
 
 typedef struct {
     char** cells;       /* [row * num_cols + col] */
@@ -932,6 +972,376 @@ int cmd_sample(const char* path, int64_t n) {
     table_print(&tbl);
     table_free(&tbl);
     free(indices);
+    carquet_reader_close(reader);
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Dynamic-width tabular printer
+ *
+ * Generic header + cells output that auto-sizes each column to the widest
+ * value (capped at MAX_COL_WIDTH). Used by `cat` and `stat` so both commands
+ * produce the same clean two-space-separated layout regardless of content
+ * width. `cells` is a flat array indexed as cells[row * num_cols + col];
+ * a NULL entry prints empty.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+static void print_dyn_table(const char* const* headers, int32_t num_cols,
+                             const char* const* cells, int64_t num_rows) {
+    if (num_cols <= 0) return;
+
+    int* widths = calloc((size_t)num_cols, sizeof(int));
+    if (!widths) return;
+
+    for (int32_t c = 0; c < num_cols; c++) {
+        int len = (int)strlen(headers[c]);
+        widths[c] = len < MAX_COL_WIDTH ? len : MAX_COL_WIDTH;
+    }
+    for (int64_t r = 0; r < num_rows; r++) {
+        for (int32_t c = 0; c < num_cols; c++) {
+            const char* v = cells[r * num_cols + c];
+            if (!v) continue;
+            int len = (int)strlen(v);
+            if (len > MAX_COL_WIDTH) len = MAX_COL_WIDTH;
+            if (len > widths[c]) widths[c] = len;
+        }
+    }
+
+    printf("  ");
+    for (int32_t c = 0; c < num_cols; c++) {
+        if (c > 0) printf("  ");
+        printf("%-*.*s", widths[c], widths[c], headers[c]);
+    }
+    printf("\n  ");
+    for (int32_t c = 0; c < num_cols; c++) {
+        if (c > 0) printf("  ");
+        for (int w = 0; w < widths[c]; w++) putchar('-');
+    }
+    printf("\n");
+
+    for (int64_t r = 0; r < num_rows; r++) {
+        printf("  ");
+        for (int32_t c = 0; c < num_cols; c++) {
+            const char* v = cells[r * num_cols + c];
+            if (!v) v = "";
+            if (c > 0) printf("  ");
+            printf("%-*.*s", widths[c], widths[c], v);
+        }
+        printf("\n");
+    }
+    free(widths);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Shared row-extraction for cmd_cat and cmd_export
+ *
+ * Both commands need to read N rows starting at an offset, optionally
+ * restricted to a column subset, and turn each value into a string. The
+ * heavy lifting (per-column read + skip across row groups) lives here.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Match `name` against the comma-separated list in `filter`. NULL filter
+ * matches everything. Leading/trailing whitespace per token is tolerated. */
+static bool name_in_filter(const char* name, const char* filter) {
+    if (!filter) return true;
+    const char* p = filter;
+    size_t name_len = strlen(name);
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        const char* comma = strchr(p, ',');
+        size_t tok_len = comma ? (size_t)(comma - p) : strlen(p);
+        while (tok_len > 0 && (p[tok_len - 1] == ' ' || p[tok_len - 1] == '\t'))
+            tok_len--;
+        if (tok_len == name_len && strncmp(p, name, tok_len) == 0)
+            return true;
+        p = comma ? comma + 1 : p + strlen(p);
+    }
+    return false;
+}
+
+/* Resolve the column filter into a list of column indices. Returns the
+ * number of selected columns, or -1 if a name didn't match the schema.
+ * On success, *out is a malloc'd array the caller must free. */
+static int32_t resolve_columns(const carquet_schema_t* schema,
+                                int32_t num_cols, const char* filter,
+                                int32_t** out) {
+    int32_t* sel = malloc((size_t)num_cols * sizeof(int32_t));
+    if (!sel) return -1;
+    int32_t n = 0;
+    for (int32_t c = 0; c < num_cols; c++) {
+        const char* nm = carquet_schema_column_name(schema, c);
+        if (name_in_filter(nm, filter)) {
+            sel[n++] = c;
+        }
+    }
+    if (filter && n == 0) {
+        free(sel);
+        return -1;
+    }
+    *out = sel;
+    return n;
+}
+
+/* String matrix used to hold formatted values before display/export. */
+typedef struct {
+    char** cells;     /* [num_rows * num_cols], heap-strdup'd; may be NULL */
+    int64_t num_rows;
+    int32_t num_cols;
+} str_matrix_t;
+
+static void matrix_free(str_matrix_t* m) {
+    if (m->cells) {
+        int64_t total = m->num_rows * m->num_cols;
+        for (int64_t i = 0; i < total; i++) free(m->cells[i]);
+        free(m->cells);
+    }
+}
+
+/* Read the requested column at `col_index`, skipping `offset` rows and
+ * filling at most `limit` formatted strings into `matrix` at column slot
+ * `dst_col`. Returns the number of rows actually filled. */
+static int64_t read_column_strings(carquet_reader_t* reader,
+                                    const carquet_schema_t* schema,
+                                    int32_t col_index,
+                                    int64_t offset, int64_t limit,
+                                    str_matrix_t* matrix, int32_t dst_col) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_physical_type_t phys = carquet_schema_column_type(schema, col_index);
+    const carquet_schema_node_t* node = carquet_schema_get_element(schema,
+        schema->leaf_indices[col_index]);
+    const carquet_logical_type_t* lt = carquet_schema_node_logical_type(node);
+    int32_t tl = carquet_schema_node_type_length(node);
+    bool nullable = carquet_schema_node_repetition(node) != CARQUET_REPETITION_REQUIRED;
+    int16_t max_def = carquet_schema_node_max_def_level(node);
+
+    int32_t num_rgs = carquet_reader_num_row_groups(reader);
+    int64_t rows_seen = 0;
+    int64_t rows_output = 0;
+
+    for (int32_t rg = 0; rg < num_rgs && rows_output < limit; rg++) {
+        carquet_row_group_metadata_t rgm;
+        (void)carquet_reader_row_group_metadata(reader, rg, &rgm);
+
+        if (rows_seen + rgm.num_rows <= offset) {
+            rows_seen += rgm.num_rows;
+            continue;
+        }
+
+        carquet_column_reader_t* col = carquet_reader_get_column(reader, rg,
+            col_index, &err);
+        if (!col) { rows_seen += rgm.num_rows; continue; }
+
+        int64_t skip_in_rg = offset - rows_seen;
+        if (skip_in_rg < 0) skip_in_rg = 0;
+        if (skip_in_rg > 0) carquet_column_skip(col, skip_in_rg);
+
+        int64_t want = limit - rows_output;
+        int64_t rg_remaining = rgm.num_rows - skip_in_rg;
+        if (want > rg_remaining) want = rg_remaining;
+
+        int32_t elem_size = carquet_physical_type_size(phys);
+        void* buf;
+        int16_t* def = NULL;
+        if (phys == CARQUET_PHYSICAL_BYTE_ARRAY)
+            buf = calloc((size_t)want, sizeof(carquet_byte_array_t));
+        else if (phys == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY)
+            buf = calloc((size_t)want, (size_t)tl);
+        else
+            buf = calloc((size_t)want, (size_t)elem_size);
+        if (nullable) def = calloc((size_t)want, sizeof(int16_t));
+
+        int64_t got = carquet_column_read_batch(col, buf, want, def, NULL);
+
+        for (int64_t i = 0; i < got && rows_output < limit; i++) {
+            char vbuf[MAX_VALUE_BUF];
+            const char* cell;
+            if (nullable && def && def[i] < max_def) {
+                cell = "";
+            } else {
+                const void* vp;
+                if (phys == CARQUET_PHYSICAL_BYTE_ARRAY)
+                    vp = &((carquet_byte_array_t*)buf)[i];
+                else if (phys == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY)
+                    vp = (uint8_t*)buf + i * tl;
+                else
+                    vp = (uint8_t*)buf + i * elem_size;
+                cli_format_value(phys, vp, tl, lt, vbuf, sizeof(vbuf));
+                cell = vbuf;
+            }
+            matrix->cells[rows_output * matrix->num_cols + dst_col] =
+                carquet_heap_strdup(cell);
+            rows_output++;
+        }
+
+        rows_seen += rgm.num_rows;
+        free(buf);
+        free(def);
+        carquet_column_reader_free(col);
+    }
+
+    return rows_output;
+}
+
+static int read_rows(carquet_reader_t* reader,
+                     const carquet_schema_t* schema,
+                     const int32_t* col_indices, int32_t num_sel_cols,
+                     int64_t offset, int64_t limit,
+                     str_matrix_t* out) {
+    out->num_cols = num_sel_cols;
+    out->num_rows = limit;
+    out->cells = calloc((size_t)(limit * num_sel_cols), sizeof(char*));
+    if (!out->cells) return -1;
+
+    int64_t produced = 0;
+    for (int32_t i = 0; i < num_sel_cols; i++) {
+        int64_t n = read_column_strings(reader, schema, col_indices[i],
+                                         offset, limit, out, i);
+        if (n > produced) produced = n;
+    }
+    out->num_rows = produced;
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * cmd_cat — print rows with optional slicing and column filter
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+int cmd_cat(const char* path, const row_select_opts_t* opts) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_reader_t* reader = open_or_die(path, &err);
+    if (!reader) return 1;
+
+    const carquet_schema_t* schema = carquet_reader_schema(reader);
+    int32_t num_cols = carquet_reader_num_columns(reader);
+    int64_t total = carquet_reader_num_rows(reader);
+
+    int64_t offset = opts->offset < 0 ? 0 : opts->offset;
+    if (offset > total) offset = total;
+    int64_t limit = opts->limit < 0 ? (total - offset) : opts->limit;
+    if (limit > total - offset) limit = total - offset;
+
+    int32_t* sel = NULL;
+    int32_t num_sel = resolve_columns(schema, num_cols, opts->columns, &sel);
+    if (num_sel < 0) {
+        fprintf(stderr, "error: no columns matched filter '%s'\n",
+                opts->columns ? opts->columns : "");
+        free(sel);
+        carquet_reader_close(reader);
+        return 1;
+    }
+    if (limit <= 0 || num_sel == 0) {
+        free(sel);
+        carquet_reader_close(reader);
+        return 0;
+    }
+
+    str_matrix_t mat = {0};
+    if (read_rows(reader, schema, sel, num_sel, offset, limit, &mat) != 0) {
+        free(sel);
+        carquet_reader_close(reader);
+        return 1;
+    }
+
+    const char** headers = malloc((size_t)num_sel * sizeof(const char*));
+    for (int32_t c = 0; c < num_sel; c++) {
+        headers[c] = carquet_schema_column_name(schema, sel[c]);
+    }
+    print_dyn_table(headers, num_sel, (const char* const*)mat.cells, mat.num_rows);
+    free(headers);
+
+    matrix_free(&mat);
+    free(sel);
+    carquet_reader_close(reader);
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * cmd_export --format csv — write rows to stdout as CSV
+ *
+ * RFC 4180 quoting: fields containing comma, quote, CR, or LF are wrapped
+ * in double quotes; embedded quotes are doubled. Header row first.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+static void emit_csv_field(const char* v) {
+    if (!v) v = "";
+    bool needs_quote = false;
+    for (const char* p = v; *p; p++) {
+        if (*p == ',' || *p == '"' || *p == '\n' || *p == '\r') {
+            needs_quote = true;
+            break;
+        }
+    }
+    if (!needs_quote) {
+        fputs(v, stdout);
+        return;
+    }
+    fputc('"', stdout);
+    for (const char* p = v; *p; p++) {
+        if (*p == '"') fputc('"', stdout);
+        fputc(*p, stdout);
+    }
+    fputc('"', stdout);
+}
+
+int cmd_export(const char* path, const row_select_opts_t* opts, export_format_t fmt) {
+    if (fmt != CLI_EXPORT_CSV) {
+        fprintf(stderr, "error: unsupported export format\n");
+        return 1;
+    }
+
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_reader_t* reader = open_or_die(path, &err);
+    if (!reader) return 1;
+
+    const carquet_schema_t* schema = carquet_reader_schema(reader);
+    int32_t num_cols = carquet_reader_num_columns(reader);
+    int64_t total = carquet_reader_num_rows(reader);
+
+    int64_t offset = opts->offset < 0 ? 0 : opts->offset;
+    if (offset > total) offset = total;
+    int64_t limit = opts->limit < 0 ? (total - offset) : opts->limit;
+    if (limit > total - offset) limit = total - offset;
+
+    int32_t* sel = NULL;
+    int32_t num_sel = resolve_columns(schema, num_cols, opts->columns, &sel);
+    if (num_sel < 0) {
+        fprintf(stderr, "error: no columns matched filter '%s'\n",
+                opts->columns ? opts->columns : "");
+        free(sel);
+        carquet_reader_close(reader);
+        return 1;
+    }
+
+    /* Header row (always emitted, even when limit==0). */
+    for (int32_t c = 0; c < num_sel; c++) {
+        if (c > 0) fputc(',', stdout);
+        emit_csv_field(carquet_schema_column_name(schema, sel[c]));
+    }
+    fputc('\n', stdout);
+
+    if (limit <= 0 || num_sel == 0) {
+        free(sel);
+        carquet_reader_close(reader);
+        return 0;
+    }
+
+    str_matrix_t mat = {0};
+    if (read_rows(reader, schema, sel, num_sel, offset, limit, &mat) != 0) {
+        free(sel);
+        carquet_reader_close(reader);
+        return 1;
+    }
+
+    for (int64_t r = 0; r < mat.num_rows; r++) {
+        for (int32_t c = 0; c < num_sel; c++) {
+            if (c > 0) fputc(',', stdout);
+            emit_csv_field(mat.cells[r * num_sel + c]);
+        }
+        fputc('\n', stdout);
+    }
+
+    matrix_free(&mat);
+    free(sel);
     carquet_reader_close(reader);
     return 0;
 }
