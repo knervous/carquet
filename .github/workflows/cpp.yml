@@ -23,6 +23,7 @@ jobs:
        run: git config --system core.longpaths true
        if: matrix.os == 'windows-latest'
      - uses: mamba-org/setup-micromamba@v2
+       if: matrix.os != 'windows-latest'
        with:
            init-shell: bash
            environment-file: ci/environment.yml
@@ -46,12 +47,13 @@ jobs:
         export CC=cl.exe
         export CXX=cl.exe
         fi
+        INSTALL_PREFIX="${CONDA_PREFIX:-$PWD/install}"
 
         cmake   -G "Ninja"  \
               -DCMAKE_BUILD_TYPE=RelWithDebInfo \
               -DCARQUET_BUILD_SHARED=$BUILD_SHARED_LIBS \
               -DCARQUET_BUILD_TESTS=ON \
-              -DCMAKE_INSTALL_PREFIX=${CONDA_PREFIX} \
+              -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
               ..
 
 
@@ -99,6 +101,5 @@ jobs:
      - name: Test
        run: |
           ctest --test-dir build -VV --rerun-failed --output-on-failure
-
 
 
