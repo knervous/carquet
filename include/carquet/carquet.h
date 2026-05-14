@@ -1,7 +1,7 @@
 /**
  * @file carquet.h
  * @brief Carquet - High-Performance Pure C Parquet Library
- * @version 0.4.2
+ * @version 0.4.3
  *
  * @copyright Copyright (c) 2025. All rights reserved.
  * @license MIT License
@@ -199,10 +199,10 @@ extern "C" {
 #define CARQUET_VERSION_MINOR 4
 
 /** @brief Patch version number */
-#define CARQUET_VERSION_PATCH 2
+#define CARQUET_VERSION_PATCH 3
 
 /** @brief Version string in "MAJOR.MINOR.PATCH" format */
-#define CARQUET_VERSION_STRING "0.4.2"
+#define CARQUET_VERSION_STRING "0.4.3"
 
 /** @brief Numeric version for compile-time comparisons: (MAJOR * 10000 + MINOR * 100 + PATCH) */
 #define CARQUET_VERSION_NUMBER (CARQUET_VERSION_MAJOR * 10000 + CARQUET_VERSION_MINOR * 100 + CARQUET_VERSION_PATCH)

@@ -248,6 +248,88 @@ static void parse_logical_type(thrift_decoder_t* dec, carquet_logical_type_t* lt
     thrift_read_struct_end(dec);
 }
 
+static bool logical_type_from_converted_type(
+    carquet_converted_type_t converted_type,
+    int32_t scale,
+    int32_t precision,
+    carquet_logical_type_t* lt) {
+
+    memset(lt, 0, sizeof(*lt));
+
+    switch (converted_type) {
+        case CARQUET_CONVERTED_UTF8:
+            lt->id = CARQUET_LOGICAL_STRING;
+            return true;
+        case CARQUET_CONVERTED_MAP:
+            lt->id = CARQUET_LOGICAL_MAP;
+            return true;
+        case CARQUET_CONVERTED_LIST:
+            lt->id = CARQUET_LOGICAL_LIST;
+            return true;
+        case CARQUET_CONVERTED_ENUM:
+            lt->id = CARQUET_LOGICAL_ENUM;
+            return true;
+        case CARQUET_CONVERTED_DECIMAL:
+            lt->id = CARQUET_LOGICAL_DECIMAL;
+            lt->params.decimal.scale = scale;
+            lt->params.decimal.precision = precision;
+            return true;
+        case CARQUET_CONVERTED_DATE:
+            lt->id = CARQUET_LOGICAL_DATE;
+            return true;
+        case CARQUET_CONVERTED_TIME_MILLIS:
+            lt->id = CARQUET_LOGICAL_TIME;
+            lt->params.time.is_adjusted_to_utc = true;
+            lt->params.time.unit = CARQUET_TIME_UNIT_MILLIS;
+            return true;
+        case CARQUET_CONVERTED_TIME_MICROS:
+            lt->id = CARQUET_LOGICAL_TIME;
+            lt->params.time.is_adjusted_to_utc = true;
+            lt->params.time.unit = CARQUET_TIME_UNIT_MICROS;
+            return true;
+        case CARQUET_CONVERTED_TIMESTAMP_MILLIS:
+            lt->id = CARQUET_LOGICAL_TIMESTAMP;
+            lt->params.timestamp.is_adjusted_to_utc = true;
+            lt->params.timestamp.unit = CARQUET_TIME_UNIT_MILLIS;
+            return true;
+        case CARQUET_CONVERTED_TIMESTAMP_MICROS:
+            lt->id = CARQUET_LOGICAL_TIMESTAMP;
+            lt->params.timestamp.is_adjusted_to_utc = true;
+            lt->params.timestamp.unit = CARQUET_TIME_UNIT_MICROS;
+            return true;
+        case CARQUET_CONVERTED_UINT_8:
+        case CARQUET_CONVERTED_UINT_16:
+        case CARQUET_CONVERTED_UINT_32:
+        case CARQUET_CONVERTED_UINT_64:
+            lt->id = CARQUET_LOGICAL_INTEGER;
+            lt->params.integer.is_signed = false;
+            lt->params.integer.bit_width =
+                (converted_type == CARQUET_CONVERTED_UINT_8) ? 8 :
+                (converted_type == CARQUET_CONVERTED_UINT_16) ? 16 :
+                (converted_type == CARQUET_CONVERTED_UINT_32) ? 32 : 64;
+            return true;
+        case CARQUET_CONVERTED_INT_8:
+        case CARQUET_CONVERTED_INT_16:
+        case CARQUET_CONVERTED_INT_32:
+        case CARQUET_CONVERTED_INT_64:
+            lt->id = CARQUET_LOGICAL_INTEGER;
+            lt->params.integer.is_signed = true;
+            lt->params.integer.bit_width =
+                (converted_type == CARQUET_CONVERTED_INT_8) ? 8 :
+                (converted_type == CARQUET_CONVERTED_INT_16) ? 16 :
+                (converted_type == CARQUET_CONVERTED_INT_32) ? 32 : 64;
+            return true;
+        case CARQUET_CONVERTED_JSON:
+            lt->id = CARQUET_LOGICAL_JSON;
+            return true;
+        case CARQUET_CONVERTED_BSON:
+            lt->id = CARQUET_LOGICAL_BSON;
+            return true;
+        default:
+            return false;
+    }
+}
+
 /* ============================================================================
  * Schema Element Parsing
  * ============================================================================
@@ -305,6 +387,11 @@ static void parse_schema_element(thrift_decoder_t* dec, carquet_arena_t* arena,
     }
 
     thrift_read_struct_end(dec);
+
+    if (!elem->has_logical_type && elem->has_converted_type) {
+        elem->has_logical_type = logical_type_from_converted_type(
+            elem->converted_type, elem->scale, elem->precision, &elem->logical_type);
+    }
 }
 
 /* ============================================================================
@@ -1020,10 +1107,105 @@ static void write_logical_type(thrift_encoder_t* enc, const carquet_logical_type
     thrift_write_struct_end(enc);
 }
 
+static bool converted_type_from_logical_type(
+    const carquet_logical_type_t* lt,
+    carquet_converted_type_t* converted_type) {
+
+    switch (lt->id) {
+        case CARQUET_LOGICAL_STRING:
+            *converted_type = CARQUET_CONVERTED_UTF8;
+            return true;
+        case CARQUET_LOGICAL_MAP:
+            *converted_type = CARQUET_CONVERTED_MAP;
+            return true;
+        case CARQUET_LOGICAL_LIST:
+            *converted_type = CARQUET_CONVERTED_LIST;
+            return true;
+        case CARQUET_LOGICAL_ENUM:
+            *converted_type = CARQUET_CONVERTED_ENUM;
+            return true;
+        case CARQUET_LOGICAL_DECIMAL:
+            *converted_type = CARQUET_CONVERTED_DECIMAL;
+            return true;
+        case CARQUET_LOGICAL_DATE:
+            *converted_type = CARQUET_CONVERTED_DATE;
+            return true;
+        case CARQUET_LOGICAL_TIME:
+            if (lt->params.time.unit == CARQUET_TIME_UNIT_MILLIS) {
+                *converted_type = CARQUET_CONVERTED_TIME_MILLIS;
+                return true;
+            }
+            if (lt->params.time.unit == CARQUET_TIME_UNIT_MICROS) {
+                *converted_type = CARQUET_CONVERTED_TIME_MICROS;
+                return true;
+            }
+            return false;
+        case CARQUET_LOGICAL_TIMESTAMP:
+            if (lt->params.timestamp.unit == CARQUET_TIME_UNIT_MILLIS) {
+                *converted_type = CARQUET_CONVERTED_TIMESTAMP_MILLIS;
+                return true;
+            }
+            if (lt->params.timestamp.unit == CARQUET_TIME_UNIT_MICROS) {
+                *converted_type = CARQUET_CONVERTED_TIMESTAMP_MICROS;
+                return true;
+            }
+            return false;
+        case CARQUET_LOGICAL_INTEGER:
+            if (lt->params.integer.is_signed) {
+                switch (lt->params.integer.bit_width) {
+                    case 8:  *converted_type = CARQUET_CONVERTED_INT_8; return true;
+                    case 16: *converted_type = CARQUET_CONVERTED_INT_16; return true;
+                    case 32: *converted_type = CARQUET_CONVERTED_INT_32; return true;
+                    case 64: *converted_type = CARQUET_CONVERTED_INT_64; return true;
+                    default: return false;
+                }
+            }
+            switch (lt->params.integer.bit_width) {
+                case 8:  *converted_type = CARQUET_CONVERTED_UINT_8; return true;
+                case 16: *converted_type = CARQUET_CONVERTED_UINT_16; return true;
+                case 32: *converted_type = CARQUET_CONVERTED_UINT_32; return true;
+                case 64: *converted_type = CARQUET_CONVERTED_UINT_64; return true;
+                default: return false;
+            }
+        case CARQUET_LOGICAL_JSON:
+            *converted_type = CARQUET_CONVERTED_JSON;
+            return true;
+        case CARQUET_LOGICAL_BSON:
+            *converted_type = CARQUET_CONVERTED_BSON;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static parquet_schema_element_t schema_element_with_logical_compat(
+    const parquet_schema_element_t* elem) {
+
+    parquet_schema_element_t normalized = *elem;
+
+    if (normalized.has_logical_type) {
+        carquet_converted_type_t converted_type;
+        if (converted_type_from_logical_type(&normalized.logical_type, &converted_type)) {
+            normalized.has_converted_type = true;
+            normalized.converted_type = converted_type;
+        }
+
+        if (normalized.logical_type.id == CARQUET_LOGICAL_DECIMAL) {
+            normalized.scale = normalized.logical_type.params.decimal.scale;
+            normalized.precision = normalized.logical_type.params.decimal.precision;
+        }
+    }
+
+    return normalized;
+}
+
 /**
  * Write schema element to Thrift buffer.
  */
 static void write_schema_element(thrift_encoder_t* enc, const parquet_schema_element_t* elem) {
+    parquet_schema_element_t normalized = schema_element_with_logical_compat(elem);
+    elem = &normalized;
+
     thrift_write_struct_begin(enc);
 
     /* Field 1: type (optional for groups) */

@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.3
+
+### Bug Fixes
+
+- **Restored Parquet logical type backward compatibility**: Writer metadata now includes the legacy `ConvertedType` annotations required by older readers when a matching modern `LogicalType` is present, including string, date/time, timestamp, decimal, integer, JSON/BSON, enum, list, and map annotations. Decimal scale/precision are also mirrored into the legacy schema fields, and old files that only contain `ConvertedType` are normalized to carquet logical types when read.
+
+### API
+
+- No public API changes.
+
 ## v0.4.2
 
 ### Bug Fixes

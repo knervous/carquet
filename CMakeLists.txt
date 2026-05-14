@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(carquet VERSION 0.4.2 LANGUAGES C)
+project(carquet VERSION 0.4.3 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -456,10 +456,36 @@ target_include_directories(carquet
 # Link external compression libraries
 set(CARQUET_COMPRESSION_LIBS ${ZSTD_LIBRARIES} ${LZ4_LIBRARIES})
 
+function(carquet_private_link_libraries_for_export out_var)
+    set(_result)
+    foreach(_lib IN LISTS ARGN)
+        if(TARGET ${_lib})
+            get_target_property(_imported ${_lib} IMPORTED)
+            if(NOT _imported)
+                list(APPEND _result "$<BUILD_INTERFACE:${_lib}>")
+            else()
+                list(APPEND _result ${_lib})
+            endif()
+        else()
+            list(APPEND _result ${_lib})
+        endif()
+    endforeach()
+    set(${out_var} ${_result} PARENT_SCOPE)
+endfunction()
+
+carquet_private_link_libraries_for_export(
+    CARQUET_PRIVATE_COMPRESSION_LIBS
+    ${CARQUET_COMPRESSION_LIBS})
+
 if(ZLIB_FOUND)
-    target_link_libraries(carquet PRIVATE ${CARQUET_COMPRESSION_LIBS} ZLIB::ZLIB)
+    target_link_libraries(carquet PRIVATE ${CARQUET_PRIVATE_COMPRESSION_LIBS} ZLIB::ZLIB)
 else()
-    target_link_libraries(carquet PRIVATE ${CARQUET_COMPRESSION_LIBS} ${ZLIB_LIBRARIES})
+    carquet_private_link_libraries_for_export(
+        CARQUET_PRIVATE_ZLIB_LIBS
+        ${ZLIB_LIBRARIES})
+    target_link_libraries(carquet PRIVATE
+        ${CARQUET_PRIVATE_COMPRESSION_LIBS}
+        ${CARQUET_PRIVATE_ZLIB_LIBS})
 endif()
 
 # Link libm for math functions (bloom_filter.c uses log())
@@ -732,6 +758,48 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
+
+    # When carquet is STATIC and we fetched compression deps via FetchContent,
+    # CMake propagates those deps to the install export's link interface
+    # (consumers must link them transitively). Add them to the same export set
+    # so the install(EXPORT) generation succeeds — this is required on Windows
+    # static builds where no system zlib/lz4/zstd is available.
+    if(NOT CARQUET_BUILD_SHARED)
+        set(_carquet_fetched_deps)
+        if(NOT ZSTD_FOUND AND TARGET libzstd_static)
+            list(APPEND _carquet_fetched_deps libzstd_static)
+        endif()
+        if(NOT ZLIB_FOUND AND TARGET zlibstatic)
+            list(APPEND _carquet_fetched_deps zlibstatic)
+        endif()
+        if(NOT LZ4_FOUND AND TARGET lz4_static)
+            list(APPEND _carquet_fetched_deps lz4_static)
+        endif()
+        if(_carquet_fetched_deps)
+            # Their INTERFACE_INCLUDE_DIRECTORIES point at build-tree paths
+            # which CMake refuses to install. Consumers of carquet only need
+            # to link these archives, not include their headers, so wrap any
+            # interface include dirs in $<BUILD_INTERFACE:> to suppress them
+            # from the installed export.
+            foreach(_dep IN LISTS _carquet_fetched_deps)
+                get_target_property(_inc ${_dep} INTERFACE_INCLUDE_DIRECTORIES)
+                if(_inc)
+                    set(_wrapped)
+                    foreach(_p IN LISTS _inc)
+                        list(APPEND _wrapped "$<BUILD_INTERFACE:${_p}>")
+                    endforeach()
+                    set_target_properties(${_dep} PROPERTIES
+                        INTERFACE_INCLUDE_DIRECTORIES "${_wrapped}")
+                endif()
+            endforeach()
+            install(TARGETS ${_carquet_fetched_deps}
+                EXPORT carquetTargets
+                ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+                LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+                RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+            )
+        endif()
+    endif()
 
     if(CARQUET_BUILD_CLI)
         install(TARGETS carquet_cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
