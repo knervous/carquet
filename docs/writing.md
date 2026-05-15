@@ -24,6 +24,33 @@ carquet_schema_add_column(schema, "score",
 
 For nested schemas, see [`nested-data.md`](./nested-data.md).
 
+### Newer Logical Types
+
+Modern logical annotations are passed through the same schema APIs as older types. `GEOMETRY` and `GEOGRAPHY` use `BYTE_ARRAY` storage, and `VARIANT` has a helper that creates the standard unshredded group layout:
+
+```c
+carquet_logical_type_t geometry_type = { .id = CARQUET_LOGICAL_GEOMETRY };
+carquet_logical_type_t geography_type = {
+    .id = CARQUET_LOGICAL_GEOGRAPHY,
+    .params.geography = {
+        .algorithm = CARQUET_GEOSPATIAL_EDGE_SPHERICAL,
+        .has_algorithm = true,
+    },
+};
+
+carquet_schema_add_column(schema, "shape",
+    CARQUET_PHYSICAL_BYTE_ARRAY, &geometry_type,
+    CARQUET_REPETITION_OPTIONAL, 0, 0);
+carquet_schema_add_column(schema, "region",
+    CARQUET_PHYSICAL_BYTE_ARRAY, &geography_type,
+    CARQUET_REPETITION_OPTIONAL, 0, 0);
+
+int32_t payload_group = carquet_schema_add_variant(
+    schema, "payload", CARQUET_REPETITION_OPTIONAL, 0);
+```
+
+When a modern logical type has a legacy equivalent, the writer also emits the corresponding `ConvertedType` compatibility annotation automatically. Footer `column_orders` metadata is emitted automatically for written leaf columns.
+
 ## Create the Writer
 
 ```c

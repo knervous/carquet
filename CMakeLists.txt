@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(carquet VERSION 0.4.3 LANGUAGES C)
+project(carquet VERSION 0.4.4 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -388,11 +388,6 @@ if(CARQUET_ARCH_ARM)
 
     if(CARQUET_ENABLE_NEON)
         list(APPEND CARQUET_SIMD_ARM_SOURCES src/simd/arm/neon_ops.c)
-        list(APPEND CARQUET_SIMD_ARM_SOURCES src/simd/arm/crc32_arm.c)
-        if(CARQUET_COMPILER_GCC_LIKE)
-            set_source_files_properties(src/simd/arm/crc32_arm.c PROPERTIES
-                COMPILE_FLAGS "-march=armv8-a+crc")
-        endif()
     endif()
 
     if(CARQUET_ENABLE_SVE)

@@ -7,7 +7,6 @@
  * - Byte stream split/merge (for BYTE_STREAM_SPLIT encoding)
  * - Delta decoding (prefix sums)
  * - Dictionary gather operations
- * - CRC32C computation
  */
 
 #include <carquet/error.h>
@@ -816,53 +815,6 @@ bool carquet_sse_checked_gather_double(const double* dict, int32_t dict_count,
                                         double* output) {
     return carquet_sse_checked_gather_i64(
         (const int64_t*)dict, dict_count, indices, count, (int64_t*)output);
-}
-
-/* ============================================================================
- * CRC32C - SSE4.2 Hardware Acceleration
- * ============================================================================
- */
-
-/**
- * Compute CRC32C using SSE4.2 hardware instructions.
- */
-uint32_t carquet_sse_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
-    size_t i = 0;
-
-    /* Standard CRC32C convention: pre-invert, process, post-invert.
-     * The _mm_crc32_* intrinsics operate on the raw (inverted) CRC state. */
-    crc = ~crc;
-
-#ifdef __x86_64__
-    /* Process 8 bytes at a time on 64-bit */
-    for (; i + 8 <= len; i += 8) {
-        uint64_t val;
-        memcpy(&val, data + i, 8);
-        crc = (uint32_t)_mm_crc32_u64(crc, val);
-    }
-#endif
-
-    /* Process 4 bytes at a time */
-    for (; i + 4 <= len; i += 4) {
-        uint32_t val;
-        memcpy(&val, data + i, 4);
-        crc = _mm_crc32_u32(crc, val);
-    }
-
-    /* Process 2 bytes */
-    if (i + 2 <= len) {
-        uint16_t val;
-        memcpy(&val, data + i, 2);
-        crc = _mm_crc32_u16(crc, val);
-        i += 2;
-    }
-
-    /* Process remaining byte */
-    if (i < len) {
-        crc = _mm_crc32_u8(crc, data[i]);
-    }
-
-    return ~crc;
 }
 
 /* ============================================================================

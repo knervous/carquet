@@ -9,6 +9,7 @@
 #include "core/arena.h"
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* ============================================================================
  * Schema Creation
@@ -150,6 +151,123 @@ static carquet_status_t schema_ensure_capacity(carquet_schema_t* schema, int32_t
  * ============================================================================
  */
 
+static int32_t decimal_max_precision_for_fixed_len(int32_t type_length) {
+    if (type_length <= 0) {
+        return 0;
+    }
+
+    long double bits = (long double)type_length * 8.0L - 1.0L;
+    return (int32_t)floorl(bits * log10l(2.0L));
+}
+
+static carquet_status_t validate_column_logical_type(
+    carquet_physical_type_t physical_type,
+    const carquet_logical_type_t* logical_type,
+    int32_t type_length) {
+
+    if (!logical_type || logical_type->id == CARQUET_LOGICAL_UNKNOWN) {
+        return CARQUET_OK;
+    }
+
+    switch (logical_type->id) {
+        case CARQUET_LOGICAL_STRING:
+        case CARQUET_LOGICAL_ENUM:
+        case CARQUET_LOGICAL_JSON:
+        case CARQUET_LOGICAL_BSON:
+        case CARQUET_LOGICAL_GEOMETRY:
+        case CARQUET_LOGICAL_GEOGRAPHY:
+            return physical_type == CARQUET_PHYSICAL_BYTE_ARRAY
+                ? CARQUET_OK
+                : CARQUET_ERROR_INVALID_ARGUMENT;
+
+        case CARQUET_LOGICAL_DATE:
+            return physical_type == CARQUET_PHYSICAL_INT32
+                ? CARQUET_OK
+                : CARQUET_ERROR_INVALID_ARGUMENT;
+
+        case CARQUET_LOGICAL_TIME:
+            if (logical_type->params.time.unit == CARQUET_TIME_UNIT_MILLIS) {
+                return physical_type == CARQUET_PHYSICAL_INT32
+                    ? CARQUET_OK
+                    : CARQUET_ERROR_INVALID_ARGUMENT;
+            }
+            if (logical_type->params.time.unit == CARQUET_TIME_UNIT_MICROS ||
+                logical_type->params.time.unit == CARQUET_TIME_UNIT_NANOS) {
+                return physical_type == CARQUET_PHYSICAL_INT64
+                    ? CARQUET_OK
+                    : CARQUET_ERROR_INVALID_ARGUMENT;
+            }
+            return CARQUET_ERROR_INVALID_ARGUMENT;
+
+        case CARQUET_LOGICAL_TIMESTAMP:
+            return physical_type == CARQUET_PHYSICAL_INT64
+                ? CARQUET_OK
+                : CARQUET_ERROR_INVALID_ARGUMENT;
+
+        case CARQUET_LOGICAL_INTEGER:
+            switch (logical_type->params.integer.bit_width) {
+                case 8:
+                case 16:
+                case 32:
+                    return physical_type == CARQUET_PHYSICAL_INT32
+                        ? CARQUET_OK
+                        : CARQUET_ERROR_INVALID_ARGUMENT;
+                case 64:
+                    return physical_type == CARQUET_PHYSICAL_INT64
+                        ? CARQUET_OK
+                        : CARQUET_ERROR_INVALID_ARGUMENT;
+                default:
+                    return CARQUET_ERROR_INVALID_ARGUMENT;
+            }
+
+        case CARQUET_LOGICAL_DECIMAL: {
+            int32_t precision = logical_type->params.decimal.precision;
+            int32_t scale = logical_type->params.decimal.scale;
+            if (precision <= 0 || scale < 0 || scale > precision) {
+                return CARQUET_ERROR_INVALID_ARGUMENT;
+            }
+
+            switch (physical_type) {
+                case CARQUET_PHYSICAL_INT32:
+                    return precision <= 9 ? CARQUET_OK : CARQUET_ERROR_INVALID_ARGUMENT;
+                case CARQUET_PHYSICAL_INT64:
+                    return precision <= 18 ? CARQUET_OK : CARQUET_ERROR_INVALID_ARGUMENT;
+                case CARQUET_PHYSICAL_BYTE_ARRAY:
+                    return CARQUET_OK;
+                case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+                    return precision <= decimal_max_precision_for_fixed_len(type_length)
+                        ? CARQUET_OK
+                        : CARQUET_ERROR_INVALID_ARGUMENT;
+                default:
+                    return CARQUET_ERROR_INVALID_ARGUMENT;
+            }
+        }
+
+        case CARQUET_LOGICAL_UUID:
+            return physical_type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY &&
+                   type_length == 16
+                ? CARQUET_OK
+                : CARQUET_ERROR_INVALID_ARGUMENT;
+
+        case CARQUET_LOGICAL_FLOAT16:
+            return physical_type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY &&
+                   type_length == 2
+                ? CARQUET_OK
+                : CARQUET_ERROR_INVALID_ARGUMENT;
+
+        case CARQUET_LOGICAL_NULL:
+            return CARQUET_OK;
+
+        case CARQUET_LOGICAL_MAP:
+        case CARQUET_LOGICAL_LIST:
+        case CARQUET_LOGICAL_VARIANT:
+            return CARQUET_ERROR_INVALID_ARGUMENT;
+
+        default:
+            return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+}
+
 carquet_status_t carquet_schema_add_column(
     carquet_schema_t* schema,
     const char* name,
@@ -160,6 +278,12 @@ carquet_status_t carquet_schema_add_column(
     int32_t parent_index) {
 
     /* schema and name are nonnull per API contract */
+
+    carquet_status_t status = validate_column_logical_type(
+        physical_type, logical_type, type_length);
+    if (status != CARQUET_OK) {
+        return status;
+    }
 
     /* Validate parent_index: -1 or 0 means root, otherwise must be a valid group */
     if (parent_index == -1) {
@@ -174,7 +298,7 @@ carquet_status_t carquet_schema_add_column(
     }
 
     /* Ensure capacity for new element */
-    carquet_status_t status = schema_ensure_capacity(schema, schema->num_elements + 1);
+    status = schema_ensure_capacity(schema, schema->num_elements + 1);
     if (status != CARQUET_OK) {
         return status;
     }
@@ -292,6 +416,32 @@ int32_t carquet_schema_find_column(
     }
 
     return -1;
+}
+
+int32_t carquet_schema_add_variant(
+    carquet_schema_t* schema,
+    const char* name,
+    carquet_field_repetition_t variant_repetition,
+    int32_t parent_index) {
+
+    int32_t outer = carquet_schema_add_group(schema, name, variant_repetition, parent_index);
+    if (outer < 0) return -1;
+
+    schema->elements[outer].has_logical_type = true;
+    schema->elements[outer].logical_type.id = CARQUET_LOGICAL_VARIANT;
+    schema->elements[outer].logical_type.params.variant.specification_version = 1;
+
+    carquet_status_t status = carquet_schema_add_column(
+        schema, "metadata", CARQUET_PHYSICAL_BYTE_ARRAY, NULL,
+        CARQUET_REPETITION_REQUIRED, 0, outer);
+    if (status != CARQUET_OK) return -1;
+
+    status = carquet_schema_add_column(
+        schema, "value", CARQUET_PHYSICAL_BYTE_ARRAY, NULL,
+        CARQUET_REPETITION_REQUIRED, 0, outer);
+    if (status != CARQUET_OK) return -1;
+
+    return outer;
 }
 
 int32_t carquet_schema_num_columns(const carquet_schema_t* schema) {

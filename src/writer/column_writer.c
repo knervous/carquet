@@ -31,7 +31,8 @@ extern const uint8_t* carquet_bloom_filter_data(const carquet_bloom_filter_t* fi
 extern size_t carquet_bloom_filter_size(const carquet_bloom_filter_t* filter);
 
 extern carquet_column_index_builder_t* carquet_column_index_builder_create(
-    carquet_physical_type_t type, int32_t type_length);
+    carquet_physical_type_t type, const carquet_logical_type_t* logical_type,
+    int32_t type_length);
 extern void carquet_column_index_builder_destroy(carquet_column_index_builder_t* builder);
 extern carquet_status_t carquet_column_index_add_page(
     carquet_column_index_builder_t* builder,
@@ -54,6 +55,7 @@ typedef struct carquet_page_writer carquet_page_writer_t;
 
 extern carquet_page_writer_t* carquet_page_writer_create(
     carquet_physical_type_t type,
+    const carquet_logical_type_t* logical_type,
     carquet_encoding_t encoding,
     carquet_compression_t compression,
     int16_t max_def_level,
@@ -100,6 +102,7 @@ typedef struct carquet_column_writer_internal {
 
     /* Column configuration */
     carquet_physical_type_t type;
+    carquet_logical_type_t logical_type;
     carquet_encoding_t encoding;
     carquet_compression_t compression;
     int32_t type_length;
@@ -149,6 +152,7 @@ typedef struct carquet_column_writer_internal {
 
 carquet_column_writer_internal_t* carquet_column_writer_create(
     carquet_physical_type_t type,
+    const carquet_logical_type_t* logical_type,
     carquet_encoding_t encoding,
     carquet_compression_t compression,
     int16_t max_def_level,
@@ -161,8 +165,8 @@ carquet_column_writer_internal_t* carquet_column_writer_create(
     if (!writer) return NULL;
 
     writer->page_writer = carquet_page_writer_create(
-        type, encoding, compression, max_def_level, max_rep_level, type_length,
-        compression_level);
+        type, logical_type, encoding, compression, max_def_level, max_rep_level,
+        type_length, compression_level);
 
     if (!writer->page_writer) {
         free(writer);
@@ -172,6 +176,9 @@ carquet_column_writer_internal_t* carquet_column_writer_create(
     carquet_buffer_init(&writer->column_buffer);
 
     writer->type = type;
+    if (logical_type) {
+        writer->logical_type = *logical_type;
+    }
     writer->encoding = encoding;
     writer->compression = compression;
     writer->type_length = type_length;
@@ -254,7 +261,8 @@ void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
         writer->offset_index = NULL;
     }
     if (writer->page_index_enabled) {
-        writer->column_index = carquet_column_index_builder_create(writer->type, writer->type_length);
+        writer->column_index = carquet_column_index_builder_create(
+            writer->type, &writer->logical_type, writer->type_length);
         writer->offset_index = carquet_offset_index_builder_create(true);
     }
 }
@@ -274,22 +282,43 @@ extern int64_t carquet_page_writer_null_count(const carquet_page_writer_t* write
 
 /* Numeric/IEEE-754-aware comparison for fixed-width stat values. For
  * variable-length and FLBA types Parquet uses unsigned lexicographic order. */
+static bool logical_integer_is_unsigned(const carquet_logical_type_t* lt) {
+    return lt &&
+           lt->id == CARQUET_LOGICAL_INTEGER &&
+           !lt->params.integer.is_signed;
+}
+
 static int compare_stat_values(carquet_physical_type_t type,
+                               const carquet_logical_type_t* logical_type,
                                const uint8_t* a, size_t alen,
                                const uint8_t* b, size_t blen) {
     if (alen == blen) {
         switch (type) {
             case CARQUET_PHYSICAL_INT32: {
-                int32_t av, bv;
-                memcpy(&av, a, sizeof(av));
-                memcpy(&bv, b, sizeof(bv));
-                return (av < bv) ? -1 : (av > bv ? 1 : 0);
+                if (logical_integer_is_unsigned(logical_type)) {
+                    uint32_t av, bv;
+                    memcpy(&av, a, sizeof(av));
+                    memcpy(&bv, b, sizeof(bv));
+                    return (av < bv) ? -1 : (av > bv ? 1 : 0);
+                } else {
+                    int32_t av, bv;
+                    memcpy(&av, a, sizeof(av));
+                    memcpy(&bv, b, sizeof(bv));
+                    return (av < bv) ? -1 : (av > bv ? 1 : 0);
+                }
             }
             case CARQUET_PHYSICAL_INT64: {
-                int64_t av, bv;
-                memcpy(&av, a, sizeof(av));
-                memcpy(&bv, b, sizeof(bv));
-                return (av < bv) ? -1 : (av > bv ? 1 : 0);
+                if (logical_integer_is_unsigned(logical_type)) {
+                    uint64_t av, bv;
+                    memcpy(&av, a, sizeof(av));
+                    memcpy(&bv, b, sizeof(bv));
+                    return (av < bv) ? -1 : (av > bv ? 1 : 0);
+                } else {
+                    int64_t av, bv;
+                    memcpy(&av, a, sizeof(av));
+                    memcpy(&bv, b, sizeof(bv));
+                    return (av < bv) ? -1 : (av > bv ? 1 : 0);
+                }
             }
             case CARQUET_PHYSICAL_FLOAT: {
                 float av, bv;
@@ -351,7 +380,7 @@ static void merge_page_statistics(carquet_column_writer_internal_t* writer,
         return;
     }
 
-    if (compare_stat_values(writer->type,
+    if (compare_stat_values(writer->type, &writer->logical_type,
                             page_min, min_size,
                             writer->min_value, writer->min_value_size) < 0) {
         if (column_stats_grow(&writer->min_value, &writer->min_value_capacity,
@@ -359,7 +388,7 @@ static void merge_page_statistics(carquet_column_writer_internal_t* writer,
         memcpy(writer->min_value, page_min, min_size);
         writer->min_value_size = min_size;
     }
-    if (compare_stat_values(writer->type,
+    if (compare_stat_values(writer->type, &writer->logical_type,
                             page_max, max_size,
                             writer->max_value, writer->max_value_size) > 0) {
         if (column_stats_grow(&writer->max_value, &writer->max_value_capacity,
@@ -673,7 +702,7 @@ void carquet_column_writer_enable_page_index(
     writer->page_index_enabled = true;
     if (!writer->column_index) {
         writer->column_index = carquet_column_index_builder_create(
-            writer->type, writer->type_length);
+            writer->type, &writer->logical_type, writer->type_length);
     }
     if (!writer->offset_index) {
         writer->offset_index = carquet_offset_index_builder_create(true);

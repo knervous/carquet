@@ -61,8 +61,6 @@ typedef void (*bitunpack8_u32_fn)(const uint8_t* input, uint32_t* values);
 
 typedef int64_t (*find_run_length_i32_fn)(const int32_t* values, int64_t count);
 
-typedef uint32_t (*crc32c_fn)(uint32_t crc, const uint8_t* data, size_t len);
-
 typedef void (*match_copy_fn)(uint8_t* dst, const uint8_t* src, size_t len, size_t offset);
 typedef size_t (*match_length_fn)(const uint8_t* p, const uint8_t* match, const uint8_t* limit);
 
@@ -277,13 +275,6 @@ static int64_t scalar_find_run_length_i32(const int32_t* values, int64_t count) 
     return count;
 }
 
-/* Use the slicing-by-8 CRC32C from crc32.c as the scalar fallback */
-extern uint32_t carquet_scalar_crc32c(uint32_t crc, const uint8_t* data, size_t len);
-
-static uint32_t scalar_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
-    return carquet_scalar_crc32c(crc, data, len);
-}
-
 static void scalar_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset) {
     if (offset >= 8) {
         /* Non-overlapping: copy 8 bytes at a time */
@@ -477,7 +468,6 @@ extern void carquet_sse_bitunpack8_8bit(const uint8_t* input, uint32_t* values);
 extern void carquet_sse_bitunpack8_16bit(const uint8_t* input, uint32_t* values);
 extern void carquet_sse_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count);
 extern void carquet_sse_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
-extern uint32_t carquet_sse_crc32c(uint32_t crc, const uint8_t* data, size_t len);
 extern void carquet_sse_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset);
 extern size_t carquet_sse_match_length(const uint8_t* p, const uint8_t* match, const uint8_t* limit);
 extern int64_t carquet_sse_count_non_nulls(const int16_t* def_levels, int64_t count, int16_t max_def_level);
@@ -558,7 +548,6 @@ extern void carquet_avx2_bitunpack8_8bit(const uint8_t* input, uint32_t* values)
 extern void carquet_avx2_bitunpack8_16bit(const uint8_t* input, uint32_t* values);
 extern void carquet_avx2_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count);
 extern void carquet_avx2_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
-extern uint32_t carquet_avx2_crc32c(uint32_t crc, const uint8_t* data, size_t len);
 extern void carquet_avx2_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset);
 extern size_t carquet_avx2_match_length(const uint8_t* p, const uint8_t* match, const uint8_t* limit);
 extern int64_t carquet_avx2_count_non_nulls(const int16_t* def_levels, int64_t count, int16_t max_def_level);
@@ -616,7 +605,6 @@ extern void carquet_avx512_bitunpack8_8bit(const uint8_t* input, uint32_t* value
 extern void carquet_avx512_bitunpack8_16bit(const uint8_t* input, uint32_t* values);
 extern void carquet_avx512_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count);
 extern void carquet_avx512_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
-extern uint32_t carquet_avx512_crc32c(uint32_t crc, const uint8_t* data, size_t len);
 extern void carquet_avx512_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset);
 extern size_t carquet_avx512_match_length(const uint8_t* p, const uint8_t* match, const uint8_t* limit);
 extern int64_t carquet_avx512_count_non_nulls(const int16_t* def_levels, int64_t count, int16_t max_def_level);
@@ -669,7 +657,6 @@ extern void carquet_neon_byte_stream_split_decode_double(const uint8_t* data, in
 extern void carquet_neon_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count);
 extern void carquet_neon_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
 extern int64_t carquet_neon_find_run_length_i32(const int32_t* values, int64_t count);
-extern uint32_t carquet_neon_crc32c(uint32_t crc, const uint8_t* data, size_t len);
 extern void carquet_neon_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset);
 extern size_t carquet_neon_match_length(const uint8_t* p, const uint8_t* match, const uint8_t* limit);
 extern int64_t carquet_neon_count_non_nulls(const int16_t* def_levels, int64_t count, int16_t max_def_level);
@@ -771,7 +758,6 @@ typedef struct {
     pack_bools_fn pack_bools;
     bitunpack8_u32_fn bitunpack8_u32[33];
     find_run_length_i32_fn find_run_length_i32;
-    crc32c_fn crc32c;
     match_copy_fn match_copy;
     match_length_fn match_length;
     count_non_nulls_fn count_non_nulls;
@@ -821,7 +807,6 @@ void carquet_simd_dispatch_init(void) {
     g_dispatch.unpack_bools = scalar_unpack_bools;
     g_dispatch.pack_bools = scalar_pack_bools;
     g_dispatch.find_run_length_i32 = scalar_find_run_length_i32;
-    g_dispatch.crc32c = scalar_crc32c;
     g_dispatch.match_copy = scalar_match_copy;
     g_dispatch.match_length = scalar_match_length;
     g_dispatch.count_non_nulls = scalar_count_non_nulls;
@@ -865,7 +850,6 @@ void carquet_simd_dispatch_init(void) {
         g_dispatch.bitunpack8_u32[7] = carquet_sse_bitunpack8_7bit;
         g_dispatch.bitunpack8_u32[8] = carquet_sse_bitunpack8_8bit;
         g_dispatch.bitunpack8_u32[16] = carquet_sse_bitunpack8_16bit;
-        g_dispatch.crc32c = carquet_sse_crc32c;
         g_dispatch.match_copy = carquet_sse_match_copy;
         g_dispatch.match_length = carquet_sse_match_length;
         g_dispatch.count_non_nulls = carquet_sse_count_non_nulls;
@@ -914,7 +898,6 @@ void carquet_simd_dispatch_init(void) {
         g_dispatch.byte_split_decode_double = carquet_avx2_byte_stream_split_decode_double;
         g_dispatch.unpack_bools = carquet_avx2_unpack_bools;
         g_dispatch.pack_bools = carquet_avx2_pack_bools;
-        g_dispatch.crc32c = carquet_avx2_crc32c;
         g_dispatch.match_copy = carquet_avx2_match_copy;
         g_dispatch.match_length = carquet_avx2_match_length;
         g_dispatch.count_non_nulls = carquet_avx2_count_non_nulls;
@@ -962,7 +945,6 @@ void carquet_simd_dispatch_init(void) {
         g_dispatch.bitunpack8_u32[16] = carquet_avx512_bitunpack8_16bit;
         g_dispatch.unpack_bools = carquet_avx512_unpack_bools;
         g_dispatch.pack_bools = carquet_avx512_pack_bools;
-        g_dispatch.crc32c = carquet_avx512_crc32c;
         g_dispatch.match_copy = carquet_avx512_match_copy;
         g_dispatch.match_length = carquet_avx512_match_length;
         g_dispatch.count_non_nulls = carquet_avx512_count_non_nulls;
@@ -1000,7 +982,6 @@ void carquet_simd_dispatch_init(void) {
     g_dispatch.unpack_bools = carquet_neon_unpack_bools;
     g_dispatch.pack_bools = carquet_neon_pack_bools;
     g_dispatch.find_run_length_i32 = carquet_neon_find_run_length_i32;
-    g_dispatch.crc32c = carquet_neon_crc32c;
     g_dispatch.match_copy = carquet_neon_match_copy;
     g_dispatch.match_length = carquet_neon_match_length;
     g_dispatch.count_non_nulls = carquet_neon_count_non_nulls;
@@ -1020,8 +1001,7 @@ void carquet_simd_dispatch_init(void) {
     /* SVE overrides NEON where SVE is genuinely better.
      * prefix_sum, unpack/pack_bools, build_null_bitmap are left as NEON
      * because their SVE implementations were pure scalar (no real benefit).
-     * CRC32C, match_copy, match_length inherit from NEON (uses ARM CRC32
-     * instructions that are independent of SVE/NEON). */
+     * match_copy, match_length inherit from NEON. */
 #if defined(__ARM_FEATURE_SVE)
     if (cpu->has_sve) {
         /* Gather: SVE has true hardware gather instructions */
@@ -1238,11 +1218,6 @@ carquet_bitunpack8_fn carquet_dispatch_get_bitunpack8_fn(int bit_width) {
         return NULL;
     }
     return g_dispatch.bitunpack8_u32[bit_width];
-}
-
-uint32_t carquet_dispatch_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
-    DISPATCH_ENSURE_INIT();
-    return g_dispatch.crc32c(crc, data, len);
 }
 
 void carquet_dispatch_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset) {

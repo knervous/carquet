@@ -293,7 +293,8 @@ struct parquet_file_metadata {
     /* Field 6: created_by */
     char* created_by;
 
-    /* Field 7: column_orders (we skip for now) */
+    /* Field 7: column_orders (TYPE_ORDER entries) */
+    int32_t num_column_orders;
 
     /* Field 8: encryption_algorithm (we skip for now) */
 

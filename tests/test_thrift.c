@@ -184,11 +184,11 @@ static int test_thrift_list(void) {
 }
 
 static int test_logical_type_converted_type_compat(void) {
-    parquet_schema_element_t schema[16];
+    parquet_schema_element_t schema[20];
     memset(schema, 0, sizeof(schema));
 
     schema[0].name = "schema";
-    schema[0].num_children = 15;
+    schema[0].num_children = 19;
 
     schema[1].name = "str";
     schema[1].has_type = true;
@@ -288,13 +288,37 @@ static int test_logical_type_converted_type_compat(void) {
     schema[15].has_converted_type = true;
     schema[15].converted_type = CARQUET_CONVERTED_INT_8;
 
+    schema[16].name = "legacy_map_key_value";
+    schema[16].has_converted_type = true;
+    schema[16].converted_type = CARQUET_CONVERTED_MAP_KEY_VALUE;
+
+    schema[17].name = "variant";
+    schema[17].has_logical_type = true;
+    schema[17].logical_type.id = CARQUET_LOGICAL_VARIANT;
+    schema[17].logical_type.params.variant.specification_version = 1;
+
+    schema[18].name = "geometry";
+    schema[18].has_type = true;
+    schema[18].type = CARQUET_PHYSICAL_BYTE_ARRAY;
+    schema[18].has_logical_type = true;
+    schema[18].logical_type.id = CARQUET_LOGICAL_GEOMETRY;
+
+    schema[19].name = "geography";
+    schema[19].has_type = true;
+    schema[19].type = CARQUET_PHYSICAL_BYTE_ARRAY;
+    schema[19].has_logical_type = true;
+    schema[19].logical_type.id = CARQUET_LOGICAL_GEOGRAPHY;
+    schema[19].logical_type.params.geography.has_algorithm = true;
+    schema[19].logical_type.params.geography.algorithm = CARQUET_GEOSPATIAL_EDGE_VINCENTY;
+
     parquet_file_metadata_t metadata;
     memset(&metadata, 0, sizeof(metadata));
     metadata.version = 1;
     metadata.schema = schema;
-    metadata.num_schema_elements = 16;
+    metadata.num_schema_elements = 20;
     metadata.num_rows = 0;
     metadata.created_by = "test";
+    metadata.num_column_orders = 18;
 
     carquet_buffer_t buf;
     carquet_buffer_init(&buf);
@@ -331,6 +355,20 @@ static int test_logical_type_converted_type_compat(void) {
     assert(parsed.schema[15].logical_type.id == CARQUET_LOGICAL_INTEGER);
     assert(parsed.schema[15].logical_type.params.integer.is_signed);
     assert(parsed.schema[15].logical_type.params.integer.bit_width == 8);
+    assert(parsed.schema[16].has_logical_type);
+    assert(parsed.schema[16].logical_type.id == CARQUET_LOGICAL_MAP);
+    assert(parsed.schema[17].has_logical_type);
+    assert(parsed.schema[17].logical_type.id == CARQUET_LOGICAL_VARIANT);
+    assert(parsed.schema[17].logical_type.params.variant.specification_version == 1);
+    assert(parsed.schema[18].has_logical_type);
+    assert(parsed.schema[18].logical_type.id == CARQUET_LOGICAL_GEOMETRY);
+    assert(!parsed.schema[18].has_converted_type);
+    assert(parsed.schema[19].has_logical_type);
+    assert(parsed.schema[19].logical_type.id == CARQUET_LOGICAL_GEOGRAPHY);
+    assert(parsed.schema[19].logical_type.params.geography.has_algorithm);
+    assert(parsed.schema[19].logical_type.params.geography.algorithm == CARQUET_GEOSPATIAL_EDGE_VINCENTY);
+    assert(!parsed.schema[19].has_converted_type);
+    assert(parsed.num_column_orders == 18);
 
     carquet_arena_destroy(&arena);
     carquet_buffer_destroy(&buf);

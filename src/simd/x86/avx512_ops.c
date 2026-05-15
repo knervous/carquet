@@ -869,40 +869,6 @@ void carquet_avx512_memcpy(void* dest, const void* src, size_t n) {
     }
 }
 
-uint32_t carquet_avx512_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
-    size_t i = 0;
-
-    /* Standard CRC32C convention: pre-invert, process, post-invert */
-    crc = ~crc;
-
-#ifdef __x86_64__
-    for (; i + 8 <= len; i += 8) {
-        uint64_t val;
-        memcpy(&val, data + i, 8);
-        crc = (uint32_t)_mm_crc32_u64(crc, val);
-    }
-#endif
-
-    for (; i + 4 <= len; i += 4) {
-        uint32_t val;
-        memcpy(&val, data + i, 4);
-        crc = _mm_crc32_u32(crc, val);
-    }
-
-    if (i + 2 <= len) {
-        uint16_t val;
-        memcpy(&val, data + i, 2);
-        crc = _mm_crc32_u16(crc, val);
-        i += 2;
-    }
-
-    if (i < len) {
-        crc = _mm_crc32_u8(crc, data[i]);
-    }
-
-    return ~crc;
-}
-
 void carquet_avx512_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset) {
     if (offset >= 64) {
         while (len >= 64) {

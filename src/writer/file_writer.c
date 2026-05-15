@@ -34,6 +34,7 @@ typedef struct column_chunk_info {
     int64_t total_uncompressed_size;
     int64_t num_values;
     carquet_physical_type_t type;
+    carquet_logical_type_t logical_type;
     carquet_encoding_t encoding;
     carquet_compression_t compression;
     int32_t type_length;
@@ -64,6 +65,7 @@ extern carquet_status_t carquet_row_group_writer_add_column(
     carquet_row_group_writer_t* writer,
     const char* name,
     carquet_physical_type_t type,
+    const carquet_logical_type_t* logical_type,
     int16_t max_def_level,
     int16_t max_rep_level,
     int32_t type_length,
@@ -136,6 +138,7 @@ typedef struct writer_column_def {
     int32_t type_length;
     int16_t max_def_level;
     int16_t max_rep_level;
+    bool statistics_sort_order_defined;
 } writer_column_def_t;
 
 /* ============================================================================
@@ -399,7 +402,8 @@ static carquet_status_t add_column_internal(
     carquet_field_repetition_t repetition,
     int32_t type_length,
     int16_t max_def_level,
-    int16_t max_rep_level) {
+    int16_t max_rep_level,
+    bool statistics_sort_order_defined) {
 
     /* Expand capacity if needed */
     if (writer->num_columns >= writer->column_capacity) {
@@ -439,6 +443,7 @@ static carquet_status_t add_column_internal(
 
     col->max_def_level = max_def_level;
     col->max_rep_level = max_rep_level;
+    col->statistics_sort_order_defined = statistics_sort_order_defined;
 
     writer->column_values_written[writer->num_columns] = 0;
     writer->num_columns++;
@@ -529,6 +534,34 @@ static carquet_status_t build_column_metadata_cache(
     return CARQUET_OK;
 }
 
+static bool leaf_statistics_sort_order_defined(
+    const carquet_schema_t* schema,
+    int32_t leaf_elem_idx) {
+
+    const parquet_schema_element_t* leaf = &schema->elements[leaf_elem_idx];
+    if (leaf->has_logical_type) {
+        switch (leaf->logical_type.id) {
+            case CARQUET_LOGICAL_GEOMETRY:
+            case CARQUET_LOGICAL_GEOGRAPHY:
+            case CARQUET_LOGICAL_VARIANT:
+                return false;
+            default:
+                break;
+        }
+    }
+
+    for (int32_t cur = schema->parent_indices[leaf_elem_idx]; cur > 0;
+         cur = schema->parent_indices[cur]) {
+        const parquet_schema_element_t* elem = &schema->elements[cur];
+        if (elem->has_logical_type &&
+            elem->logical_type.id == CARQUET_LOGICAL_VARIANT) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static carquet_status_t ensure_column_overrides(carquet_writer_t* writer) {
     if (writer->column_overrides_allocated) return CARQUET_OK;
     int32_t n = writer->num_columns;
@@ -573,11 +606,17 @@ static void free_column_overrides(carquet_writer_t* writer) {
 
 static carquet_compression_t effective_column_compression(
     const carquet_writer_t* writer, int32_t column_index) {
+    carquet_compression_t codec;
     if (writer->column_overrides_allocated &&
         writer->column_compression_override_set[column_index]) {
-        return writer->column_compression_overrides[column_index];
+        codec = writer->column_compression_overrides[column_index];
+    } else {
+        codec = writer->options.compression;
     }
-    return writer->options.compression;
+
+    /* carquet writes raw LZ4 blocks, which are represented by the LZ4_RAW
+     * Parquet codec. The legacy LZ4 enum has a different deprecated framing. */
+    return codec == CARQUET_COMPRESSION_LZ4 ? CARQUET_COMPRESSION_LZ4_RAW : codec;
 }
 
 static int32_t effective_column_compression_level(
@@ -682,11 +721,15 @@ static carquet_status_t ensure_row_group(carquet_writer_t* writer) {
         int32_t col_level = effective_column_compression_level(writer, i);
         carquet_encoding_t col_enc = effective_column_encoding(
             writer, i, col->physical_type, col_comp);
+        carquet_logical_type_t no_stats_logical = { .id = CARQUET_LOGICAL_VARIANT };
+        const carquet_logical_type_t* writer_logical_type =
+            col->statistics_sort_order_defined ? &col->logical_type : &no_stats_logical;
 
         carquet_status_t status = carquet_row_group_writer_add_column(
             writer->current_row_group,
             col->name,
             col->physical_type,
+            writer_logical_type,
             col->max_def_level,
             col->max_rep_level,
             col->type_length,
@@ -775,6 +818,9 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
         bool emit_stats = writer->column_overrides_allocated && i < writer->num_columns
             ? writer->column_statistics_overrides[i]
             : writer->options.write_statistics;
+        if (i < writer->num_columns && !writer->columns[i].statistics_sort_order_defined) {
+            emit_stats = false;
+        }
 
         if (emit_stats && (col_info->has_min_max || col_info->has_null_count)) {
             chunk->has_statistics = true;
@@ -939,6 +985,18 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
     return CARQUET_OK;
 }
 
+static bool deprecated_stats_are_compatible(const writer_column_def_t* column) {
+    if (!column) return false;
+    if (column->logical_type.id == CARQUET_LOGICAL_INTEGER &&
+        !column->logical_type.params.integer.is_signed) {
+        return false;
+    }
+    if (!column->statistics_sort_order_defined) {
+        return false;
+    }
+    return true;
+}
+
 static carquet_status_t build_file_metadata(
     carquet_writer_t* writer,
     parquet_file_metadata_t* metadata) {
@@ -947,6 +1005,7 @@ static carquet_status_t build_file_metadata(
 
     metadata->version = 2;  /* Parquet version 2 */
     metadata->num_rows = writer->total_rows;
+    metadata->num_column_orders = writer->num_columns;
     metadata->created_by = carquet_arena_strdup(&writer->arena,
         writer->options.created_by ? writer->options.created_by : "Carquet");
 
@@ -1067,6 +1126,8 @@ static carquet_status_t build_file_metadata(
                     int32_t min_n = (int32_t)src_col->min_value_size;
                     int32_t max_n = (int32_t)src_col->max_value_size;
                     bool emit_max = true;
+                    bool min_exact = true;
+                    bool max_exact = true;
 
                     uint8_t* min_buf = carquet_arena_alloc(&writer->arena,
                         (size_t)min_n);
@@ -1076,6 +1137,7 @@ static carquet_status_t build_file_metadata(
                     if (variable_len && (size_t)min_n > TRUNC) {
                         /* Truncated prefix is lex <= original, valid as min. */
                         min_n = (int32_t)TRUNC;
+                        min_exact = false;
                     }
 
                     uint8_t* max_buf = carquet_arena_alloc(&writer->arena,
@@ -1088,6 +1150,7 @@ static carquet_status_t build_file_metadata(
                          * If all bytes in the prefix are 0xFF the increment
                          * wraps and we cannot emit a valid upper bound — drop
                          * max in that case. */
+                        max_exact = false;
                         size_t new_len = TRUNC;
                         max_buf[new_len - 1]++;
                         while (new_len > 0 && max_buf[new_len - 1] == 0) {
@@ -1103,19 +1166,26 @@ static carquet_status_t build_file_metadata(
 
                     stats->min_value = min_buf;
                     stats->min_value_len = min_n;
+                    stats->has_is_min_value_exact = true;
+                    stats->is_min_value_exact = min_exact;
                     if (emit_max) {
                         stats->max_value = max_buf;
                         stats->max_value_len = max_n;
+                        stats->has_is_max_value_exact = true;
+                        stats->is_max_value_exact = max_exact;
                     }
 
                     /* Mirror to deprecated min/max fields for older readers
                      * that ignore min_value/max_value (only for non-truncated
                      * stats to avoid leaking truncation semantics). */
-                    if (!variable_len || (size_t)src_col->min_value_size <= TRUNC) {
+                    bool deprecated_ok = j < writer->num_columns &&
+                        deprecated_stats_are_compatible(&writer->columns[j]);
+                    if (deprecated_ok &&
+                        (!variable_len || (size_t)src_col->min_value_size <= TRUNC)) {
                         stats->min_deprecated = min_buf;
                         stats->min_deprecated_len = min_n;
                     }
-                    if (emit_max &&
+                    if (deprecated_ok && emit_max &&
                         (!variable_len || (size_t)src_col->max_value_size <= TRUNC)) {
                         stats->max_deprecated = max_buf;
                         stats->max_deprecated_len = max_n;
@@ -1210,7 +1280,8 @@ carquet_writer_t* carquet_writer_create(
             elem->repetition_type,
             elem->type_length,
             schema->max_def_levels[i],
-            schema->max_rep_levels[i]);
+            schema->max_rep_levels[i],
+            leaf_statistics_sort_order_defined(schema, elem_idx));
 
         if (status != CARQUET_OK) {
             carquet_writer_abort(writer);
@@ -1284,7 +1355,8 @@ carquet_writer_t* carquet_writer_create_file(
             elem->repetition_type,
             elem->type_length,
             schema->max_def_levels[i],
-            schema->max_rep_levels[i]);
+            schema->max_rep_levels[i],
+            leaf_statistics_sort_order_defined(schema, elem_idx));
 
         if (status != CARQUET_OK) {
             carquet_writer_abort(writer);

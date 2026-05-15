@@ -1,7 +1,7 @@
 /**
  * @file carquet.h
  * @brief Carquet - High-Performance Pure C Parquet Library
- * @version 0.4.3
+ * @version 0.4.4
  *
  * @copyright Copyright (c) 2025. All rights reserved.
  * @license MIT License
@@ -199,10 +199,10 @@ extern "C" {
 #define CARQUET_VERSION_MINOR 4
 
 /** @brief Patch version number */
-#define CARQUET_VERSION_PATCH 3
+#define CARQUET_VERSION_PATCH 4
 
 /** @brief Version string in "MAJOR.MINOR.PATCH" format */
-#define CARQUET_VERSION_STRING "0.4.3"
+#define CARQUET_VERSION_STRING "0.4.4"
 
 /** @brief Numeric version for compile-time comparisons: (MAJOR * 10000 + MINOR * 100 + PATCH) */
 #define CARQUET_VERSION_NUMBER (CARQUET_VERSION_MAJOR * 10000 + CARQUET_VERSION_MINOR * 100 + CARQUET_VERSION_PATCH)
@@ -613,6 +613,30 @@ int32_t carquet_schema_add_group(
     carquet_schema_t* schema,
     const char* name,
     carquet_field_repetition_t repetition,
+    int32_t parent_index);
+
+/**
+ * @brief Add an unshredded VARIANT group to the schema.
+ *
+ * Creates the standard Parquet unshredded VARIANT structure:
+ * @code
+ *   <name> (<variant_repetition>, VARIANT(1)) {
+ *     required binary metadata;
+ *     required binary value;
+ *   }
+ * @endcode
+ *
+ * @param[in,out] schema Target schema
+ * @param[in] name Variant column name
+ * @param[in] variant_repetition Repetition of the variant itself
+ * @param[in] parent_index Parent group index (0 for root)
+ * @return Group index of the variant container, or -1 on error
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 2)
+int32_t carquet_schema_add_variant(
+    carquet_schema_t* schema,
+    const char* name,
+    carquet_field_repetition_t variant_repetition,
     int32_t parent_index);
 
 /**

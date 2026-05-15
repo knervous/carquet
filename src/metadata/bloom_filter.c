@@ -56,7 +56,8 @@ struct carquet_bloom_filter {
  * Generate block index from hash.
  */
 static inline size_t bloom_filter_block_index(uint64_t hash, size_t num_blocks) {
-    return (size_t)((hash >> 32) % num_blocks);
+    uint64_t top_bits = hash >> 32;
+    return (size_t)((top_bits * (uint64_t)num_blocks) >> 32);
 }
 
 /**

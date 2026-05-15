@@ -53,6 +53,9 @@ void cli_format_type(carquet_physical_type_t phys,
         case CARQUET_LOGICAL_LIST:      snprintf(buf, buf_size, "LIST"); break;
         case CARQUET_LOGICAL_MAP:       snprintf(buf, buf_size, "MAP"); break;
         case CARQUET_LOGICAL_FLOAT16:   snprintf(buf, buf_size, "FLOAT16"); break;
+        case CARQUET_LOGICAL_VARIANT:   snprintf(buf, buf_size, "VARIANT"); break;
+        case CARQUET_LOGICAL_GEOMETRY:  snprintf(buf, buf_size, "GEOMETRY"); break;
+        case CARQUET_LOGICAL_GEOGRAPHY: snprintf(buf, buf_size, "GEOGRAPHY"); break;
         case CARQUET_LOGICAL_NULL:      snprintf(buf, buf_size, "NULL"); break;
         case CARQUET_LOGICAL_BSON:      snprintf(buf, buf_size, "BSON"); break;
         case CARQUET_LOGICAL_DECIMAL:
@@ -280,6 +283,9 @@ int cmd_schema(const char* path) {
                 switch (lt->id) {
                     case CARQUET_LOGICAL_LIST: annotation = " (LIST)"; break;
                     case CARQUET_LOGICAL_MAP:  annotation = " (MAP)"; break;
+                    case CARQUET_LOGICAL_VARIANT: annotation = " (VARIANT)"; break;
+                    case CARQUET_LOGICAL_GEOMETRY: annotation = " (GEOMETRY)"; break;
+                    case CARQUET_LOGICAL_GEOGRAPHY: annotation = " (GEOGRAPHY)"; break;
                     default: break;
                 }
             }

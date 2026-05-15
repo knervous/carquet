@@ -434,6 +434,74 @@ static int test_stats_numeric_signed(void) {
     return 0;
 }
 
+static int test_stats_unsigned_logical_order(void) {
+    const char* tname = "stats_unsigned_logical_order";
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    char path[512];
+    carquet_test_temp_path(path, sizeof(path), "stats_unsigned");
+
+    carquet_schema_t* schema = carquet_schema_create(&err);
+    if (!schema) TEST_FAIL(tname, "schema create");
+
+    carquet_logical_type_t u32_type = {
+        .id = CARQUET_LOGICAL_INTEGER,
+        .params.integer = { .bit_width = 32, .is_signed = false }
+    };
+    carquet_logical_type_t u64_type = {
+        .id = CARQUET_LOGICAL_INTEGER,
+        .params.integer = { .bit_width = 64, .is_signed = false }
+    };
+
+    (void)carquet_schema_add_column(schema, "u32", CARQUET_PHYSICAL_INT32, &u32_type,
+        CARQUET_REPETITION_REQUIRED, 0, 0);
+    (void)carquet_schema_add_column(schema, "u64", CARQUET_PHYSICAL_INT64, &u64_type,
+        CARQUET_REPETITION_REQUIRED, 0, 0);
+
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.write_statistics = true;
+    carquet_writer_t* writer = carquet_writer_create(path, schema, &opts, &err);
+    if (!writer) { carquet_schema_free(schema); TEST_FAIL(tname, "writer create"); }
+
+    uint32_t u32[] = { UINT32_MAX, 1u, 42u };
+    uint64_t u64[] = { UINT64_MAX, 1ull, 42ull };
+    if (carquet_writer_write_batch(writer, 0, u32, 3, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(writer, 1, u64, 3, NULL, NULL) != CARQUET_OK) {
+        (void)carquet_writer_close(writer); carquet_schema_free(schema);
+        carquet_test_cleanup(path); TEST_FAIL(tname, "write_batch");
+    }
+    if (carquet_writer_close(writer) != CARQUET_OK) {
+        carquet_schema_free(schema); carquet_test_cleanup(path);
+        TEST_FAIL(tname, "writer close");
+    }
+    carquet_schema_free(schema);
+
+    carquet_reader_t* reader = carquet_reader_open(path, NULL, &err);
+    if (!reader) { carquet_test_cleanup(path); TEST_FAIL(tname, "reader open"); }
+
+    carquet_column_statistics_t s;
+    if (carquet_reader_column_statistics(reader, 0, 0, &s) != CARQUET_OK ||
+        !s.has_min_max) {
+        carquet_reader_close(reader); carquet_test_cleanup(path);
+        TEST_FAIL(tname, "UINT32 stats missing");
+    }
+    ASSERT_PRIMITIVE_EQ(tname, s, min_value, uint32_t, 1u);
+    ASSERT_PRIMITIVE_EQ(tname, s, max_value, uint32_t, UINT32_MAX);
+
+    if (carquet_reader_column_statistics(reader, 0, 1, &s) != CARQUET_OK ||
+        !s.has_min_max) {
+        carquet_reader_close(reader); carquet_test_cleanup(path);
+        TEST_FAIL(tname, "UINT64 stats missing");
+    }
+    ASSERT_PRIMITIVE_EQ(tname, s, min_value, uint64_t, 1ull);
+    ASSERT_PRIMITIVE_EQ(tname, s, max_value, uint64_t, UINT64_MAX);
+
+    carquet_reader_close(reader);
+    carquet_test_cleanup(path);
+    TEST_PASS(tname);
+    return 0;
+}
+
 /* BOOLEAN stats: all-false / all-true / mixed across three row groups. */
 static int test_stats_boolean(void) {
     const char* tname = "stats_boolean";
@@ -1215,6 +1283,7 @@ int main(void) {
     failures += test_row_group_statistics();
     failures += test_statistics_toggle();
     failures += test_stats_numeric_signed();
+    failures += test_stats_unsigned_logical_order();
     failures += test_stats_boolean();
     failures += test_stats_byte_array();
     failures += test_stats_flba();

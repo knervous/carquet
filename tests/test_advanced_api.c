@@ -441,6 +441,58 @@ static int test_per_column_options(void) {
     return 0;
 }
 
+static int test_lz4_writer_uses_lz4_raw_codec(void) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(&err);
+    if (!schema) TEST_FAIL("lz4_raw_codec", "schema create failed");
+    if (carquet_schema_add_column(schema, "id", CARQUET_PHYSICAL_INT32,
+            NULL, CARQUET_REPETITION_REQUIRED, 0, 0) != CARQUET_OK) {
+        carquet_schema_free(schema);
+        TEST_FAIL("lz4_raw_codec", "schema add failed");
+    }
+
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.compression = CARQUET_COMPRESSION_LZ4;
+
+    carquet_writer_t* w = carquet_writer_create(TEMP_FILE, schema, &opts, &err);
+    if (!w) {
+        carquet_schema_free(schema);
+        TEST_FAIL("lz4_raw_codec", "writer create failed");
+    }
+
+    int32_t ids[16];
+    for (int i = 0; i < 16; i++) ids[i] = i;
+    if (carquet_writer_write_batch(w, 0, ids, 16, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_close(w) != CARQUET_OK) {
+        carquet_schema_free(schema);
+        TEST_FAIL("lz4_raw_codec", "write failed");
+    }
+
+    carquet_reader_t* r = carquet_reader_open(TEMP_FILE, NULL, &err);
+    if (!r) {
+        carquet_schema_free(schema);
+        TEST_FAIL("lz4_raw_codec", "reader open failed");
+    }
+
+    carquet_column_chunk_metadata_t meta;
+    if (carquet_reader_column_chunk_metadata(r, 0, 0, &meta) != CARQUET_OK) {
+        carquet_reader_close(r);
+        carquet_schema_free(schema);
+        TEST_FAIL("lz4_raw_codec", "metadata failed");
+    }
+
+    carquet_reader_close(r);
+    carquet_schema_free(schema);
+
+    if (meta.codec != CARQUET_COMPRESSION_LZ4_RAW) {
+        TEST_FAIL("lz4_raw_codec", "writer did not normalize LZ4 to LZ4_RAW");
+    }
+
+    TEST_PASS("lz4_raw_codec");
+    return 0;
+}
+
 /* ======================================================================
  * Main
  * ====================================================================== */
@@ -455,6 +507,7 @@ int main(void) {
     failures += test_page_index();
     failures += test_buffer_writer();
     failures += test_per_column_options();
+    failures += test_lz4_writer_uses_lz4_raw_codec();
 
     remove(TEMP_FILE);
 

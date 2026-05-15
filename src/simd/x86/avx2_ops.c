@@ -830,42 +830,6 @@ bool carquet_avx2_checked_gather_double(const double* dict, int32_t dict_count,
         (const int64_t*)dict, dict_count, indices, count, (int64_t*)output);
 }
 
-uint32_t carquet_avx2_crc32c(uint32_t crc, const uint8_t* data, size_t len) {
-    size_t i = 0;
-
-    /* Standard CRC32C convention: pre/post XOR with 0xFFFFFFFF.
-     * The _mm_crc32_* intrinsics compute the raw polynomial remainder
-     * without any inversion, so we must handle it. */
-    crc = ~crc;
-
-#ifdef __x86_64__
-    for (; i + 8 <= len; i += 8) {
-        uint64_t val;
-        memcpy(&val, data + i, 8);
-        crc = (uint32_t)_mm_crc32_u64(crc, val);
-    }
-#endif
-
-    for (; i + 4 <= len; i += 4) {
-        uint32_t val;
-        memcpy(&val, data + i, 4);
-        crc = _mm_crc32_u32(crc, val);
-    }
-
-    if (i + 2 <= len) {
-        uint16_t val;
-        memcpy(&val, data + i, 2);
-        crc = _mm_crc32_u16(crc, val);
-        i += 2;
-    }
-
-    if (i < len) {
-        crc = _mm_crc32_u8(crc, data[i]);
-    }
-
-    return ~crc;
-}
-
 void carquet_avx2_match_copy(uint8_t* dst, const uint8_t* src, size_t len, size_t offset) {
     if (offset >= 32) {
         while (len >= 32) {

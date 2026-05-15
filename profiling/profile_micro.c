@@ -77,9 +77,6 @@ extern void carquet_dispatch_byte_split_decode_double(const uint8_t* data, int64
 extern void carquet_dispatch_prefix_sum_i32(int32_t* values, int64_t count, int32_t initial);
 extern void carquet_dispatch_prefix_sum_i64(int64_t* values, int64_t count, int64_t initial);
 
-/* CRC32 dispatch */
-extern uint32_t carquet_dispatch_crc32c(uint32_t crc, const uint8_t* data, size_t len);
-
 /* LZ4 internal functions */
 extern carquet_status_t carquet_lz4_compress(const uint8_t* src, size_t src_len,
                                               uint8_t* dst, size_t dst_capacity,
@@ -1147,30 +1144,14 @@ static void run_prefix_sum_benchmarks(int64_t count, int64_t iterations) {
  * CRC32 Micro-benchmark
  * ============================================================================ */
 
-NOINLINE static void bench_crc32_software(const uint8_t* data, size_t size,
-                                           int64_t iterations) {
-    printf("  CRC32 (software):        ");
+NOINLINE static void bench_crc32(const uint8_t* data, size_t size,
+                                  int64_t iterations) {
+    printf("  CRC32 (IEEE, zlib):      ");
     fflush(stdout);
 
     BENCH_START();
     for (int64_t iter = 0; iter < iterations; iter++) {
         uint32_t crc = carquet_crc32(data, size);
-        g_sink = crc;
-    }
-    double elapsed = BENCH_END();
-
-    double mb_per_sec = (double)size * iterations / elapsed * 1e3;
-    printf("%.2f MB/sec\n", mb_per_sec);
-}
-
-NOINLINE static void bench_crc32c_dispatch(const uint8_t* data, size_t size,
-                                            int64_t iterations) {
-    printf("  CRC32C (dispatch):       ");
-    fflush(stdout);
-
-    BENCH_START();
-    for (int64_t iter = 0; iter < iterations; iter++) {
-        uint32_t crc = carquet_dispatch_crc32c(0, data, size);
         g_sink = crc;
     }
     double elapsed = BENCH_END();
@@ -1206,8 +1187,7 @@ static void run_hash_benchmarks(size_t size, int64_t iterations) {
         data[i] = (uint8_t)(seed >> 16);
     }
 
-    bench_crc32_software(data, size, iterations);
-    bench_crc32c_dispatch(data, size, iterations);
+    bench_crc32(data, size, iterations);
     bench_xxhash64(data, size, iterations);
 
     free(data);

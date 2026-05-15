@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.4.4
+
+### Bug Fixes
+
+- **Fixed page checksum interoperability**: Page CRCs now use standard IEEE CRC32 as required by the Parquet spec, so files validate with readers that enable page checksum verification.
+- **Fixed LZ4 writer metadata**: `CARQUET_COMPRESSION_LZ4` writer requests are normalized to the interoperable Parquet `LZ4_RAW` codec because carquet writes raw LZ4 blocks, not the deprecated framed LZ4 format.
+- **Fixed Bloom filter block selection**: Split block Bloom filters now use the Parquet-specified block selection formula.
+- **Tightened schema validation**: Primitive logical type annotations are now validated against their allowed physical types and parameters before being added to a schema.
+- **Added newer logical type metadata**: The writer/parser now supports Parquet `VARIANT`, `GEOMETRY`, and `GEOGRAPHY` logical annotations, including geography edge interpolation metadata.
+- **Added column order metadata and stricter statistics semantics**: File metadata now emits `column_orders`, unsigned integer statistics use unsigned ordering, floating-point statistics ignore NaN values, and undefined-order logical types suppress min/max statistics.
+
+### Performance
+
+- **Hardware-accelerated page checksums**: The IEEE CRC32 used for page checksums now routes through zlib's `crc32`, which ships PCLMULQDQ-folding on x86 and FEAT_CRC32 on ARMv8 instead of a scalar slicing-by-8 loop. CRC is computed for every page on both write and read, so this lifts the whole pipeline — most dramatically for fast codecs where the checksum dominated (e.g. `large/snappy` read ~160ms → ~22ms, write ~824ms → ~231ms on Apple M3). Removes the now-unused CRC32C SIMD code paths.
+- **Re-fused statistics collection**: Fixed-width PLAIN encoding again computes column min/max in the same SIMD pass that copies values into the page buffer, instead of a separate scalar pass, halving the memory traffic of the write hot path. Float/double min/max use the SIMD path with a NaN-skipping rescan only when NaNs are present.
+
+### API
+
+- Public API added `CARQUET_LOGICAL_VARIANT`, `CARQUET_LOGICAL_GEOMETRY`, `CARQUET_LOGICAL_GEOGRAPHY`, geospatial edge algorithm constants, and `carquet_schema_add_variant()`. Existing `CARQUET_COMPRESSION_LZ4` writer usage is accepted, but emitted metadata now uses `LZ4_RAW`.
+
 ## v0.4.3
 
 ### Bug Fixes

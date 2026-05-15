@@ -75,6 +75,7 @@ void carquet_offset_index_builder_destroy(carquet_offset_index_builder_t* builde
 
 struct carquet_column_index_builder {
     carquet_physical_type_t type;
+    carquet_logical_type_t logical_type;
     int32_t type_length;
 
     int32_t capacity;
@@ -95,12 +96,16 @@ struct carquet_column_index_builder {
  */
 carquet_column_index_builder_t* carquet_column_index_builder_create(
     carquet_physical_type_t type,
+    const carquet_logical_type_t* logical_type,
     int32_t type_length) {
 
     carquet_column_index_builder_t* builder = calloc(1, sizeof(*builder));
     if (!builder) return NULL;
 
     builder->type = type;
+    if (logical_type) {
+        builder->logical_type = *logical_type;
+    }
     builder->type_length = type_length;
     builder->capacity = 16;
     builder->boundary_order = 0;  /* UNORDERED by default */
@@ -250,6 +255,54 @@ void carquet_column_index_set_boundary_order(
     if (builder) {
         builder->boundary_order = order;
     }
+}
+
+static bool index_logical_integer_is_unsigned(const carquet_logical_type_t* lt) {
+    return lt &&
+           lt->id == CARQUET_LOGICAL_INTEGER &&
+           !lt->params.integer.is_signed;
+}
+
+static int compare_index_values(const carquet_column_index_builder_t* builder,
+                                const uint8_t* a, int32_t alen,
+                                const uint8_t* b, int32_t blen) {
+    if (alen == blen) {
+        switch (builder->type) {
+            case CARQUET_PHYSICAL_INT32:
+                if (index_logical_integer_is_unsigned(&builder->logical_type)) {
+                    uint32_t av, bv;
+                    memcpy(&av, a, sizeof(av));
+                    memcpy(&bv, b, sizeof(bv));
+                    return (av < bv) ? -1 : (av > bv ? 1 : 0);
+                } else {
+                    int32_t av, bv;
+                    memcpy(&av, a, sizeof(av));
+                    memcpy(&bv, b, sizeof(bv));
+                    return (av < bv) ? -1 : (av > bv ? 1 : 0);
+                }
+            case CARQUET_PHYSICAL_INT64:
+                if (index_logical_integer_is_unsigned(&builder->logical_type)) {
+                    uint64_t av, bv;
+                    memcpy(&av, a, sizeof(av));
+                    memcpy(&bv, b, sizeof(bv));
+                    return (av < bv) ? -1 : (av > bv ? 1 : 0);
+                } else {
+                    int64_t av, bv;
+                    memcpy(&av, a, sizeof(av));
+                    memcpy(&bv, b, sizeof(bv));
+                    return (av < bv) ? -1 : (av > bv ? 1 : 0);
+                }
+            default:
+                break;
+        }
+    }
+
+    int32_t n = alen < blen ? alen : blen;
+    int c = memcmp(a, b, (size_t)n);
+    if (c != 0) return c;
+    if (alen < blen) return -1;
+    if (alen > blen) return 1;
+    return 0;
 }
 
 /* ============================================================================
@@ -529,10 +582,10 @@ carquet_status_t carquet_column_index_page_might_match(
 
     /* If query max < page min, no match */
     if (max_value && builder->min_values[page_idx]) {
-        int cmp = memcmp(max_value, builder->min_values[page_idx],
-                         value_len < builder->min_value_lens[page_idx] ?
-                         value_len : builder->min_value_lens[page_idx]);
-        if (cmp < 0 || (cmp == 0 && value_len < builder->min_value_lens[page_idx])) {
+        int cmp = compare_index_values(
+            builder, max_value, value_len,
+            builder->min_values[page_idx], builder->min_value_lens[page_idx]);
+        if (cmp < 0) {
             *might_match = false;
             return CARQUET_OK;
         }
@@ -540,10 +593,10 @@ carquet_status_t carquet_column_index_page_might_match(
 
     /* If query min > page max, no match */
     if (min_value && builder->max_values[page_idx]) {
-        int cmp = memcmp(min_value, builder->max_values[page_idx],
-                         value_len < builder->max_value_lens[page_idx] ?
-                         value_len : builder->max_value_lens[page_idx]);
-        if (cmp > 0 || (cmp == 0 && value_len > builder->max_value_lens[page_idx])) {
+        int cmp = compare_index_values(
+            builder, min_value, value_len,
+            builder->max_values[page_idx], builder->max_value_lens[page_idx]);
+        if (cmp > 0) {
             *might_match = false;
             return CARQUET_OK;
         }

@@ -24,6 +24,7 @@ typedef struct carquet_column_writer_internal carquet_column_writer_internal_t;
 
 extern carquet_column_writer_internal_t* carquet_column_writer_create(
     carquet_physical_type_t type,
+    const carquet_logical_type_t* logical_type,
     carquet_encoding_t encoding,
     carquet_compression_t compression,
     int16_t max_def_level,
@@ -92,6 +93,7 @@ typedef struct column_chunk_info {
     int64_t total_uncompressed_size;
     int64_t num_values;
     carquet_physical_type_t type;
+    carquet_logical_type_t logical_type;
     carquet_encoding_t encoding;
     carquet_compression_t compression;
     int32_t type_length;
@@ -315,6 +317,7 @@ carquet_status_t carquet_row_group_writer_add_column(
     carquet_row_group_writer_t* writer,
     const char* name,
     carquet_physical_type_t type,
+    const carquet_logical_type_t* logical_type,
     int16_t max_def_level,
     int16_t max_rep_level,
     int32_t type_length,
@@ -349,6 +352,7 @@ carquet_status_t carquet_row_group_writer_add_column(
     /* Create column writer with caller-resolved encoding/compression */
     carquet_column_writer_internal_t* col_writer = carquet_column_writer_create(
         type,
+        logical_type,
         encoding,
         compression,
         max_def_level,
@@ -376,6 +380,9 @@ carquet_status_t carquet_row_group_writer_add_column(
     /* Initialize column info */
     memset(&writer->column_infos[writer->num_columns], 0, sizeof(column_chunk_info_t));
     writer->column_infos[writer->num_columns].type = type;
+    if (logical_type) {
+        writer->column_infos[writer->num_columns].logical_type = *logical_type;
+    }
     writer->column_infos[writer->num_columns].encoding = encoding;
     writer->column_infos[writer->num_columns].compression = compression;
     writer->column_infos[writer->num_columns].type_length = type_length;
