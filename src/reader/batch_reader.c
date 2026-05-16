@@ -11,6 +11,7 @@
  * - Buffer pooling to minimize allocations
  */
 
+#include "core/allocator.h"
 #include <carquet/carquet.h>
 #include "reader_internal.h"
 #include "worker_pool.h"
@@ -31,6 +32,11 @@ extern void carquet_dispatch_build_null_bitmap(const int16_t* def_levels, int64_
                                                 int16_t max_def_level, uint8_t* null_bitmap);
 
 #define CARQUET_MAX_PAGE_PAYLOAD_SIZE (256ULL * 1024 * 1024)
+
+/* Upper bound for the pipeline's per-slot, per-column buffer pre-allocation.
+ * Sized from attacker-controlled row_group.num_rows; above this we fall back
+ * to lazy allocation in pipeline_fill instead of eagerly malloc'ing. */
+#define CARQUET_MAX_PREALLOC_BYTES (1024ULL * 1024 * 1024)
 
 /* ============================================================================
  * Internal Structures
@@ -227,8 +233,8 @@ static void* pool_ensure_data(carquet_column_pool_t* pool, size_t needed) {
     if (needed <= pool->data_capacity) {
         return pool->data;
     }
-    free(pool->data);
-    pool->data = malloc(needed);
+    carquet_mem_free(pool->data);
+    pool->data = carquet_mem_malloc(needed);
     pool->data_capacity = pool->data ? needed : 0;
     return pool->data;
 }
@@ -238,8 +244,8 @@ static uint8_t* pool_ensure_bitmap(carquet_column_pool_t* pool, size_t needed) {
         memset(pool->null_bitmap, 0, needed);
         return pool->null_bitmap;
     }
-    free(pool->null_bitmap);
-    pool->null_bitmap = calloc(1, needed);
+    carquet_mem_free(pool->null_bitmap);
+    pool->null_bitmap = carquet_mem_calloc(1, needed);
     pool->bitmap_capacity = pool->null_bitmap ? needed : 0;
     return pool->null_bitmap;
 }
@@ -248,8 +254,8 @@ static int16_t* pool_ensure_def_levels(carquet_column_pool_t* pool, size_t count
     if (count <= pool->def_levels_capacity) {
         return pool->def_levels;
     }
-    free(pool->def_levels);
-    pool->def_levels = malloc(sizeof(int16_t) * count);
+    carquet_mem_free(pool->def_levels);
+    pool->def_levels = carquet_mem_malloc(sizeof(int16_t) * count);
     pool->def_levels_capacity = pool->def_levels ? count : 0;
     return pool->def_levels;
 }
@@ -548,9 +554,9 @@ static void reset_column_reader_for_row_group(
     /* Dictionary may differ between row groups - must reload */
     if (col_reader->has_dictionary) {
         if (col_reader->dictionary_ownership == CARQUET_DATA_OWNED) {
-            free(col_reader->dictionary_data);
+            carquet_mem_free(col_reader->dictionary_data);
         }
-        free(col_reader->dictionary_offsets);
+        carquet_mem_free(col_reader->dictionary_offsets);
         col_reader->dictionary_data = NULL;
         col_reader->dictionary_offsets = NULL;
         col_reader->dictionary_size = 0;
@@ -585,7 +591,7 @@ carquet_batch_reader_t* carquet_batch_reader_create(
     carquet_error_t* error) {
 
     /* reader is nonnull per API contract */
-    carquet_batch_reader_t* batch_reader = calloc(1, sizeof(carquet_batch_reader_t));
+    carquet_batch_reader_t* batch_reader = carquet_mem_calloc(1, sizeof(carquet_batch_reader_t));
     if (!batch_reader) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate batch reader");
         return NULL;
@@ -606,9 +612,9 @@ carquet_batch_reader_t* carquet_batch_reader_create(
     if (batch_reader->config.column_indices && batch_reader->config.num_columns > 0) {
         /* Use provided column indices */
         batch_reader->num_projected = batch_reader->config.num_columns;
-        batch_reader->projected_columns = malloc(sizeof(int32_t) * batch_reader->num_projected);
+        batch_reader->projected_columns = carquet_mem_malloc(sizeof(int32_t) * batch_reader->num_projected);
         if (!batch_reader->projected_columns) {
-            free(batch_reader);
+            carquet_mem_free(batch_reader);
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate projection");
             return NULL;
         }
@@ -617,9 +623,9 @@ carquet_batch_reader_t* carquet_batch_reader_create(
     } else if (batch_reader->config.column_names && batch_reader->config.num_column_names > 0) {
         /* Resolve column names to indices */
         batch_reader->num_projected = batch_reader->config.num_column_names;
-        batch_reader->projected_columns = malloc(sizeof(int32_t) * batch_reader->num_projected);
+        batch_reader->projected_columns = carquet_mem_malloc(sizeof(int32_t) * batch_reader->num_projected);
         if (!batch_reader->projected_columns) {
-            free(batch_reader);
+            carquet_mem_free(batch_reader);
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate projection");
             return NULL;
         }
@@ -628,8 +634,8 @@ carquet_batch_reader_t* carquet_batch_reader_create(
             const char* col_name = batch_reader->config.column_names[i];
             int32_t idx = resolve_column_name(reader, col_name);
             if (idx < 0) {
-                free(batch_reader->projected_columns);
-                free(batch_reader);
+                carquet_mem_free(batch_reader->projected_columns);
+                carquet_mem_free(batch_reader);
                 CARQUET_SET_ERROR(error, CARQUET_ERROR_COLUMN_NOT_FOUND,
                     "Column not found: %s", col_name);
                 return NULL;
@@ -639,9 +645,9 @@ carquet_batch_reader_t* carquet_batch_reader_create(
     } else {
         /* Read all columns */
         batch_reader->num_projected = total_columns;
-        batch_reader->projected_columns = malloc(sizeof(int32_t) * total_columns);
+        batch_reader->projected_columns = carquet_mem_malloc(sizeof(int32_t) * total_columns);
         if (!batch_reader->projected_columns) {
-            free(batch_reader);
+            carquet_mem_free(batch_reader);
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate projection");
             return NULL;
         }
@@ -651,32 +657,32 @@ carquet_batch_reader_t* carquet_batch_reader_create(
     }
 
     /* Allocate column reader array */
-    batch_reader->col_readers = calloc(batch_reader->num_projected,
+    batch_reader->col_readers = carquet_mem_calloc(batch_reader->num_projected,
                                         sizeof(carquet_column_reader_t*));
     if (!batch_reader->col_readers) {
-        free(batch_reader->projected_columns);
-        free(batch_reader);
+        carquet_mem_free(batch_reader->projected_columns);
+        carquet_mem_free(batch_reader);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate column readers");
         return NULL;
     }
 
-    batch_reader->projected_types = malloc(sizeof(carquet_physical_type_t) *
+    batch_reader->projected_types = carquet_mem_malloc(sizeof(carquet_physical_type_t) *
                                            (size_t)batch_reader->num_projected);
-    batch_reader->projected_type_lengths = malloc(sizeof(int32_t) *
+    batch_reader->projected_type_lengths = carquet_mem_malloc(sizeof(int32_t) *
                                                   (size_t)batch_reader->num_projected);
-    batch_reader->projected_max_defs = malloc(sizeof(int16_t) *
+    batch_reader->projected_max_defs = carquet_mem_malloc(sizeof(int16_t) *
                                               (size_t)batch_reader->num_projected);
-    batch_reader->projected_value_sizes = malloc(sizeof(size_t) *
+    batch_reader->projected_value_sizes = carquet_mem_malloc(sizeof(size_t) *
                                                  (size_t)batch_reader->num_projected);
     if (!batch_reader->projected_types || !batch_reader->projected_type_lengths ||
         !batch_reader->projected_max_defs || !batch_reader->projected_value_sizes) {
-        free(batch_reader->projected_value_sizes);
-        free(batch_reader->projected_max_defs);
-        free(batch_reader->projected_type_lengths);
-        free(batch_reader->projected_types);
-        free(batch_reader->col_readers);
-        free(batch_reader->projected_columns);
-        free(batch_reader);
+        carquet_mem_free(batch_reader->projected_value_sizes);
+        carquet_mem_free(batch_reader->projected_max_defs);
+        carquet_mem_free(batch_reader->projected_type_lengths);
+        carquet_mem_free(batch_reader->projected_types);
+        carquet_mem_free(batch_reader->col_readers);
+        carquet_mem_free(batch_reader->projected_columns);
+        carquet_mem_free(batch_reader);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate projection metadata");
         return NULL;
     }
@@ -699,16 +705,16 @@ carquet_batch_reader_t* carquet_batch_reader_create(
     }
 
     /* Allocate buffer pool (one per projected column) */
-    batch_reader->col_pools = calloc(batch_reader->num_projected,
+    batch_reader->col_pools = carquet_mem_calloc(batch_reader->num_projected,
                                       sizeof(carquet_column_pool_t));
     if (!batch_reader->col_pools) {
-        free(batch_reader->projected_value_sizes);
-        free(batch_reader->projected_max_defs);
-        free(batch_reader->projected_type_lengths);
-        free(batch_reader->projected_types);
-        free(batch_reader->col_readers);
-        free(batch_reader->projected_columns);
-        free(batch_reader);
+        carquet_mem_free(batch_reader->projected_value_sizes);
+        carquet_mem_free(batch_reader->projected_max_defs);
+        carquet_mem_free(batch_reader->projected_type_lengths);
+        carquet_mem_free(batch_reader->projected_types);
+        carquet_mem_free(batch_reader->col_readers);
+        carquet_mem_free(batch_reader->projected_columns);
+        carquet_mem_free(batch_reader);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate buffer pool");
         return NULL;
     }
@@ -719,7 +725,7 @@ carquet_batch_reader_t* carquet_batch_reader_create(
      * Pre-compute filtered row group order
      * ==================================================================== */
     int32_t num_row_groups = carquet_reader_num_row_groups(reader);
-    batch_reader->rg_order = malloc(sizeof(int32_t) * (size_t)num_row_groups);
+    batch_reader->rg_order = carquet_mem_malloc(sizeof(int32_t) * (size_t)num_row_groups);
     if (!batch_reader->rg_order) {
         batch_reader->rg_order_len = 0;
     } else {
@@ -742,9 +748,19 @@ carquet_batch_reader_t* carquet_batch_reader_create(
     /* Enable the pipeline for multi-RG files, or single-RG files that are
      * large enough for the pipeline overhead to be amortized.  Small files
      * (< 500K rows) are faster with the simpler per-batch OMP path. */
+    /* row_groups[].num_rows is parsed straight from attacker-controlled
+     * metadata, so a crafted file can supply negative or absurd values.
+     * Saturate the accumulation (this total only gates a >= 500000 check)
+     * and ignore non-positive counts rather than overflowing int64_t. */
     int64_t total_pipeline_rows = 0;
     for (int32_t r = 0; r < batch_reader->rg_order_len; r++) {
-        total_pipeline_rows += reader->metadata.row_groups[batch_reader->rg_order[r]].num_rows;
+        int64_t rg_rows = reader->metadata.row_groups[batch_reader->rg_order[r]].num_rows;
+        if (rg_rows <= 0) continue;
+        if (rg_rows > INT64_MAX - total_pipeline_rows) {
+            total_pipeline_rows = INT64_MAX;
+            break;
+        }
+        total_pipeline_rows += rg_rows;
     }
     bool pipeline_safe = true;
     for (int32_t ci = 0; ci < batch_reader->num_projected; ci++) {
@@ -799,7 +815,7 @@ carquet_batch_reader_t* carquet_batch_reader_create(
                 if (depth > pt * 2) depth = pt * 2;
                 if (depth < 1) depth = 1;
 
-                batch_reader->pipeline = calloc(depth, sizeof(rg_slot_t));
+                batch_reader->pipeline = carquet_mem_calloc(depth, sizeof(rg_slot_t));
                 if (batch_reader->pipeline) {
                     batch_reader->pipeline_depth = depth;
                     batch_reader->pipeline_head = 0;
@@ -813,10 +829,10 @@ carquet_batch_reader_t* carquet_batch_reader_create(
                     int32_t np = batch_reader->num_projected;
                     int32_t max_splits = 1;
                     batch_reader->task_args_capacity = depth * np * (max_splits + 1);
-                    batch_reader->task_args = calloc(batch_reader->task_args_capacity,
+                    batch_reader->task_args = carquet_mem_calloc(batch_reader->task_args_capacity,
                                                      sizeof(bulk_read_arg_t));
                     if (!batch_reader->task_args) {
-                        free(batch_reader->pipeline);
+                        carquet_mem_free(batch_reader->pipeline);
                         batch_reader->pipeline = NULL;
                         batch_reader->pipeline_active = false;
                         batch_reader->task_args_capacity = 0;
@@ -824,10 +840,10 @@ carquet_batch_reader_t* carquet_batch_reader_create(
 
                     bool alloc_ok = batch_reader->pipeline_active;
                     for (int32_t s = 0; s < depth && alloc_ok; s++) {
-                        batch_reader->pipeline[s].col_readers = calloc(np, sizeof(carquet_column_reader_t*));
-                        batch_reader->pipeline[s].col_values = calloc(np, sizeof(void*));
-                        batch_reader->pipeline[s].col_buf_sizes = calloc(np, sizeof(size_t));
-                        batch_reader->pipeline[s].col_num_values = calloc(np, sizeof(int64_t));
+                        batch_reader->pipeline[s].col_readers = carquet_mem_calloc(np, sizeof(carquet_column_reader_t*));
+                        batch_reader->pipeline[s].col_values = carquet_mem_calloc(np, sizeof(void*));
+                        batch_reader->pipeline[s].col_buf_sizes = carquet_mem_calloc(np, sizeof(size_t));
+                        batch_reader->pipeline[s].col_num_values = carquet_mem_calloc(np, sizeof(int64_t));
                         batch_reader->pipeline[s].rg_index = -1;
                         if (!batch_reader->pipeline[s].col_readers ||
                             !batch_reader->pipeline[s].col_values ||
@@ -835,12 +851,12 @@ carquet_batch_reader_t* carquet_batch_reader_create(
                             !batch_reader->pipeline[s].col_num_values) {
                             /* Cleanup all slots on failure */
                             for (int32_t j = 0; j <= s; j++) {
-                                free(batch_reader->pipeline[j].col_readers);
-                                free(batch_reader->pipeline[j].col_values);
-                                free(batch_reader->pipeline[j].col_buf_sizes);
-                                free(batch_reader->pipeline[j].col_num_values);
+                                carquet_mem_free(batch_reader->pipeline[j].col_readers);
+                                carquet_mem_free(batch_reader->pipeline[j].col_values);
+                                carquet_mem_free(batch_reader->pipeline[j].col_buf_sizes);
+                                carquet_mem_free(batch_reader->pipeline[j].col_num_values);
                             }
-                            free(batch_reader->pipeline);
+                            carquet_mem_free(batch_reader->pipeline);
                             batch_reader->pipeline = NULL;
                             batch_reader->pipeline_active = false;
                             alloc_ok = false;
@@ -856,14 +872,29 @@ carquet_batch_reader_t* carquet_batch_reader_create(
                             int64_t rr = meta->row_groups[batch_reader->rg_order[r]].num_rows;
                             if (rr > max_rg_rows) max_rg_rows = rr;
                         }
-                        for (int32_t s = 0; s < depth; s++) {
-                            rg_slot_t* slot = &batch_reader->pipeline[s];
-                            for (int32_t i = 0; i < np; i++) {
-                                size_t needed = (size_t)max_rg_rows *
-                                                batch_reader->projected_value_sizes[i];
-                                if (needed > 0) {
-                                    slot->col_values[i] = malloc(needed);
-                                    slot->col_buf_sizes[i] = slot->col_values[i] ? needed : 0;
+                        /* This is a hot-path optimization only: a NULL/zero
+                         * slot buffer is lazily (re)allocated by pipeline_fill.
+                         * num_rows is attacker-controlled metadata, so skip the
+                         * pre-allocation entirely when the size is non-positive,
+                         * overflows size_t, or is implausibly large rather than
+                         * trusting it into carquet_mem_malloc(). */
+                        if (max_rg_rows > 0) {
+                            for (int32_t s = 0; s < depth; s++) {
+                                rg_slot_t* slot = &batch_reader->pipeline[s];
+                                for (int32_t i = 0; i < np; i++) {
+                                    size_t vsize = batch_reader->projected_value_sizes[i];
+                                    if (vsize == 0 ||
+                                        (uint64_t)max_rg_rows > SIZE_MAX / vsize) {
+                                        continue;
+                                    }
+                                    size_t needed = (size_t)max_rg_rows * vsize;
+                                    if (needed == 0 ||
+                                        needed > CARQUET_MAX_PREALLOC_BYTES) {
+                                        continue;
+                                    }
+                                    slot->col_values[i] = carquet_mem_malloc(needed);
+                                    slot->col_buf_sizes[i] =
+                                        slot->col_values[i] ? needed : 0;
                                 }
                             }
                         }
@@ -1047,7 +1078,7 @@ static void coalesced_read_column_range(
         } else if (encoding == CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
             /* Decompress to temp, then cache-tiled transpose to output */
             if (uncomp_size > reader->decompress_capacity) {
-                uint8_t* new_buf = realloc(reader->decompress_buffer, uncomp_size);
+                uint8_t* new_buf = carquet_mem_realloc(reader->decompress_buffer, uncomp_size);
                 if (!new_buf) {
                     break;
                 }
@@ -1230,7 +1261,7 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
             /* Ensure value buffer is large enough (grow-only via realloc) */
             size_t needed = (size_t)rg_rows * br->projected_value_sizes[i];
             if (needed > slot->col_buf_sizes[i]) {
-                void* new_buf = realloc(slot->col_values[i], needed);
+                void* new_buf = carquet_mem_realloc(slot->col_values[i], needed);
                 if (!new_buf) return;
                 slot->col_values[i] = new_buf;
                 slot->col_buf_sizes[i] = needed;
@@ -1386,17 +1417,17 @@ carquet_status_t carquet_batch_reader_next(
         /* Reuse or allocate batch struct */
         carquet_row_batch_t* new_batch = batch_reader->cached_batch;
         if (!new_batch) {
-            new_batch = calloc(1, sizeof(carquet_row_batch_t));
+            new_batch = carquet_mem_calloc(1, sizeof(carquet_row_batch_t));
             if (!new_batch) return CARQUET_ERROR_OUT_OF_MEMORY;
             if (carquet_arena_init(&new_batch->arena) != CARQUET_OK) {
-                free(new_batch);
+                carquet_mem_free(new_batch);
                 return CARQUET_ERROR_OUT_OF_MEMORY;
             }
             new_batch->columns = carquet_arena_calloc(&new_batch->arena,
                 batch_reader->num_projected, sizeof(carquet_column_data_t));
             if (!new_batch->columns) {
                 carquet_arena_destroy(&new_batch->arena);
-                free(new_batch);
+                carquet_mem_free(new_batch);
                 return CARQUET_ERROR_OUT_OF_MEMORY;
             }
             new_batch->pooled = true;
@@ -1469,19 +1500,19 @@ carquet_status_t carquet_batch_reader_next(
     /* Reuse or allocate batch struct */
     carquet_row_batch_t* new_batch = batch_reader->cached_batch;
     if (!new_batch) {
-        new_batch = calloc(1, sizeof(carquet_row_batch_t));
+        new_batch = carquet_mem_calloc(1, sizeof(carquet_row_batch_t));
         if (!new_batch) {
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
         if (carquet_arena_init(&new_batch->arena) != CARQUET_OK) {
-            free(new_batch);
+            carquet_mem_free(new_batch);
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
         new_batch->columns = carquet_arena_calloc(&new_batch->arena,
             batch_reader->num_projected, sizeof(carquet_column_data_t));
         if (!new_batch->columns) {
             carquet_arena_destroy(&new_batch->arena);
-            free(new_batch);
+            carquet_mem_free(new_batch);
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
         new_batch->pooled = true;
@@ -1673,26 +1704,26 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
                         carquet_column_reader_free(slot->col_readers[i]);
                     }
                 }
-                free(slot->col_readers);
+                carquet_mem_free(slot->col_readers);
             }
             if (slot->col_values) {
                 for (int32_t i = 0; i < batch_reader->num_projected; i++) {
-                    free(slot->col_values[i]);
+                    carquet_mem_free(slot->col_values[i]);
                 }
-                free(slot->col_values);
+                carquet_mem_free(slot->col_values);
             }
-            free(slot->col_buf_sizes);
-            free(slot->col_num_values);
+            carquet_mem_free(slot->col_buf_sizes);
+            carquet_mem_free(slot->col_num_values);
 #if !defined(_WIN32)
             if (slot->slot_mmap && slot->slot_mmap_size > 0)
                 munmap(slot->slot_mmap, slot->slot_mmap_size);
 #endif
         }
-        free(batch_reader->pipeline);
+        carquet_mem_free(batch_reader->pipeline);
     }
 
     /* Free per-reader task args */
-    free(batch_reader->task_args);
+    carquet_mem_free(batch_reader->task_args);
 
     /* Destroy worker pool (only if we created it) */
     if (!batch_reader->pool_is_borrowed) {
@@ -1706,32 +1737,32 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
                 carquet_column_reader_free(batch_reader->col_readers[i]);
             }
         }
-        free(batch_reader->col_readers);
+        carquet_mem_free(batch_reader->col_readers);
     }
 
     /* Free buffer pools */
     if (batch_reader->col_pools) {
         for (int32_t i = 0; i < batch_reader->num_projected; i++) {
-            free(batch_reader->col_pools[i].data);
-            free(batch_reader->col_pools[i].null_bitmap);
-            free(batch_reader->col_pools[i].def_levels);
+            carquet_mem_free(batch_reader->col_pools[i].data);
+            carquet_mem_free(batch_reader->col_pools[i].null_bitmap);
+            carquet_mem_free(batch_reader->col_pools[i].def_levels);
         }
-        free(batch_reader->col_pools);
+        carquet_mem_free(batch_reader->col_pools);
     }
 
     /* Free cached batch struct (but NOT pool buffers - those are freed above) */
     if (batch_reader->cached_batch) {
         carquet_arena_destroy(&batch_reader->cached_batch->arena);
-        free(batch_reader->cached_batch);
+        carquet_mem_free(batch_reader->cached_batch);
     }
 
-    free(batch_reader->rg_order);
-    free(batch_reader->projected_value_sizes);
-    free(batch_reader->projected_max_defs);
-    free(batch_reader->projected_type_lengths);
-    free(batch_reader->projected_types);
-    free(batch_reader->projected_columns);
-    free(batch_reader);
+    carquet_mem_free(batch_reader->rg_order);
+    carquet_mem_free(batch_reader->projected_value_sizes);
+    carquet_mem_free(batch_reader->projected_max_defs);
+    carquet_mem_free(batch_reader->projected_type_lengths);
+    carquet_mem_free(batch_reader->projected_types);
+    carquet_mem_free(batch_reader->projected_columns);
+    carquet_mem_free(batch_reader);
 }
 
 /* ============================================================================
@@ -1837,11 +1868,11 @@ void carquet_row_batch_free(carquet_row_batch_t* batch) {
     /* Non-pooled batch: free column data (only if owned, not views into mmap) */
     for (int32_t i = 0; i < batch->num_columns; i++) {
         if (batch->columns[i].ownership == CARQUET_DATA_OWNED) {
-            free(batch->columns[i].data);
+            carquet_mem_free(batch->columns[i].data);
         }
-        free(batch->columns[i].null_bitmap);
+        carquet_mem_free(batch->columns[i].null_bitmap);
     }
 
     carquet_arena_destroy(&batch->arena);
-    free(batch);
+    carquet_mem_free(batch);
 }

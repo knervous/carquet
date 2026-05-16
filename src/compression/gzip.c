@@ -1,8 +1,9 @@
 /**
  * @file gzip.c
- * @brief DEFLATE compression/decompression using zlib
+ * @brief GZIP compression/decompression using zlib
  *
- * Parquet uses raw DEFLATE (no gzip/zlib headers).
+ * Parquet's GZIP codec is the RFC 1952 gzip format (zlib windowBits 15+16),
+ * not raw DEFLATE.
  */
 
 #include <carquet/error.h>

@@ -6,6 +6,7 @@
  * tracking row counts and generating row group metadata.
  */
 
+#include "core/allocator.h"
 #include <carquet/carquet.h>
 #include <carquet/error.h>
 #include "core/buffer.h"
@@ -51,21 +52,38 @@ extern carquet_status_t carquet_column_writer_finalize(
     int64_t* total_uncompressed_size);
 
 extern int64_t carquet_column_writer_num_values(const carquet_column_writer_internal_t* writer);
+extern bool carquet_column_writer_has_dictionary_page(
+    const carquet_column_writer_internal_t* writer);
+extern int64_t carquet_column_writer_dictionary_page_size(
+    const carquet_column_writer_internal_t* writer);
+extern void carquet_column_writer_set_dictionary_page_size_limit(
+    carquet_column_writer_internal_t* writer, int64_t limit);
 
 extern void carquet_column_writer_enable_bloom_filter(
     carquet_column_writer_internal_t* writer, int64_t ndv);
+extern void carquet_column_writer_configure_bloom_filter(
+    carquet_column_writer_internal_t* writer,
+    bool enabled, int64_t ndv, double fpp);
+extern void carquet_column_writer_set_max_rows_per_page(
+    carquet_column_writer_internal_t* writer, int64_t max_rows);
+extern void carquet_column_writer_set_write_batch_size(
+    carquet_column_writer_internal_t* writer, int64_t batch_size);
 extern void carquet_column_writer_enable_page_index(
     carquet_column_writer_internal_t* writer);
 extern void carquet_column_writer_set_file_offset(
     carquet_column_writer_internal_t* writer, int64_t offset);
 extern void carquet_column_writer_set_statistics(
     carquet_column_writer_internal_t* writer, bool enabled);
+extern const parquet_geospatial_statistics_t* carquet_column_writer_get_geo_stats(
+    const carquet_column_writer_internal_t* writer);
 extern bool carquet_column_writer_get_statistics(
     const carquet_column_writer_internal_t* writer,
     const uint8_t** min_value, size_t* min_size,
     const uint8_t** max_value, size_t* max_size,
     int64_t* null_count);
 extern void carquet_column_writer_set_crc(
+    carquet_column_writer_internal_t* writer, bool enabled);
+extern void carquet_column_writer_set_data_page_v2(
     carquet_column_writer_internal_t* writer, bool enabled);
 extern void carquet_column_writer_reset(
     carquet_column_writer_internal_t* writer);
@@ -108,6 +126,14 @@ typedef struct column_chunk_info {
     size_t max_value_size;
     int64_t null_count;
     bool has_null_count;
+    /* Dictionary page plumbing. When has_dictionary_page is set the chunk
+     * starts with a DICTIONARY_PAGE of dictionary_page_size bytes at
+     * file_offset; the first data page follows it. */
+    bool has_dictionary_page;
+    int64_t dictionary_page_size;
+    /* GeospatialStatistics (GEOMETRY/GEOGRAPHY); cumulative over the chunk. */
+    bool has_geo_stats;
+    parquet_geospatial_statistics_t geo_stats;
 } column_chunk_info_t;
 
 /* ============================================================================
@@ -137,6 +163,7 @@ typedef struct carquet_row_group_writer {
     bool write_statistics;
     bool write_crc;
     int32_t compression_level;
+    int64_t dictionary_page_size;  /* 0 = column default (1MB) */
 } carquet_row_group_writer_t;
 
 typedef struct finalized_column_chunk {
@@ -149,9 +176,21 @@ typedef struct finalized_column_chunk {
 } finalized_column_chunk_t;
 
 static void capture_column_statistics(carquet_row_group_writer_t* writer, int i) {
+    column_chunk_info_t* info = &writer->column_infos[i];
+
+    /* GeospatialStatistics are independent of min/max statistics and of the
+     * write_statistics flag. The page writer accumulates them cumulatively
+     * over the whole chunk, so a plain copy of the latest snapshot is the
+     * complete chunk-level value. */
+    const parquet_geospatial_statistics_t* g =
+        carquet_column_writer_get_geo_stats(writer->column_writers[i]);
+    if (g) {
+        info->geo_stats = *g;
+        info->has_geo_stats = true;
+    }
+
     if (!writer->write_statistics) return;
 
-    column_chunk_info_t* info = &writer->column_infos[i];
     const uint8_t* min_v = NULL;
     const uint8_t* max_v = NULL;
     size_t min_size = 0;
@@ -166,8 +205,8 @@ static void capture_column_statistics(carquet_row_group_writer_t* writer, int i)
     info->null_count = null_count;
 
     /* Free any stats left over from a previous row group on this writer. */
-    free(info->min_value);
-    free(info->max_value);
+    carquet_mem_free(info->min_value);
+    carquet_mem_free(info->max_value);
     info->min_value = NULL;
     info->max_value = NULL;
     info->min_value_size = 0;
@@ -175,8 +214,8 @@ static void capture_column_statistics(carquet_row_group_writer_t* writer, int i)
     info->has_min_max = false;
 
     if (has_min_max && min_size > 0 && max_size > 0) {
-        info->min_value = malloc(min_size);
-        info->max_value = malloc(max_size);
+        info->min_value = carquet_mem_malloc(min_size);
+        info->max_value = carquet_mem_malloc(max_size);
         if (info->min_value && info->max_value) {
             memcpy(info->min_value, min_v, min_size);
             memcpy(info->max_value, max_v, max_size);
@@ -184,12 +223,20 @@ static void capture_column_statistics(carquet_row_group_writer_t* writer, int i)
             info->max_value_size = max_size;
             info->has_min_max = true;
         } else {
-            free(info->min_value);
-            free(info->max_value);
+            carquet_mem_free(info->min_value);
+            carquet_mem_free(info->max_value);
             info->min_value = NULL;
             info->max_value = NULL;
         }
     }
+}
+
+static void capture_dictionary_info(carquet_row_group_writer_t* writer, int i) {
+    column_chunk_info_t* info = &writer->column_infos[i];
+    info->has_dictionary_page =
+        carquet_column_writer_has_dictionary_page(writer->column_writers[i]);
+    info->dictionary_page_size =
+        carquet_column_writer_dictionary_page_size(writer->column_writers[i]);
 }
 
 static bool can_parallel_finalize(const carquet_row_group_writer_t* writer) {
@@ -245,7 +292,7 @@ carquet_row_group_writer_t* carquet_row_group_writer_create(
 
     (void)schema;  /* Will be used when we have schema traversal */
 
-    carquet_row_group_writer_t* writer = calloc(1, sizeof(*writer));
+    carquet_row_group_writer_t* writer = carquet_mem_calloc(1, sizeof(*writer));
     if (!writer) return NULL;
 
     carquet_buffer_init(&writer->row_group_buffer);
@@ -265,20 +312,20 @@ void carquet_row_group_writer_destroy(carquet_row_group_writer_t* writer) {
                     carquet_column_writer_destroy(writer->column_writers[i]);
                 }
             }
-            free(writer->column_writers);
+            carquet_mem_free(writer->column_writers);
         }
 
         if (writer->column_infos) {
             for (int i = 0; i < writer->num_columns; i++) {
-                free(writer->column_infos[i].path);
-                free(writer->column_infos[i].min_value);
-                free(writer->column_infos[i].max_value);
+                carquet_mem_free(writer->column_infos[i].path);
+                carquet_mem_free(writer->column_infos[i].min_value);
+                carquet_mem_free(writer->column_infos[i].max_value);
             }
-            free(writer->column_infos);
+            carquet_mem_free(writer->column_infos);
         }
 
         carquet_buffer_destroy(&writer->row_group_buffer);
-        free(writer);
+        carquet_mem_free(writer);
     }
 }
 
@@ -296,8 +343,10 @@ void carquet_row_group_writer_reset(carquet_row_group_writer_t* writer, int64_t 
         writer->column_infos[i].total_compressed_size = 0;
         writer->column_infos[i].total_uncompressed_size = 0;
         writer->column_infos[i].num_values = 0;
-        free(writer->column_infos[i].min_value);
-        free(writer->column_infos[i].max_value);
+        writer->column_infos[i].has_dictionary_page = false;
+        writer->column_infos[i].dictionary_page_size = 0;
+        carquet_mem_free(writer->column_infos[i].min_value);
+        carquet_mem_free(writer->column_infos[i].max_value);
         writer->column_infos[i].min_value = NULL;
         writer->column_infos[i].max_value = NULL;
         writer->column_infos[i].min_value_size = 0;
@@ -332,7 +381,7 @@ carquet_status_t carquet_row_group_writer_add_column(
     int new_count = writer->num_columns + 1;
 
     /* Expand column writers array */
-    carquet_column_writer_internal_t** new_writers = realloc(
+    carquet_column_writer_internal_t** new_writers = carquet_mem_realloc(
         writer->column_writers,
         new_count * sizeof(carquet_column_writer_internal_t*));
     if (!new_writers) {
@@ -341,7 +390,7 @@ carquet_status_t carquet_row_group_writer_add_column(
     writer->column_writers = new_writers;
 
     /* Expand column infos array */
-    column_chunk_info_t* new_infos = realloc(
+    column_chunk_info_t* new_infos = carquet_mem_realloc(
         writer->column_infos,
         new_count * sizeof(column_chunk_info_t));
     if (!new_infos) {
@@ -374,6 +423,10 @@ carquet_status_t carquet_row_group_writer_add_column(
     }
     carquet_column_writer_set_statistics(col_writer, writer->write_statistics);
     carquet_column_writer_set_crc(col_writer, writer->write_crc);
+    if (writer->dictionary_page_size > 0) {
+        carquet_column_writer_set_dictionary_page_size_limit(
+            col_writer, writer->dictionary_page_size);
+    }
 
     writer->column_writers[writer->num_columns] = col_writer;
 
@@ -436,14 +489,14 @@ carquet_status_t carquet_row_group_writer_finalize(
     int64_t current_offset = writer->file_offset;
 
     if (can_parallel_finalize(writer)) {
-        finalized_column_chunk_t* chunks = calloc((size_t)writer->num_columns, sizeof(*chunks));
+        finalized_column_chunk_t* chunks = carquet_mem_calloc((size_t)writer->num_columns, sizeof(*chunks));
         if (!chunks) {
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
 
         carquet_status_t status = finalize_columns_parallel(writer, chunks);
         if (status != CARQUET_OK) {
-            free(chunks);
+            carquet_mem_free(chunks);
             return status;
         }
 
@@ -453,10 +506,11 @@ carquet_status_t carquet_row_group_writer_finalize(
             writer->column_infos[i].total_uncompressed_size = chunks[i].uncompressed_size;
             writer->column_infos[i].num_values = chunks[i].total_values;
             capture_column_statistics(writer, i);
+            capture_dictionary_info(writer, i);
 
             status = carquet_buffer_append(&writer->row_group_buffer, chunks[i].data, chunks[i].size);
             if (status != CARQUET_OK) {
-                free(chunks);
+                carquet_mem_free(chunks);
                 return status;
             }
 
@@ -464,7 +518,7 @@ carquet_status_t carquet_row_group_writer_finalize(
             writer->total_byte_size += chunks[i].size;
         }
 
-        free(chunks);
+        carquet_mem_free(chunks);
         if (data) *data = writer->row_group_buffer.data;
         if (size) *size = writer->row_group_buffer.size;
         return CARQUET_OK;
@@ -496,6 +550,7 @@ carquet_status_t carquet_row_group_writer_finalize(
         writer->column_infos[i].total_uncompressed_size = uncompressed_size;
         writer->column_infos[i].num_values = total_values;
         capture_column_statistics(writer, i);
+        capture_dictionary_info(writer, i);
 
         /* Append column data */
         status = carquet_buffer_append(&writer->row_group_buffer, col_data, col_size);
@@ -529,14 +584,14 @@ carquet_status_t carquet_row_group_writer_write_to_file(
     writer->total_byte_size = 0;
 
     if (can_parallel_finalize(writer)) {
-        finalized_column_chunk_t* chunks = calloc((size_t)writer->num_columns, sizeof(*chunks));
+        finalized_column_chunk_t* chunks = carquet_mem_calloc((size_t)writer->num_columns, sizeof(*chunks));
         if (!chunks) {
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
 
         carquet_status_t status = finalize_columns_parallel(writer, chunks);
         if (status != CARQUET_OK) {
-            free(chunks);
+            carquet_mem_free(chunks);
             return status;
         }
 
@@ -546,10 +601,11 @@ carquet_status_t carquet_row_group_writer_write_to_file(
             writer->column_infos[i].total_uncompressed_size = chunks[i].uncompressed_size;
             writer->column_infos[i].num_values = chunks[i].total_values;
             capture_column_statistics(writer, i);
+            capture_dictionary_info(writer, i);
 
             if (chunks[i].size > 0) {
                 if (fwrite(chunks[i].data, 1, chunks[i].size, file) != chunks[i].size) {
-                    free(chunks);
+                    carquet_mem_free(chunks);
                     return CARQUET_ERROR_FILE_WRITE;
                 }
             }
@@ -559,7 +615,7 @@ carquet_status_t carquet_row_group_writer_write_to_file(
             written += chunks[i].size;
         }
 
-        free(chunks);
+        carquet_mem_free(chunks);
         if (total_size) *total_size = written;
         return CARQUET_OK;
     }
@@ -587,6 +643,7 @@ carquet_status_t carquet_row_group_writer_write_to_file(
         writer->column_infos[i].total_uncompressed_size = uncompressed_size;
         writer->column_infos[i].num_values = total_values;
         capture_column_statistics(writer, i);
+        capture_dictionary_info(writer, i);
 
         if (col_size > 0) {
             if (fwrite(col_data, 1, col_size, file) != col_size) {
@@ -629,14 +686,62 @@ void carquet_row_group_writer_set_options(
     bool write_page_index,
     bool write_statistics,
     bool write_crc,
-    int32_t compression_level) {
+    int32_t compression_level,
+    int64_t dictionary_page_size) {
     if (writer) {
         writer->write_bloom_filters = write_bloom_filters;
         writer->write_page_index = write_page_index;
         writer->write_statistics = write_statistics;
         writer->write_crc = write_crc;
         writer->compression_level = compression_level;
+        writer->dictionary_page_size = dictionary_page_size;
+        if (dictionary_page_size > 0) {
+            for (int i = 0; i < writer->num_columns; i++) {
+                carquet_column_writer_set_dictionary_page_size_limit(
+                    writer->column_writers[i], dictionary_page_size);
+            }
+        }
     }
+}
+
+void carquet_row_group_writer_configure_column_bloom(
+    carquet_row_group_writer_t* writer,
+    int column_index, bool enabled, int64_t ndv, double fpp) {
+    if (!writer || column_index < 0 || column_index >= writer->num_columns) {
+        return;
+    }
+    carquet_column_writer_configure_bloom_filter(
+        writer->column_writers[column_index], enabled, ndv, fpp);
+}
+
+void carquet_row_group_writer_set_column_max_rows_per_page(
+    carquet_row_group_writer_t* writer,
+    int column_index, int64_t max_rows) {
+    if (!writer || column_index < 0 || column_index >= writer->num_columns) {
+        return;
+    }
+    carquet_column_writer_set_max_rows_per_page(
+        writer->column_writers[column_index], max_rows);
+}
+
+void carquet_row_group_writer_set_column_write_batch_size(
+    carquet_row_group_writer_t* writer,
+    int column_index, int64_t batch_size) {
+    if (!writer || column_index < 0 || column_index >= writer->num_columns) {
+        return;
+    }
+    carquet_column_writer_set_write_batch_size(
+        writer->column_writers[column_index], batch_size);
+}
+
+void carquet_row_group_writer_set_column_data_page_v2(
+    carquet_row_group_writer_t* writer,
+    int column_index, bool enabled) {
+    if (!writer || column_index < 0 || column_index >= writer->num_columns) {
+        return;
+    }
+    carquet_column_writer_set_data_page_v2(
+        writer->column_writers[column_index], enabled);
 }
 
 carquet_bloom_filter_t* carquet_row_group_writer_get_bloom_filter(

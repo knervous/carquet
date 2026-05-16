@@ -6,9 +6,11 @@
  * dictionary encoding, and column-level metadata.
  */
 
+#include "core/allocator.h"
 #include <carquet/carquet.h>
 #include <carquet/error.h>
 #include "core/buffer.h"
+#include "core/float16.h"
 #include "thrift/thrift_encode.h"
 #include "thrift/parquet_types.h"
 #include <stdlib.h>
@@ -29,6 +31,9 @@ extern void carquet_bloom_filter_insert_bytes(carquet_bloom_filter_t* filter,
                                                const uint8_t* data, size_t len);
 extern const uint8_t* carquet_bloom_filter_data(const carquet_bloom_filter_t* filter);
 extern size_t carquet_bloom_filter_size(const carquet_bloom_filter_t* filter);
+extern int64_t carquet_dispatch_count_non_nulls(const int16_t* def_levels, int64_t count,
+                                                 int16_t max_def_level);
+extern void carquet_dispatch_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
 
 extern carquet_column_index_builder_t* carquet_column_index_builder_create(
     carquet_physical_type_t type, const carquet_logical_type_t* logical_type,
@@ -90,6 +95,49 @@ extern size_t carquet_page_writer_estimated_size(const carquet_page_writer_t* wr
 extern int64_t carquet_page_writer_num_values(const carquet_page_writer_t* writer);
 extern void carquet_page_writer_set_crc(carquet_page_writer_t* writer, bool enabled);
 extern void carquet_page_writer_set_statistics(carquet_page_writer_t* writer, bool enabled);
+extern void carquet_page_writer_set_data_page_v2(carquet_page_writer_t* writer, bool enabled);
+extern const parquet_geospatial_statistics_t* carquet_page_writer_get_geo_stats(
+    const carquet_page_writer_t* writer);
+
+extern carquet_status_t carquet_page_writer_emit_dictionary_page(
+    carquet_page_writer_t* writer, carquet_buffer_t* output_buffer,
+    const uint8_t* plain_payload, size_t payload_size, int32_t num_entries,
+    size_t* page_size, int32_t* uncompressed_size, int32_t* compressed_size);
+extern carquet_status_t carquet_page_writer_add_dictionary_indices(
+    carquet_page_writer_t* writer, const uint8_t* idx_payload, size_t idx_size,
+    const int16_t* def_levels, const int16_t* rep_levels,
+    int64_t num_values_total, int64_t num_nulls);
+extern void carquet_page_writer_set_encoding(carquet_page_writer_t* writer,
+                                             carquet_encoding_t encoding);
+extern carquet_status_t carquet_page_writer_set_min_max(
+    carquet_page_writer_t* writer,
+    const uint8_t* min_value, size_t min_size,
+    const uint8_t* max_value, size_t max_size);
+
+/* Dictionary encoders (src/encoding/dictionary.c). Each produces the PLAIN
+ * dictionary payload in dict_output and [bit-width][RLE indices] in
+ * indices_output, over the full non-null value array in one call. */
+extern carquet_status_t carquet_dictionary_encode_int32(
+    const int32_t* values, int64_t count,
+    carquet_buffer_t* dict_output, carquet_buffer_t* indices_output);
+extern carquet_status_t carquet_dictionary_encode_int64(
+    const int64_t* values, int64_t count,
+    carquet_buffer_t* dict_output, carquet_buffer_t* indices_output);
+extern carquet_status_t carquet_dictionary_encode_float(
+    const float* values, int64_t count,
+    carquet_buffer_t* dict_output, carquet_buffer_t* indices_output);
+extern carquet_status_t carquet_dictionary_encode_double(
+    const double* values, int64_t count,
+    carquet_buffer_t* dict_output, carquet_buffer_t* indices_output);
+extern carquet_status_t carquet_dictionary_encode_byte_array(
+    const carquet_byte_array_t* values, int64_t count,
+    carquet_buffer_t* dict_output, carquet_buffer_t* indices_output);
+extern carquet_status_t carquet_dictionary_encode_capped(
+    carquet_physical_type_t type, int32_t type_length,
+    const void* fixed_values, const carquet_byte_array_t* ba_values,
+    int64_t count, size_t max_dict_bytes,
+    carquet_buffer_t* dict_output, carquet_buffer_t* indices_output,
+    bool* abandoned);
 
 /* ============================================================================
  * Column Writer Structure
@@ -112,6 +160,8 @@ typedef struct carquet_column_writer_internal {
     /* Page size limits */
     size_t target_page_size;
     size_t max_page_size;
+    int64_t max_rows_per_page;  /* 0 = unlimited */
+    int64_t write_batch_size;   /* 0 = automatic chunk heuristic */
 
     /* Statistics */
     int64_t total_values;
@@ -136,6 +186,7 @@ typedef struct carquet_column_writer_internal {
     /* Bloom filter (optional) */
     carquet_bloom_filter_t* bloom_filter;
     int64_t bloom_ndv;
+    double bloom_fpp;
 
     /* Page index builders (optional) */
     carquet_column_index_builder_t* column_index;
@@ -143,6 +194,31 @@ typedef struct carquet_column_writer_internal {
     bool page_index_enabled;
     int64_t page_row_offset;      /* Row offset for current page (for offset index) */
     int64_t column_file_offset;   /* File offset where this column starts */
+
+    /* Dictionary (chunk-buffered) encoding state. When use_dictionary is set,
+     * write_batch accumulates all non-null values plus all def/rep levels for
+     * the whole column chunk; finalize then builds the dictionary, decides
+     * whether to keep it (fallback heuristic), and emits the dictionary page
+     * followed by a single RLE_DICTIONARY data page (or a PLAIN data page on
+     * fallback). dictionary_page_size_bytes is reported back so the file
+     * writer can compute dictionary_page_offset / data_page_offset. */
+    bool use_dictionary;
+    size_t dictionary_page_size_limit;  /* options.dictionary_page_size */
+    carquet_buffer_t dict_values;       /* Accumulated raw non-null values */
+    int64_t dict_value_count;           /* Count of accumulated non-null values */
+    carquet_byte_array_t* dict_ba;      /* BYTE_ARRAY: array of {data,len} */
+    size_t dict_ba_capacity;
+    carquet_buffer_t dict_ba_storage;   /* BYTE_ARRAY: backing byte storage */
+    int16_t* dict_def_levels;           /* Accumulated definition levels */
+    int64_t dict_def_count;
+    size_t dict_def_capacity;
+    int16_t* dict_rep_levels;           /* Accumulated repetition levels */
+    int64_t dict_rep_count;
+    size_t dict_rep_capacity;
+    int64_t dict_total_rows;            /* Total logical rows incl. nulls */
+    int64_t dict_total_nulls;
+    bool has_dictionary_page;           /* Set when a dict page was emitted */
+    int64_t dictionary_page_size_bytes; /* Size of the emitted dict page */
 } carquet_column_writer_internal_t;
 
 /* ============================================================================
@@ -161,7 +237,7 @@ carquet_column_writer_internal_t* carquet_column_writer_create(
     size_t target_page_size,
     int32_t compression_level) {
 
-    carquet_column_writer_internal_t* writer = calloc(1, sizeof(*writer));
+    carquet_column_writer_internal_t* writer = carquet_mem_calloc(1, sizeof(*writer));
     if (!writer) return NULL;
 
     writer->page_writer = carquet_page_writer_create(
@@ -169,7 +245,7 @@ carquet_column_writer_internal_t* carquet_column_writer_create(
         type_length, compression_level);
 
     if (!writer->page_writer) {
-        free(writer);
+        carquet_mem_free(writer);
         return NULL;
     }
 
@@ -187,6 +263,22 @@ carquet_column_writer_internal_t* carquet_column_writer_create(
     writer->target_page_size = target_page_size > 0 ? target_page_size : (1024 * 1024);
     writer->max_page_size = writer->target_page_size * 2;
 
+    /* Dictionary encoding is used when the requested encoding is a dictionary
+     * encoding AND the physical type is eligible. INT96, BOOLEAN and
+     * FIXED_LEN_BYTE_ARRAY have no dictionary encoder, so they keep PLAIN. */
+    bool dict_eligible_type =
+        type == CARQUET_PHYSICAL_INT32 ||
+        type == CARQUET_PHYSICAL_INT64 ||
+        type == CARQUET_PHYSICAL_FLOAT ||
+        type == CARQUET_PHYSICAL_DOUBLE ||
+        type == CARQUET_PHYSICAL_BYTE_ARRAY;
+    writer->use_dictionary = dict_eligible_type &&
+        (encoding == CARQUET_ENCODING_RLE_DICTIONARY ||
+         encoding == CARQUET_ENCODING_PLAIN_DICTIONARY);
+    writer->dictionary_page_size_limit = 1024 * 1024;
+    carquet_buffer_init(&writer->dict_values);
+    carquet_buffer_init(&writer->dict_ba_storage);
+
     return writer;
 }
 
@@ -195,16 +287,21 @@ void carquet_column_writer_destroy(carquet_column_writer_internal_t* writer) {
         if (writer->page_writer) {
             carquet_page_writer_destroy(writer->page_writer);
         }
-        free(writer->min_value);
-        free(writer->max_value);
+        carquet_mem_free(writer->min_value);
+        carquet_mem_free(writer->max_value);
         carquet_buffer_destroy(&writer->column_buffer);
+        carquet_buffer_destroy(&writer->dict_values);
+        carquet_buffer_destroy(&writer->dict_ba_storage);
+        carquet_mem_free(writer->dict_ba);
+        carquet_mem_free(writer->dict_def_levels);
+        carquet_mem_free(writer->dict_rep_levels);
 
         /* Free path strings */
         if (writer->path_in_schema) {
             for (int i = 0; i < writer->path_depth; i++) {
-                free(writer->path_in_schema[i]);
+                carquet_mem_free(writer->path_in_schema[i]);
             }
-            free(writer->path_in_schema);
+            carquet_mem_free(writer->path_in_schema);
         }
 
         if (writer->bloom_filter) {
@@ -217,7 +314,7 @@ void carquet_column_writer_destroy(carquet_column_writer_internal_t* writer) {
             carquet_offset_index_builder_destroy(writer->offset_index);
         }
 
-        free(writer);
+        carquet_mem_free(writer);
     }
 }
 
@@ -225,6 +322,19 @@ void carquet_column_writer_set_crc(carquet_column_writer_internal_t* writer, boo
     if (writer) {
         carquet_page_writer_set_crc(writer->page_writer, enabled);
     }
+}
+
+void carquet_column_writer_set_data_page_v2(
+    carquet_column_writer_internal_t* writer, bool enabled) {
+    if (writer) {
+        carquet_page_writer_set_data_page_v2(writer->page_writer, enabled);
+    }
+}
+
+const parquet_geospatial_statistics_t* carquet_column_writer_get_geo_stats(
+    const carquet_column_writer_internal_t* writer) {
+    if (!writer) return NULL;
+    return carquet_page_writer_get_geo_stats(writer->page_writer);
 }
 
 void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
@@ -244,12 +354,25 @@ void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
     writer->page_row_offset = 0;
     writer->column_file_offset = 0;
 
+    carquet_buffer_clear(&writer->dict_values);
+    carquet_buffer_clear(&writer->dict_ba_storage);
+    writer->dict_value_count = 0;
+    writer->dict_def_count = 0;
+    writer->dict_rep_count = 0;
+    writer->dict_total_rows = 0;
+    writer->dict_total_nulls = 0;
+    writer->has_dictionary_page = false;
+    writer->dictionary_page_size_bytes = 0;
+
     if (writer->bloom_filter) {
         carquet_bloom_filter_destroy(writer->bloom_filter);
         writer->bloom_filter = NULL;
     }
     if (writer->bloom_ndv > 0) {
-        writer->bloom_filter = carquet_bloom_filter_create_with_ndv(writer->bloom_ndv, 0.01);
+        double fpp = (writer->bloom_fpp > 0.0 && writer->bloom_fpp < 1.0)
+                         ? writer->bloom_fpp : 0.01;
+        writer->bloom_filter = carquet_bloom_filter_create_with_ndv(
+            writer->bloom_ndv, fpp);
     }
 
     if (writer->column_index) {
@@ -336,6 +459,20 @@ static int compare_stat_values(carquet_physical_type_t type,
                 if (av > bv) return 1;
                 return 0;
             }
+            case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY: {
+                /* FLOAT16 is ordered by represented value, not lexicographic. */
+                if (logical_type &&
+                    logical_type->id == CARQUET_LOGICAL_FLOAT16 && alen == 2) {
+                    float av = carquet_half_to_float(
+                        (uint16_t)(a[0] | (a[1] << 8)));
+                    float bv = carquet_half_to_float(
+                        (uint16_t)(b[0] | (b[1] << 8)));
+                    if (av < bv) return -1;
+                    if (av > bv) return 1;
+                    return 0;
+                }
+                break;
+            }
             default:
                 break;
         }
@@ -353,7 +490,7 @@ static carquet_status_t column_stats_grow(uint8_t** buf, size_t* cap, size_t nee
     if (need <= *cap) return CARQUET_OK;
     size_t new_cap = *cap == 0 ? 64 : *cap;
     while (new_cap < need) new_cap *= 2;
-    uint8_t* p = realloc(*buf, new_cap);
+    uint8_t* p = carquet_mem_realloc(*buf, new_cap);
     if (!p) return CARQUET_ERROR_OUT_OF_MEMORY;
     *buf = p;
     *cap = new_cap;
@@ -501,10 +638,8 @@ static void bloom_filter_insert_chunk(
 
     int64_t num_non_null = num_values;
     if (def_levels && writer->max_def_level > 0) {
-        num_non_null = 0;
-        for (int64_t i = 0; i < num_values; i++) {
-            if (def_levels[i] == writer->max_def_level) num_non_null++;
-        }
+        num_non_null = carquet_dispatch_count_non_nulls(
+            def_levels, num_values, writer->max_def_level);
     }
 
     switch (writer->type) {
@@ -550,6 +685,109 @@ static void bloom_filter_insert_chunk(
     }
 }
 
+/* ============================================================================
+ * Dictionary Accumulation (chunk-buffered path)
+ * ============================================================================
+ */
+
+static carquet_status_t dict_levels_reserve(int16_t** buf, size_t* cap,
+                                             int64_t need) {
+    if ((size_t)need <= *cap) return CARQUET_OK;
+    size_t new_cap = *cap == 0 ? 4096 : *cap;
+    while (new_cap < (size_t)need) new_cap *= 2;
+    int16_t* p = carquet_mem_realloc(*buf, new_cap * sizeof(int16_t));
+    if (!p) return CARQUET_ERROR_OUT_OF_MEMORY;
+    *buf = p;
+    *cap = new_cap;
+    return CARQUET_OK;
+}
+
+/* Accumulate one batch into the chunk-wide dictionary buffers. Non-null
+ * values are appended packed; all def/rep levels for every logical row are
+ * preserved so the eventual data page reproduces them exactly. */
+static carquet_status_t dict_accumulate(
+    carquet_column_writer_internal_t* writer,
+    const void* values,
+    int64_t num_values,
+    const int16_t* def_levels,
+    const int16_t* rep_levels) {
+
+    int64_t num_non_null = num_values;
+    if (def_levels && writer->max_def_level > 0) {
+        num_non_null = carquet_dispatch_count_non_nulls(
+            def_levels, num_values, writer->max_def_level);
+    }
+    writer->dict_total_rows += num_values;
+    writer->dict_total_nulls += (num_values - num_non_null);
+
+    /* Append non-null values. */
+    if (writer->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
+        const carquet_byte_array_t* arr = (const carquet_byte_array_t*)values;
+        if ((size_t)(writer->dict_value_count + num_non_null) >
+            writer->dict_ba_capacity) {
+            size_t nc = writer->dict_ba_capacity == 0 ? 1024
+                                                      : writer->dict_ba_capacity;
+            while (nc < (size_t)(writer->dict_value_count + num_non_null))
+                nc *= 2;
+            carquet_byte_array_t* p = carquet_mem_realloc(writer->dict_ba,
+                                              nc * sizeof(*p));
+            if (!p) return CARQUET_ERROR_OUT_OF_MEMORY;
+            writer->dict_ba = p;
+            writer->dict_ba_capacity = nc;
+        }
+        for (int64_t i = 0; i < num_non_null; i++) {
+            /* Store offsets relative to dict_ba_storage; resolve to pointers
+             * after all batches accumulated (storage may realloc). */
+            carquet_byte_array_t* slot =
+                &writer->dict_ba[writer->dict_value_count + i];
+            slot->length = arr[i].length;
+            slot->data = (uint8_t*)(uintptr_t)writer->dict_ba_storage.size;
+            carquet_status_t s = carquet_buffer_append(
+                &writer->dict_ba_storage, arr[i].data,
+                (size_t)arr[i].length);
+            if (s != CARQUET_OK) return s;
+        }
+    } else {
+        size_t stride = physical_type_stride(writer->type,
+                                             writer->type_length);
+        carquet_status_t s = carquet_buffer_append(
+            &writer->dict_values, (const uint8_t*)values,
+            (size_t)num_non_null * stride);
+        if (s != CARQUET_OK) return s;
+    }
+    writer->dict_value_count += num_non_null;
+
+    /* Append def/rep levels. */
+    if (writer->max_def_level > 0) {
+        carquet_status_t s = dict_levels_reserve(
+            &writer->dict_def_levels, &writer->dict_def_capacity,
+            writer->dict_def_count + num_values);
+        if (s != CARQUET_OK) return s;
+        if (def_levels) {
+            memcpy(writer->dict_def_levels + writer->dict_def_count,
+                   def_levels, (size_t)num_values * sizeof(int16_t));
+        } else {
+            carquet_dispatch_fill_def_levels(
+                writer->dict_def_levels + writer->dict_def_count,
+                num_values,
+                writer->max_def_level);
+        }
+        writer->dict_def_count += num_values;
+    }
+    if (writer->max_rep_level > 0 && rep_levels) {
+        carquet_status_t s = dict_levels_reserve(
+            &writer->dict_rep_levels, &writer->dict_rep_capacity,
+            writer->dict_rep_count + num_values);
+        if (s != CARQUET_OK) return s;
+        memcpy(writer->dict_rep_levels + writer->dict_rep_count,
+               rep_levels, (size_t)num_values * sizeof(int16_t));
+        writer->dict_rep_count += num_values;
+    }
+
+    bloom_filter_insert_chunk(writer, values, num_values, def_levels);
+    return CARQUET_OK;
+}
+
 carquet_status_t carquet_column_writer_write_batch(
     carquet_column_writer_internal_t* writer,
     const void* values,
@@ -559,6 +797,14 @@ carquet_status_t carquet_column_writer_write_batch(
 
     if (!writer || !values) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (writer->use_dictionary) {
+        carquet_status_t s = dict_accumulate(writer, values, num_values,
+                                             def_levels, rep_levels);
+        if (s != CARQUET_OK) return s;
+        writer->total_values += num_values;
+        return CARQUET_OK;
     }
 
     /* For fixed-size types, split large batches into page-sized chunks.
@@ -580,6 +826,11 @@ carquet_status_t carquet_column_writer_write_batch(
             expected += expected / 50;
             carquet_buffer_reserve(&writer->column_buffer, expected);
         }
+    }
+
+    /* Honor an explicit write_batch_size cap for all physical types. */
+    if (writer->write_batch_size > 0 && writer->write_batch_size < max_chunk) {
+        max_chunk = writer->write_batch_size;
     }
 
     const uint8_t* val_bytes = (const uint8_t*)values;
@@ -607,8 +858,12 @@ carquet_status_t carquet_column_writer_write_batch(
 
         offset += chunk;
 
-        /* Flush page when it reaches target size */
-        if (carquet_page_writer_estimated_size(writer->page_writer) >= writer->target_page_size) {
+        /* Flush page when it reaches target size, or (when configured) when
+         * it reaches the row-count cap. The row-count check is guarded by a
+         * cheap > 0 test first so it costs nothing when the knob is unset. */
+        if (carquet_page_writer_estimated_size(writer->page_writer) >= writer->target_page_size ||
+            (writer->max_rows_per_page > 0 &&
+             carquet_page_writer_num_values(writer->page_writer) >= writer->max_rows_per_page)) {
             status = flush_current_page(writer);
             if (status != CARQUET_OK) return status;
         }
@@ -622,6 +877,274 @@ carquet_status_t carquet_column_writer_write_batch(
  * ============================================================================
  */
 
+/* Count dictionary entries from the PLAIN dictionary payload. Fixed types:
+ * payload_size / stride. BYTE_ARRAY: walk 4-byte LE length prefixes. */
+static int32_t dict_entry_count(carquet_physical_type_t type,
+                                int32_t type_length,
+                                const uint8_t* payload, size_t size) {
+    if (type == CARQUET_PHYSICAL_BYTE_ARRAY) {
+        int32_t n = 0;
+        size_t off = 0;
+        while (off + 4 <= size) {
+            uint32_t len = (uint32_t)payload[off] |
+                           ((uint32_t)payload[off + 1] << 8) |
+                           ((uint32_t)payload[off + 2] << 16) |
+                           ((uint32_t)payload[off + 3] << 24);
+            off += 4 + len;
+            n++;
+        }
+        return n;
+    }
+    size_t stride = physical_type_stride(type, type_length);
+    return stride ? (int32_t)(size / stride) : 0;
+}
+
+/* Compute min/max byte representation across the accumulated non-null values
+ * so the RLE_DICTIONARY data page header carries the same stats the PLAIN
+ * path would. */
+static void dict_compute_min_max(carquet_column_writer_internal_t* writer,
+                                 const uint8_t** min_out, size_t* min_len,
+                                 const uint8_t** max_out, size_t* max_len) {
+    *min_out = NULL; *max_out = NULL; *min_len = 0; *max_len = 0;
+    if (writer->dict_value_count == 0) return;
+
+    if (writer->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
+        const uint8_t* base = writer->dict_ba_storage.data;
+        int64_t mn = 0, mx = 0;
+        for (int64_t i = 1; i < writer->dict_value_count; i++) {
+            const uint8_t* vi = base + (uintptr_t)writer->dict_ba[i].data;
+            const uint8_t* vmn = base + (uintptr_t)writer->dict_ba[mn].data;
+            const uint8_t* vmx = base + (uintptr_t)writer->dict_ba[mx].data;
+            if (compare_stat_values(writer->type, &writer->logical_type,
+                    vi, (size_t)writer->dict_ba[i].length,
+                    vmn, (size_t)writer->dict_ba[mn].length) < 0) mn = i;
+            if (compare_stat_values(writer->type, &writer->logical_type,
+                    vi, (size_t)writer->dict_ba[i].length,
+                    vmx, (size_t)writer->dict_ba[mx].length) > 0) mx = i;
+        }
+        *min_out = writer->dict_ba_storage.data +
+                   (uintptr_t)writer->dict_ba[mn].data;
+        *min_len = (size_t)writer->dict_ba[mn].length;
+        *max_out = writer->dict_ba_storage.data +
+                   (uintptr_t)writer->dict_ba[mx].data;
+        *max_len = (size_t)writer->dict_ba[mx].length;
+        return;
+    }
+
+    size_t stride = physical_type_stride(writer->type, writer->type_length);
+    const uint8_t* base = writer->dict_values.data;
+    size_t mn = 0, mx = 0;
+    for (int64_t i = 1; i < writer->dict_value_count; i++) {
+        if (compare_stat_values(writer->type, &writer->logical_type,
+                base + i * stride, stride,
+                base + mn * stride, stride) < 0) mn = (size_t)i;
+        if (compare_stat_values(writer->type, &writer->logical_type,
+                base + i * stride, stride,
+                base + mx * stride, stride) > 0) mx = (size_t)i;
+    }
+    *min_out = base + mn * stride;
+    *min_len = stride;
+    *max_out = base + mx * stride;
+    *max_len = stride;
+}
+
+/* Replay the accumulated values+levels through the normal PLAIN page path
+ * (used on dictionary fallback). Splits into target-page-sized chunks. */
+static carquet_status_t dict_fallback_to_plain(
+    carquet_column_writer_internal_t* writer) {
+
+    carquet_page_writer_set_encoding(writer->page_writer,
+                                     CARQUET_ENCODING_PLAIN);
+    writer->use_dictionary = false;
+
+    int64_t total = writer->dict_total_rows;
+    if (total == 0) return CARQUET_OK;
+
+    /* Resolve BYTE_ARRAY offsets to real pointers now that storage is final. */
+    if (writer->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
+        for (int64_t i = 0; i < writer->dict_value_count; i++) {
+            writer->dict_ba[i].data = writer->dict_ba_storage.data +
+                                      (uintptr_t)writer->dict_ba[i].data;
+        }
+    }
+
+    size_t stride = physical_type_stride(writer->type, writer->type_length);
+    int64_t row_off = 0;       /* logical rows consumed */
+    int64_t val_off = 0;       /* non-null values consumed */
+    int64_t max_rows = stride > 0
+        ? (int64_t)(writer->target_page_size / stride)
+        : 8192;
+    if (max_rows < 1024) max_rows = 1024;
+
+    while (row_off < total) {
+        int64_t rows = total - row_off;
+        if (rows > max_rows) rows = max_rows;
+
+        const int16_t* dl = writer->max_def_level > 0
+            ? writer->dict_def_levels + row_off : NULL;
+        const int16_t* rl = (writer->max_rep_level > 0 && writer->dict_rep_levels)
+            ? writer->dict_rep_levels + row_off : NULL;
+
+        /* Count non-null values in this row span. */
+        int64_t nn = rows;
+        if (dl) {
+            nn = carquet_dispatch_count_non_nulls(
+                dl, rows, writer->max_def_level);
+        }
+
+        /* add_values rejects a NULL values pointer even when every row in
+         * the span is null; pass a valid dummy in that case. */
+        static const uint8_t dummy_value[16] = {0};
+        const void* vals;
+        if (writer->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
+            vals = (nn > 0 && writer->dict_ba)
+                ? (const void*)(writer->dict_ba + val_off)
+                : (const void*)dummy_value;
+        } else {
+            vals = (nn > 0 && writer->dict_values.data)
+                ? (const void*)(writer->dict_values.data +
+                                (size_t)val_off * stride)
+                : (const void*)dummy_value;
+        }
+
+        carquet_status_t s = carquet_page_writer_add_values(
+            writer->page_writer, vals, rows, dl, rl);
+        if (s != CARQUET_OK) return s;
+
+        s = flush_current_page(writer);
+        if (s != CARQUET_OK) return s;
+
+        row_off += rows;
+        val_off += nn;
+    }
+    return CARQUET_OK;
+}
+
+/* Build the dictionary, decide fallback, and emit the dictionary page
+ * followed by a single RLE_DICTIONARY data page. */
+static carquet_status_t finalize_dictionary(
+    carquet_column_writer_internal_t* writer) {
+
+    /* No data written to this column chunk: emit nothing, exactly like the
+     * empty PLAIN path (flush_current_page early-returns on 0 values). */
+    if (writer->dict_total_rows == 0) {
+        return CARQUET_OK;
+    }
+
+    /* All values null: there is nothing to dictionary-encode. Fall back to
+     * the PLAIN path which correctly emits a levels-only data page. */
+    if (writer->dict_value_count == 0) {
+        return dict_fallback_to_plain(writer);
+    }
+
+    /* Resolve BYTE_ARRAY offsets to pointers for the encoder (dict_value_count
+     * > 0 here; the empty/all-null cases returned above). */
+    carquet_byte_array_t* ba_resolved = NULL;
+    if (writer->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
+        ba_resolved = carquet_mem_malloc((size_t)writer->dict_value_count *
+                             sizeof(carquet_byte_array_t));
+        if (!ba_resolved) return CARQUET_ERROR_OUT_OF_MEMORY;
+        for (int64_t i = 0; i < writer->dict_value_count; i++) {
+            ba_resolved[i].length = writer->dict_ba[i].length;
+            ba_resolved[i].data = writer->dict_ba_storage.data +
+                                  (uintptr_t)writer->dict_ba[i].data;
+        }
+    }
+
+    carquet_buffer_t dict_out, idx_out;
+    carquet_buffer_init(&dict_out);
+    carquet_buffer_init(&idx_out);
+
+    carquet_status_t status;
+    int64_t n = writer->dict_value_count;
+    bool dict_abandoned = false;
+    const void* fixed_in = (writer->type == CARQUET_PHYSICAL_BYTE_ARRAY)
+        ? NULL : (const void*)writer->dict_values.data;
+    const carquet_byte_array_t* ba_in =
+        (writer->type == CARQUET_PHYSICAL_BYTE_ARRAY) ? ba_resolved : NULL;
+
+    /* Single pass with an early-abort budget: if the PLAIN dictionary would
+     * exceed dictionary_page_size, the encoder stops immediately instead of
+     * scanning the rest of the chunk and serializing indices we would only
+     * throw away on fallback. */
+    status = carquet_dictionary_encode_capped(
+        writer->type, writer->type_length, fixed_in, ba_in, n,
+        writer->dictionary_page_size_limit,
+        &dict_out, &idx_out, &dict_abandoned);
+    carquet_mem_free(ba_resolved);
+    if (status != CARQUET_OK) {
+        carquet_buffer_destroy(&dict_out);
+        carquet_buffer_destroy(&idx_out);
+        return status;
+    }
+    if (dict_abandoned) {
+        carquet_buffer_destroy(&dict_out);
+        carquet_buffer_destroy(&idx_out);
+        return dict_fallback_to_plain(writer);
+    }
+
+    int32_t num_unique = dict_entry_count(writer->type, writer->type_length,
+                                          dict_out.data, dict_out.size);
+
+    /* The dictionary fit under the size budget, but if it is effectively
+     * all-unique it provides no benefit, so fall back to PLAIN. (This path
+     * completed a full cheap pass; only the catastrophic high-cardinality
+     * case is short-circuited by the early abort above.) */
+    if ((int64_t)num_unique >= writer->dict_value_count) {
+        carquet_buffer_destroy(&dict_out);
+        carquet_buffer_destroy(&idx_out);
+        return dict_fallback_to_plain(writer);
+    }
+
+    /* Emit the dictionary page first into the column buffer. */
+    size_t dp_size = 0;
+    int32_t dp_uncomp = 0, dp_comp = 0;
+    status = carquet_page_writer_emit_dictionary_page(
+        writer->page_writer, &writer->column_buffer,
+        dict_out.data, dict_out.size, num_unique,
+        &dp_size, &dp_uncomp, &dp_comp);
+    carquet_buffer_destroy(&dict_out);
+    if (status != CARQUET_OK) {
+        carquet_buffer_destroy(&idx_out);
+        return status;
+    }
+    writer->has_dictionary_page = true;
+    writer->dictionary_page_size_bytes = (int64_t)dp_size;
+    writer->total_uncompressed_size += dp_uncomp;
+    writer->total_compressed_size += dp_comp;
+
+    /* Stage the RLE_DICTIONARY data page. */
+    const int16_t* dl = writer->max_def_level > 0
+        ? writer->dict_def_levels : NULL;
+    const int16_t* rl = (writer->max_rep_level > 0 && writer->dict_rep_levels)
+        ? writer->dict_rep_levels : NULL;
+
+    status = carquet_page_writer_add_dictionary_indices(
+        writer->page_writer, idx_out.data, idx_out.size,
+        dl, rl, writer->dict_total_rows, writer->dict_total_nulls);
+    carquet_buffer_destroy(&idx_out);
+    if (status != CARQUET_OK) return status;
+
+    carquet_page_writer_set_encoding(writer->page_writer,
+                                     CARQUET_ENCODING_RLE_DICTIONARY);
+
+    /* Inject column statistics so the data page header matches PLAIN. */
+    const uint8_t *mn = NULL, *mx = NULL;
+    size_t mn_len = 0, mx_len = 0;
+    dict_compute_min_max(writer, &mn, &mn_len, &mx, &mx_len);
+    if (mn && mx) {
+        status = carquet_page_writer_set_min_max(writer->page_writer,
+                                                 mn, mn_len, mx, mx_len);
+        if (status != CARQUET_OK) return status;
+    }
+
+    /* flush_current_page reads stats off the page writer, finalizes the data
+     * page into column_buffer, and updates column index / offset index. The
+     * dictionary page already written is intentionally NOT a data page for
+     * offset-index purposes. */
+    return flush_current_page(writer);
+}
+
 carquet_status_t carquet_column_writer_finalize(
     carquet_column_writer_internal_t* writer,
     const uint8_t** data,
@@ -634,10 +1157,18 @@ carquet_status_t carquet_column_writer_finalize(
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
-    /* Flush any remaining data */
-    carquet_status_t status = flush_current_page(writer);
-    if (status != CARQUET_OK) {
-        return status;
+    carquet_status_t status;
+    if (writer->use_dictionary) {
+        status = finalize_dictionary(writer);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+    } else {
+        /* Flush any remaining data */
+        status = flush_current_page(writer);
+        if (status != CARQUET_OK) {
+            return status;
+        }
     }
 
     if (data) *data = writer->column_buffer.data;
@@ -684,16 +1215,77 @@ int64_t carquet_column_writer_num_values(const carquet_column_writer_internal_t*
     return writer ? writer->total_values : 0;
 }
 
+bool carquet_column_writer_has_dictionary_page(
+    const carquet_column_writer_internal_t* writer) {
+    return writer && writer->has_dictionary_page;
+}
+
+int64_t carquet_column_writer_dictionary_page_size(
+    const carquet_column_writer_internal_t* writer) {
+    return writer ? writer->dictionary_page_size_bytes : 0;
+}
+
+void carquet_column_writer_set_dictionary_page_size_limit(
+    carquet_column_writer_internal_t* writer, int64_t limit) {
+    if (writer && limit > 0) {
+        writer->dictionary_page_size_limit = (size_t)limit;
+    }
+}
+
+void carquet_column_writer_set_max_rows_per_page(
+    carquet_column_writer_internal_t* writer, int64_t max_rows) {
+    if (writer && max_rows > 0) {
+        writer->max_rows_per_page = max_rows;
+    }
+}
+
+void carquet_column_writer_set_write_batch_size(
+    carquet_column_writer_internal_t* writer, int64_t batch_size) {
+    if (writer && batch_size > 0) {
+        writer->write_batch_size = batch_size;
+    }
+}
+
 int32_t carquet_column_writer_num_pages(const carquet_column_writer_internal_t* writer) {
     return writer ? writer->num_pages : 0;
 }
 
+void carquet_column_writer_enable_bloom_filter_fpp(
+    carquet_column_writer_internal_t* writer, int64_t ndv, double fpp);
+
 void carquet_column_writer_enable_bloom_filter(
     carquet_column_writer_internal_t* writer, int64_t ndv) {
+    carquet_column_writer_enable_bloom_filter_fpp(writer, ndv, 0.01);
+}
+
+void carquet_column_writer_enable_bloom_filter_fpp(
+    carquet_column_writer_internal_t* writer, int64_t ndv, double fpp) {
     if (!writer || writer->bloom_filter) return;
     writer->bloom_ndv = ndv > 0 ? ndv : 100000;
+    writer->bloom_fpp = (fpp > 0.0 && fpp < 1.0) ? fpp : 0.01;
     writer->bloom_filter = carquet_bloom_filter_create_with_ndv(
-        writer->bloom_ndv, 0.01);
+        writer->bloom_ndv, writer->bloom_fpp);
+}
+
+/* Reconfigure (or enable) the bloom filter with explicit ndv/fpp. Safe to
+ * call before any data is written; recreates the filter if one already
+ * exists so per-column overrides take effect. */
+void carquet_column_writer_configure_bloom_filter(
+    carquet_column_writer_internal_t* writer,
+    bool enabled, int64_t ndv, double fpp) {
+    if (!writer) return;
+    if (writer->bloom_filter) {
+        carquet_bloom_filter_destroy(writer->bloom_filter);
+        writer->bloom_filter = NULL;
+    }
+    if (!enabled) {
+        writer->bloom_ndv = 0;
+        return;
+    }
+    writer->bloom_ndv = ndv > 0 ? ndv : 100000;
+    writer->bloom_fpp = (fpp > 0.0 && fpp < 1.0) ? fpp : 0.01;
+    writer->bloom_filter = carquet_bloom_filter_create_with_ndv(
+        writer->bloom_ndv, writer->bloom_fpp);
 }
 
 void carquet_column_writer_enable_page_index(

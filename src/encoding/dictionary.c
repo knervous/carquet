@@ -6,6 +6,7 @@
  * and data pages contain RLE-encoded indices into the dictionary.
  */
 
+#include "core/allocator.h"
 #include <carquet/error.h>
 #include <carquet/types.h>
 #include "rle.h"
@@ -43,7 +44,7 @@ extern bool carquet_dispatch_checked_gather_double(const double* dict, int32_t d
             (aligned_ptr) = (const T*)(dict_data); \
             (aligned_buf) = NULL; \
         } else { \
-            (aligned_buf) = malloc(dict_bytes); \
+            (aligned_buf) = carquet_mem_malloc(dict_bytes); \
             if (!(aligned_buf)) { \
                 (aligned_ptr) = NULL; \
             } else { \
@@ -78,6 +79,13 @@ typedef struct {
 
     size_t value_size;             /* For fixed-size types */
     bool is_variable_length;
+
+    /* Early-abort cap. When max_dict_bytes is non-zero and the PLAIN
+     * dictionary payload grows past it, the builder stops admitting new
+     * entries and sets `abandoned` so the caller can bail out to PLAIN
+     * without scanning the rest of the input or serializing indices. */
+    size_t max_dict_bytes;
+    bool abandoned;
 } dict_builder_t;
 
 #define DICT_BUILDER_INITIAL_BUCKETS 1024U  /* Must be power of 2 */
@@ -85,7 +93,7 @@ typedef struct {
 #define DICT_BUILDER_MAX_LOAD_DEN 4U
 
 static carquet_status_t dict_builder_rehash(dict_builder_t* builder, size_t new_bucket_count) {
-    dict_entry_t** new_buckets = calloc(new_bucket_count, sizeof(dict_entry_t*));
+    dict_entry_t** new_buckets = carquet_mem_calloc(new_bucket_count, sizeof(dict_entry_t*));
     if (!new_buckets) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
@@ -103,7 +111,7 @@ static carquet_status_t dict_builder_rehash(dict_builder_t* builder, size_t new_
         }
     }
 
-    free(builder->buckets);
+    carquet_mem_free(builder->buckets);
     builder->buckets = new_buckets;
     builder->num_buckets = new_bucket_count;
     return CARQUET_OK;
@@ -158,22 +166,22 @@ static carquet_status_t dict_builder_init(dict_builder_t* builder,
     memset(builder, 0, sizeof(*builder));
 
     builder->num_buckets = DICT_BUILDER_INITIAL_BUCKETS;
-    builder->buckets = calloc(builder->num_buckets, sizeof(dict_entry_t*));
+    builder->buckets = carquet_mem_calloc(builder->num_buckets, sizeof(dict_entry_t*));
     if (!builder->buckets) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
     carquet_status_t status = carquet_buffer_init_capacity(&builder->dict_buffer, 4096);
     if (status != CARQUET_OK) {
-        free(builder->buckets);
+        carquet_mem_free(builder->buckets);
         return status;
     }
 
     builder->indices_capacity = expected_count > 0 ? expected_count : 1024;
-    builder->indices = malloc(builder->indices_capacity * sizeof(uint32_t));
+    builder->indices = carquet_mem_malloc(builder->indices_capacity * sizeof(uint32_t));
     if (!builder->indices) {
         carquet_buffer_destroy(&builder->dict_buffer);
-        free(builder->buckets);
+        carquet_mem_free(builder->buckets);
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
@@ -189,14 +197,14 @@ static void dict_builder_destroy(dict_builder_t* builder) {
             dict_entry_t* entry = builder->buckets[i];
             while (entry) {
                 dict_entry_t* next = entry->next;
-                free(entry);
+                carquet_mem_free(entry);
                 entry = next;
             }
         }
-        free(builder->buckets);
+        carquet_mem_free(builder->buckets);
     }
     carquet_buffer_destroy(&builder->dict_buffer);
-    free(builder->indices);
+    carquet_mem_free(builder->indices);
 }
 
 static carquet_status_t dict_builder_add(dict_builder_t* builder,
@@ -205,7 +213,7 @@ static carquet_status_t dict_builder_add(dict_builder_t* builder,
     /* Ensure indices array has space */
     if (builder->indices_count >= builder->indices_capacity) {
         size_t new_cap = builder->indices_capacity * 2;
-        uint32_t* new_indices = realloc(builder->indices, new_cap * sizeof(uint32_t));
+        uint32_t* new_indices = carquet_mem_realloc(builder->indices, new_cap * sizeof(uint32_t));
         if (!new_indices) {
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
@@ -239,7 +247,7 @@ static carquet_status_t dict_builder_add(dict_builder_t* builder,
     }
 
     /* Add new entry */
-    dict_entry_t* new_entry = malloc(sizeof(dict_entry_t) + value_size);
+    dict_entry_t* new_entry = carquet_mem_malloc(sizeof(dict_entry_t) + value_size);
     if (!new_entry) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
@@ -262,6 +270,14 @@ static carquet_status_t dict_builder_add(dict_builder_t* builder,
 
     builder->indices[builder->indices_count++] = new_entry->index;
     builder->count++;
+
+    /* Early-abort: the dictionary is no longer worthwhile once its PLAIN
+     * payload exceeds the budget. Stop here; the caller detects `abandoned`
+     * and falls back to PLAIN without touching the rest of the input. */
+    if (builder->max_dict_bytes &&
+        builder->dict_buffer.size > builder->max_dict_bytes) {
+        builder->abandoned = true;
+    }
 
     return CARQUET_OK;
 }
@@ -455,6 +471,98 @@ carquet_status_t carquet_dictionary_encode_byte_array(
     return status;
 }
 
+/* Single-pass dictionary encoder with an early-abort budget. Dispatches on
+ * physical type, applying the same PLAIN value marshaling as the per-type
+ * encoders above. If the PLAIN dictionary payload would exceed
+ * max_dict_bytes, it stops immediately (without scanning the remaining
+ * input or serializing indices) and reports *abandoned = true so the caller
+ * can fall back to PLAIN. When max_dict_bytes is 0 the cap is disabled and
+ * this behaves exactly like the per-type encoders. */
+carquet_status_t carquet_dictionary_encode_capped(
+    carquet_physical_type_t type,
+    int32_t type_length,
+    const void* fixed_values,
+    const carquet_byte_array_t* ba_values,
+    int64_t count,
+    size_t max_dict_bytes,
+    carquet_buffer_t* dict_output,
+    carquet_buffer_t* indices_output,
+    bool* abandoned) {
+
+    if (abandoned) *abandoned = false;
+    if (count <= 0) return CARQUET_ERROR_INVALID_ARGUMENT;
+    (void)type_length;
+
+    size_t value_size;
+    bool var_len = false;
+    switch (type) {
+        case CARQUET_PHYSICAL_INT32:
+        case CARQUET_PHYSICAL_FLOAT:  value_size = 4; break;
+        case CARQUET_PHYSICAL_INT64:
+        case CARQUET_PHYSICAL_DOUBLE: value_size = 8; break;
+        case CARQUET_PHYSICAL_BYTE_ARRAY: value_size = 0; var_len = true; break;
+        default: return CARQUET_ERROR_NOT_IMPLEMENTED;
+    }
+
+    dict_builder_t builder;
+    carquet_status_t status = dict_builder_init(&builder, (size_t)count,
+                                                value_size, var_len);
+    if (status != CARQUET_OK) return status;
+    builder.max_dict_bytes = max_dict_bytes;
+
+    for (int64_t i = 0; i < count && !builder.abandoned; i++) {
+        switch (type) {
+            case CARQUET_PHYSICAL_INT32: {
+                uint8_t le[4];
+                carquet_write_i32_le(le, ((const int32_t*)fixed_values)[i]);
+                status = dict_builder_add(&builder, le, 4);
+                break;
+            }
+            case CARQUET_PHYSICAL_INT64: {
+                uint8_t le[8];
+                carquet_write_i64_le(le, ((const int64_t*)fixed_values)[i]);
+                status = dict_builder_add(&builder, le, 8);
+                break;
+            }
+            case CARQUET_PHYSICAL_FLOAT: {
+                uint8_t le[4];
+                carquet_write_f32_le(le, ((const float*)fixed_values)[i]);
+                status = dict_builder_add(&builder, le, 4);
+                break;
+            }
+            case CARQUET_PHYSICAL_DOUBLE: {
+                uint8_t le[8];
+                carquet_write_f64_le(le, ((const double*)fixed_values)[i]);
+                status = dict_builder_add(&builder, le, 8);
+                break;
+            }
+            default:  /* BYTE_ARRAY */
+                status = dict_builder_add(&builder, ba_values[i].data,
+                                          (size_t)ba_values[i].length);
+                break;
+        }
+        if (status != CARQUET_OK) {
+            dict_builder_destroy(&builder);
+            return status;
+        }
+    }
+
+    if (builder.abandoned) {
+        if (abandoned) *abandoned = true;
+        dict_builder_destroy(&builder);
+        return CARQUET_OK;
+    }
+
+    carquet_buffer_append(dict_output, builder.dict_buffer.data,
+                          builder.dict_buffer.size);
+    int bit_width = bit_width_for_count((uint32_t)builder.count);
+    carquet_buffer_append_byte(indices_output, (uint8_t)bit_width);
+    status = carquet_rle_encode_all(builder.indices, count, bit_width,
+                                    indices_output);
+    dict_builder_destroy(&builder);
+    return status;
+}
+
 /* ============================================================================
  * Dictionary Decoding
  * ============================================================================
@@ -489,7 +597,7 @@ carquet_status_t carquet_dictionary_decode_int32(
     int bit_width = indices_data[0];
 
     /* Decode RLE indices */
-    uint32_t* indices = malloc(output_count * sizeof(uint32_t));
+    uint32_t* indices = carquet_mem_malloc(output_count * sizeof(uint32_t));
     if (!indices) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
@@ -498,7 +606,7 @@ carquet_status_t carquet_dictionary_decode_int32(
         indices_data + 1, indices_size - 1, bit_width, indices, output_count);
 
     if (decoded < 0 || decoded < output_count) {
-        free(indices);
+        carquet_mem_free(indices);
         return CARQUET_ERROR_DECODE;
     }
 
@@ -516,19 +624,19 @@ carquet_status_t carquet_dictionary_decode_int32(
     size_t dict_bytes = (size_t)dict_count * sizeof(int32_t);
     ENSURE_DICT_ALIGNED(dict_data, dict_bytes, int32_t, aligned_dict, aligned_buf);
     if (!aligned_dict) {
-        free(indices);
+        carquet_mem_free(indices);
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
     if (!carquet_dispatch_checked_gather_i32(aligned_dict, dict_count,
                                              indices, decoded, output)) {
-        free(aligned_buf);
-        free(indices);
+        carquet_mem_free(aligned_buf);
+        carquet_mem_free(indices);
         return CARQUET_ERROR_DECODE;
     }
-    free(aligned_buf);
+    carquet_mem_free(aligned_buf);
 #endif
 
-    free(indices);
+    carquet_mem_free(indices);
     return CARQUET_OK;
 }
 
@@ -559,7 +667,7 @@ carquet_status_t carquet_dictionary_decode_int64(
     }
     int bit_width = indices_data[0];
 
-    uint32_t* indices = malloc(output_count * sizeof(uint32_t));
+    uint32_t* indices = carquet_mem_malloc(output_count * sizeof(uint32_t));
     if (!indices) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
@@ -568,7 +676,7 @@ carquet_status_t carquet_dictionary_decode_int64(
         indices_data + 1, indices_size - 1, bit_width, indices, output_count);
 
     if (decoded < 0 || decoded < output_count) {
-        free(indices);
+        carquet_mem_free(indices);
         return CARQUET_ERROR_DECODE;
     }
 
@@ -585,19 +693,19 @@ carquet_status_t carquet_dictionary_decode_int64(
     size_t dict_bytes = (size_t)dict_count * sizeof(int64_t);
     ENSURE_DICT_ALIGNED(dict_data, dict_bytes, int64_t, aligned_dict, aligned_buf);
     if (!aligned_dict) {
-        free(indices);
+        carquet_mem_free(indices);
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
     if (!carquet_dispatch_checked_gather_i64(aligned_dict, dict_count,
                                              indices, decoded, output)) {
-        free(aligned_buf);
-        free(indices);
+        carquet_mem_free(aligned_buf);
+        carquet_mem_free(indices);
         return CARQUET_ERROR_DECODE;
     }
-    free(aligned_buf);
+    carquet_mem_free(aligned_buf);
 #endif
 
-    free(indices);
+    carquet_mem_free(indices);
     return CARQUET_OK;
 }
 
@@ -628,7 +736,7 @@ carquet_status_t carquet_dictionary_decode_float(
     }
     int bit_width = indices_data[0];
 
-    uint32_t* indices = malloc(output_count * sizeof(uint32_t));
+    uint32_t* indices = carquet_mem_malloc(output_count * sizeof(uint32_t));
     if (!indices) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
@@ -637,7 +745,7 @@ carquet_status_t carquet_dictionary_decode_float(
         indices_data + 1, indices_size - 1, bit_width, indices, output_count);
 
     if (decoded < 0 || decoded < output_count) {
-        free(indices);
+        carquet_mem_free(indices);
         return CARQUET_ERROR_DECODE;
     }
 
@@ -654,19 +762,19 @@ carquet_status_t carquet_dictionary_decode_float(
     size_t dict_bytes = (size_t)dict_count * sizeof(float);
     ENSURE_DICT_ALIGNED(dict_data, dict_bytes, float, aligned_dict, aligned_buf);
     if (!aligned_dict) {
-        free(indices);
+        carquet_mem_free(indices);
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
     if (!carquet_dispatch_checked_gather_float(aligned_dict, dict_count,
                                                indices, decoded, output)) {
-        free(aligned_buf);
-        free(indices);
+        carquet_mem_free(aligned_buf);
+        carquet_mem_free(indices);
         return CARQUET_ERROR_DECODE;
     }
-    free(aligned_buf);
+    carquet_mem_free(aligned_buf);
 #endif
 
-    free(indices);
+    carquet_mem_free(indices);
     return CARQUET_OK;
 }
 
@@ -697,7 +805,7 @@ carquet_status_t carquet_dictionary_decode_double(
     }
     int bit_width = indices_data[0];
 
-    uint32_t* indices = malloc(output_count * sizeof(uint32_t));
+    uint32_t* indices = carquet_mem_malloc(output_count * sizeof(uint32_t));
     if (!indices) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
@@ -706,7 +814,7 @@ carquet_status_t carquet_dictionary_decode_double(
         indices_data + 1, indices_size - 1, bit_width, indices, output_count);
 
     if (decoded < 0 || decoded < output_count) {
-        free(indices);
+        carquet_mem_free(indices);
         return CARQUET_ERROR_DECODE;
     }
 
@@ -723,18 +831,18 @@ carquet_status_t carquet_dictionary_decode_double(
     size_t dict_bytes = (size_t)dict_count * sizeof(double);
     ENSURE_DICT_ALIGNED(dict_data, dict_bytes, double, aligned_dict, aligned_buf);
     if (!aligned_dict) {
-        free(indices);
+        carquet_mem_free(indices);
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
     if (!carquet_dispatch_checked_gather_double(aligned_dict, dict_count,
                                                 indices, decoded, output)) {
-        free(aligned_buf);
-        free(indices);
+        carquet_mem_free(aligned_buf);
+        carquet_mem_free(indices);
         return CARQUET_ERROR_DECODE;
     }
-    free(aligned_buf);
+    carquet_mem_free(aligned_buf);
 #endif
 
-    free(indices);
+    carquet_mem_free(indices);
     return CARQUET_OK;
 }

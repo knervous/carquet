@@ -12,6 +12,7 @@
  */
 
 #include <carquet/error.h>
+#include "simd/simd_unaligned.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -661,7 +662,7 @@ void carquet_avx512_gather_i32(const int32_t* dict, const uint32_t* indices,
 
     /* Handle remaining */
     for (; i < count; i++) {
-        output[i] = dict[indices[i]];
+        output[i] = cq_loadu(dict + (indices[i]));
     }
 }
 
@@ -681,7 +682,7 @@ void carquet_avx512_gather_i64(const int64_t* dict, const uint32_t* indices,
 
     /* Handle remaining */
     for (; i < count; i++) {
-        output[i] = dict[indices[i]];
+        output[i] = cq_loadu(dict + (indices[i]));
     }
 }
 
@@ -726,7 +727,7 @@ bool carquet_avx512_checked_gather_i32(const int32_t* dict, int32_t dict_count,
         if (idx >= (uint32_t)dict_count) {
             return false;
         }
-        output[i] = dict[idx];
+        output[i] = cq_loadu(dict + (idx));
     }
 
     return true;
@@ -753,7 +754,7 @@ bool carquet_avx512_checked_gather_i64(const int64_t* dict, int32_t dict_count,
         if (idx >= (uint32_t)dict_count) {
             return false;
         }
-        output[i] = dict[idx];
+        output[i] = cq_loadu(dict + (idx));
     }
 
     return true;

@@ -90,7 +90,7 @@ When calling `carquet_writer_write_batch()` or reading from `carquet_column_read
 | `CARQUET_PHYSICAL_BOOLEAN` | `uint8_t` | 1 | One byte per value (not bit-packed in the API) |
 | `CARQUET_PHYSICAL_INT32` | `int32_t` | 4 | |
 | `CARQUET_PHYSICAL_INT64` | `int64_t` | 8 | |
-| `CARQUET_PHYSICAL_INT96` | `carquet_int96_t` | 12 | Deprecated; legacy timestamps only |
+| `CARQUET_PHYSICAL_INT96` | `carquet_int96_t` | 12 | Deprecated legacy timestamps; readable and writable (PLAIN only, no statistics) |
 | `CARQUET_PHYSICAL_FLOAT` | `float` | 4 | IEEE 754 |
 | `CARQUET_PHYSICAL_DOUBLE` | `double` | 8 | IEEE 754 |
 | `CARQUET_PHYSICAL_BYTE_ARRAY` | `carquet_byte_array_t` | ptr+len | Variable-length; data pointer valid until batch/reader freed |

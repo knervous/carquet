@@ -6,6 +6,7 @@
  * Statistics are used for predicate pushdown and query optimization.
  */
 
+#include "core/allocator.h"
 #include <carquet/carquet.h>
 #include <carquet/error.h>
 #include "thrift/parquet_types.h"
@@ -120,7 +121,7 @@ carquet_statistics_builder_t* carquet_statistics_builder_create(
     carquet_physical_type_t type,
     int32_t type_length) {
 
-    carquet_statistics_builder_t* builder = calloc(1, sizeof(*builder));
+    carquet_statistics_builder_t* builder = carquet_mem_calloc(1, sizeof(*builder));
     if (!builder) return NULL;
 
     builder->type = type;
@@ -133,7 +134,7 @@ carquet_statistics_builder_t* carquet_statistics_builder_create(
  * Destroy a statistics builder.
  */
 void carquet_statistics_builder_destroy(carquet_statistics_builder_t* builder) {
-    free(builder);
+    carquet_mem_free(builder);
 }
 
 /**
@@ -382,7 +383,7 @@ carquet_status_t carquet_statistics_build(
             stats->min_value = carquet_arena_memdup(arena,
                 builder->min_value, builder->min_len);
         } else {
-            stats->min_value = malloc(builder->min_len);
+            stats->min_value = carquet_mem_malloc(builder->min_len);
             if (stats->min_value) {
                 memcpy(stats->min_value, builder->min_value, builder->min_len);
             }
@@ -400,7 +401,7 @@ carquet_status_t carquet_statistics_build(
             stats->max_value = carquet_arena_memdup(arena,
                 builder->max_value, builder->max_len);
         } else {
-            stats->max_value = malloc(builder->max_len);
+            stats->max_value = carquet_mem_malloc(builder->max_len);
             if (stats->max_value) {
                 memcpy(stats->max_value, builder->max_value, builder->max_len);
             }

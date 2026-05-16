@@ -12,6 +12,19 @@
 #define TEST_PASS(name) printf("[PASS] %s\n", name)
 #define TEST_FAIL(name, msg) do { printf("[FAIL] %s: %s\n", name, msg); return 1; } while(0)
 
+/* Batch column buffers may be zero-copy views into the mmap'd file and are
+ * not guaranteed to satisfy the alignment of the element type. Read elements
+ * via memcpy to avoid unaligned-load undefined behavior. */
+static inline int64_t rd_i64(const void* base, int64_t i) {
+    int64_t v; memcpy(&v, (const uint8_t*)base + i * (int64_t)sizeof v, sizeof v); return v;
+}
+static inline int32_t rd_i32(const void* base, int64_t i) {
+    int32_t v; memcpy(&v, (const uint8_t*)base + i * (int64_t)sizeof v, sizeof v); return v;
+}
+static inline double rd_f64(const void* base, int64_t i) {
+    double v; memcpy(&v, (const uint8_t*)base + i * (int64_t)sizeof v, sizeof v); return v;
+}
+
 /* ============================================================================
  * Helper: Create a test file with uncompressed data
  * ============================================================================
@@ -337,10 +350,9 @@ static int test_mmap_batch_reader(void) {
         TEST_FAIL(name, "Failed to get column data");
     }
 
-    /* Verify data */
-    const int64_t* int_data = (const int64_t*)data;
+    /* Verify data (batch buffer may be an unaligned mmap view). */
     for (int64_t i = 0; i < num_rows; i++) {
-        if (int_data[i] != i * 100) {
+        if (rd_i64(data, i) != i * 100) {
             carquet_row_batch_free(batch);
             carquet_batch_reader_free(batch_reader);
             carquet_reader_close(reader);
@@ -427,7 +439,7 @@ static int test_mmap_batch_reader_page_aligned(void) {
             carquet_reader_close(reader);
             TEST_FAIL(name, "Failed to read INT64 batch column");
         }
-        ids = (const int64_t*)data;
+        ids = (const int64_t*)data;  /* compared via rd_i64 (may be unaligned) */
 
         if (carquet_row_batch_column(batch, 1, &data, &null_bitmap, &col_num_values) != CARQUET_OK ||
             !data || null_bitmap != NULL || col_num_values != batch_rows) {
@@ -439,8 +451,8 @@ static int test_mmap_batch_reader_page_aligned(void) {
         values = (const double*)data;
 
         for (int64_t i = 0; i < batch_rows; i++) {
-            if (ids[i] != expected_row * 100 ||
-                fabs(values[i] - ((double)expected_row * 3.14159)) > 1e-9) {
+            if (rd_i64(ids, i) != expected_row * 100 ||
+                fabs(rd_f64(values, i) - ((double)expected_row * 3.14159)) > 1e-9) {
                 carquet_row_batch_free(batch);
                 carquet_batch_reader_free(batch_reader);
                 carquet_reader_close(reader);
@@ -515,18 +527,18 @@ static int test_mmap_compressed_optional_batch(void) {
             TEST_FAIL(name, "Failed to read optional batch column");
         }
 
-        const int32_t* values = (const int32_t*)data;
+        const int32_t* values = (const int32_t*)data;  /* via rd_i32 (may be unaligned) */
         for (int64_t i = 0; i < n; i++) {
             int64_t row = total + i;
             int is_present = (null_bitmap[i / 8] >> (i % 8)) & 1;
             if ((row % 2) == 0) {
-                if (!is_present || values[i] != row * 10) {
+                if (!is_present || rd_i32(values, i) != row * 10) {
                     carquet_row_batch_free(batch);
                     carquet_batch_reader_free(batch_reader);
                     carquet_reader_close(reader);
                     TEST_FAIL(name, "present optional value mismatch");
                 }
-            } else if (is_present || values[i] != 0) {
+            } else if (is_present || rd_i32(values, i) != 0) {
                 carquet_row_batch_free(batch);
                 carquet_batch_reader_free(batch_reader);
                 carquet_reader_close(reader);

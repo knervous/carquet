@@ -10,6 +10,7 @@
  */
 
 #include <carquet/error.h>
+#include "simd/simd_unaligned.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -575,28 +576,28 @@ void carquet_sse_gather_i32(const int32_t* dict, const uint32_t* indices,
         __builtin_prefetch(dict + indices[i + 6], 0, 0);
 
         /* First 4 values */
-        int32_t v0 = dict[indices[i + 0]];
-        int32_t v1 = dict[indices[i + 1]];
-        int32_t v2 = dict[indices[i + 2]];
-        int32_t v3 = dict[indices[i + 3]];
+        int32_t v0 = cq_loadu(dict + (indices[i + 0]));
+        int32_t v1 = cq_loadu(dict + (indices[i + 1]));
+        int32_t v2 = cq_loadu(dict + (indices[i + 2]));
+        int32_t v3 = cq_loadu(dict + (indices[i + 3]));
         __m128i result0 = _mm_set_epi32(v3, v2, v1, v0);
         _mm_storeu_si128((__m128i*)(output + i), result0);
 
         /* Second 4 values */
-        int32_t v4 = dict[indices[i + 4]];
-        int32_t v5 = dict[indices[i + 5]];
-        int32_t v6 = dict[indices[i + 6]];
-        int32_t v7 = dict[indices[i + 7]];
+        int32_t v4 = cq_loadu(dict + (indices[i + 4]));
+        int32_t v5 = cq_loadu(dict + (indices[i + 5]));
+        int32_t v6 = cq_loadu(dict + (indices[i + 6]));
+        int32_t v7 = cq_loadu(dict + (indices[i + 7]));
         __m128i result1 = _mm_set_epi32(v7, v6, v5, v4);
         _mm_storeu_si128((__m128i*)(output + i + 4), result1);
     }
 
     /* Process remaining 4 at a time */
     for (; i + 4 <= count; i += 4) {
-        int32_t v0 = dict[indices[i + 0]];
-        int32_t v1 = dict[indices[i + 1]];
-        int32_t v2 = dict[indices[i + 2]];
-        int32_t v3 = dict[indices[i + 3]];
+        int32_t v0 = cq_loadu(dict + (indices[i + 0]));
+        int32_t v1 = cq_loadu(dict + (indices[i + 1]));
+        int32_t v2 = cq_loadu(dict + (indices[i + 2]));
+        int32_t v3 = cq_loadu(dict + (indices[i + 3]));
 
         __m128i result = _mm_set_epi32(v3, v2, v1, v0);
         _mm_storeu_si128((__m128i*)(output + i), result);
@@ -604,7 +605,7 @@ void carquet_sse_gather_i32(const int32_t* dict, const uint32_t* indices,
 
     /* Handle remaining */
     for (; i < count; i++) {
-        output[i] = dict[indices[i]];
+        output[i] = cq_loadu(dict + (indices[i]));
     }
 }
 
@@ -628,35 +629,35 @@ void carquet_sse_gather_float(const float* dict, const uint32_t* indices,
         __builtin_prefetch(dict + indices[i + 6], 0, 0);
 
         /* First 4 values */
-        float v0 = dict[indices[i + 0]];
-        float v1 = dict[indices[i + 1]];
-        float v2 = dict[indices[i + 2]];
-        float v3 = dict[indices[i + 3]];
+        float v0 = cq_loadu(dict + (indices[i + 0]));
+        float v1 = cq_loadu(dict + (indices[i + 1]));
+        float v2 = cq_loadu(dict + (indices[i + 2]));
+        float v3 = cq_loadu(dict + (indices[i + 3]));
         __m128 result0 = _mm_set_ps(v3, v2, v1, v0);
         _mm_storeu_ps(output + i, result0);
 
         /* Second 4 values */
-        float v4 = dict[indices[i + 4]];
-        float v5 = dict[indices[i + 5]];
-        float v6 = dict[indices[i + 6]];
-        float v7 = dict[indices[i + 7]];
+        float v4 = cq_loadu(dict + (indices[i + 4]));
+        float v5 = cq_loadu(dict + (indices[i + 5]));
+        float v6 = cq_loadu(dict + (indices[i + 6]));
+        float v7 = cq_loadu(dict + (indices[i + 7]));
         __m128 result1 = _mm_set_ps(v7, v6, v5, v4);
         _mm_storeu_ps(output + i + 4, result1);
     }
 
     /* Process remaining 4 at a time */
     for (; i + 4 <= count; i += 4) {
-        float v0 = dict[indices[i + 0]];
-        float v1 = dict[indices[i + 1]];
-        float v2 = dict[indices[i + 2]];
-        float v3 = dict[indices[i + 3]];
+        float v0 = cq_loadu(dict + (indices[i + 0]));
+        float v1 = cq_loadu(dict + (indices[i + 1]));
+        float v2 = cq_loadu(dict + (indices[i + 2]));
+        float v3 = cq_loadu(dict + (indices[i + 3]));
 
         __m128 result = _mm_set_ps(v3, v2, v1, v0);
         _mm_storeu_ps(output + i, result);
     }
 
     for (; i < count; i++) {
-        output[i] = dict[indices[i]];
+        output[i] = cq_loadu(dict + (indices[i]));
     }
 }
 
@@ -677,10 +678,10 @@ void carquet_sse_gather_i64(const int64_t* dict, const uint32_t* indices,
         __builtin_prefetch(dict + indices[i], 0, 0);
         __builtin_prefetch(dict + indices[i + 2], 0, 0);
 
-        int64_t v0 = dict[indices[i + 0]];
-        int64_t v1 = dict[indices[i + 1]];
-        int64_t v2 = dict[indices[i + 2]];
-        int64_t v3 = dict[indices[i + 3]];
+        int64_t v0 = cq_loadu(dict + (indices[i + 0]));
+        int64_t v1 = cq_loadu(dict + (indices[i + 1]));
+        int64_t v2 = cq_loadu(dict + (indices[i + 2]));
+        int64_t v3 = cq_loadu(dict + (indices[i + 3]));
 
         __m128i result0 = _mm_set_epi64x(v1, v0);
         __m128i result1 = _mm_set_epi64x(v3, v2);
@@ -690,7 +691,7 @@ void carquet_sse_gather_i64(const int64_t* dict, const uint32_t* indices,
 
     /* Handle remaining */
     for (; i < count; i++) {
-        output[i] = dict[indices[i]];
+        output[i] = cq_loadu(dict + (indices[i]));
     }
 }
 
@@ -711,10 +712,10 @@ void carquet_sse_gather_double(const double* dict, const uint32_t* indices,
         __builtin_prefetch(dict + indices[i], 0, 0);
         __builtin_prefetch(dict + indices[i + 2], 0, 0);
 
-        double v0 = dict[indices[i + 0]];
-        double v1 = dict[indices[i + 1]];
-        double v2 = dict[indices[i + 2]];
-        double v3 = dict[indices[i + 3]];
+        double v0 = cq_loadu(dict + (indices[i + 0]));
+        double v1 = cq_loadu(dict + (indices[i + 1]));
+        double v2 = cq_loadu(dict + (indices[i + 2]));
+        double v3 = cq_loadu(dict + (indices[i + 3]));
 
         __m128d result0 = _mm_set_pd(v1, v0);
         __m128d result1 = _mm_set_pd(v3, v2);
@@ -724,7 +725,7 @@ void carquet_sse_gather_double(const double* dict, const uint32_t* indices,
 
     /* Handle remaining */
     for (; i < count; i++) {
-        output[i] = dict[indices[i]];
+        output[i] = cq_loadu(dict + (indices[i]));
     }
 }
 
@@ -753,10 +754,10 @@ bool carquet_sse_checked_gather_i32(const int32_t* dict, int32_t dict_count,
         __builtin_prefetch(dict + indices[i + 2], 0, 0);
 
         __m128i result = _mm_set_epi32(
-            dict[indices[i + 3]],
-            dict[indices[i + 2]],
-            dict[indices[i + 1]],
-            dict[indices[i + 0]]);
+            cq_loadu(dict + (indices[i + 3])),
+            cq_loadu(dict + (indices[i + 2])),
+            cq_loadu(dict + (indices[i + 1])),
+            cq_loadu(dict + (indices[i + 0])));
         _mm_storeu_si128((__m128i*)(output + i), result);
     }
 
@@ -765,7 +766,7 @@ bool carquet_sse_checked_gather_i32(const int32_t* dict, int32_t dict_count,
         if (idx >= limit) {
             return false;
         }
-        output[i] = dict[idx];
+        output[i] = cq_loadu(dict + (idx));
     }
 
     return true;
@@ -786,8 +787,8 @@ bool carquet_sse_checked_gather_i64(const int64_t* dict, int32_t dict_count,
         __builtin_prefetch(dict + indices[i], 0, 0);
         __builtin_prefetch(dict + indices[i + 2], 0, 0);
 
-        __m128i result0 = _mm_set_epi64x(dict[indices[i + 1]], dict[indices[i + 0]]);
-        __m128i result1 = _mm_set_epi64x(dict[indices[i + 3]], dict[indices[i + 2]]);
+        __m128i result0 = _mm_set_epi64x(cq_loadu(dict + (indices[i + 1])), cq_loadu(dict + (indices[i + 0])));
+        __m128i result1 = _mm_set_epi64x(cq_loadu(dict + (indices[i + 3])), cq_loadu(dict + (indices[i + 2])));
         _mm_storeu_si128((__m128i*)(output + i), result0);
         _mm_storeu_si128((__m128i*)(output + i + 2), result1);
     }
@@ -797,7 +798,7 @@ bool carquet_sse_checked_gather_i64(const int64_t* dict, int32_t dict_count,
         if (idx >= limit) {
             return false;
         }
-        output[i] = dict[idx];
+        output[i] = cq_loadu(dict + (idx));
     }
 
     return true;

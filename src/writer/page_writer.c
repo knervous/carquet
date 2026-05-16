@@ -6,9 +6,12 @@
  * definition/repetition levels, and compression.
  */
 
+#include "core/allocator.h"
 #include <carquet/carquet.h>
 #include <carquet/error.h>
 #include "core/buffer.h"
+#include "core/float16.h"
+#include "core/geo_wkb.h"
 #include "encoding/plain.h"
 #include "encoding/rle.h"
 #include "thrift/thrift_decode.h"
@@ -55,6 +58,25 @@ extern carquet_status_t carquet_byte_stream_split_encode_double(
     uint8_t* output,
     size_t output_capacity,
     size_t* bytes_written);
+extern carquet_status_t carquet_byte_stream_split_encode(
+    const uint8_t* values,
+    int64_t count,
+    int32_t type_length,
+    uint8_t* output,
+    size_t output_capacity,
+    size_t* bytes_written);
+extern carquet_status_t carquet_delta_encode_int32(
+    const int32_t* values, int32_t num_values,
+    uint8_t* data, size_t data_capacity, size_t* bytes_written);
+extern carquet_status_t carquet_delta_encode_int64(
+    const int64_t* values, int32_t num_values,
+    uint8_t* data, size_t data_capacity, size_t* bytes_written);
+extern carquet_status_t carquet_delta_length_encode(
+    const carquet_byte_array_t* values, int32_t num_values,
+    carquet_buffer_t* output);
+extern carquet_status_t carquet_delta_strings_encode(
+    const carquet_byte_array_t* values, int32_t num_values,
+    carquet_buffer_t* output);
 extern int64_t carquet_dispatch_count_non_nulls(const int16_t* def_levels, int64_t count,
                                                  int16_t max_def_level);
 extern void carquet_dispatch_minmax_i32(const int32_t* values, int64_t count,
@@ -98,6 +120,9 @@ typedef struct carquet_page_writer {
 
     int64_t num_values;
     int64_t num_nulls;
+    int64_t num_rows;        /* Logical rows (rep_level==0); used by V2 only */
+
+    bool data_page_v2;       /* Emit DATA_PAGE_V2 instead of DATA_PAGE */
 
     int32_t compression_level;   /* 0 = use codec default */
 
@@ -127,6 +152,13 @@ typedef struct carquet_page_writer {
     /* Compatibility alias: many code paths use a single "size" when the type
      * has fixed-width stats. Numeric paths set both _size fields equal. */
     size_t min_max_size;
+
+    /* GeospatialStatistics accumulator (GEOMETRY/GEOGRAPHY columns). Unlike
+     * min/max it is NOT cleared per page — it spans the whole column chunk
+     * (one page_writer lifetime), so the column writer reads it once at
+     * finalize. */
+    bool geo_enabled;
+    parquet_geospatial_statistics_t geo_stats;
 } carquet_page_writer_t;
 
 static bool stats_order_defined_for_logical(const carquet_logical_type_t* lt) {
@@ -153,7 +185,7 @@ static carquet_status_t stats_grow(uint8_t** buf, size_t* cap, size_t need) {
     if (need <= *cap) return CARQUET_OK;
     size_t new_cap = *cap == 0 ? 64 : *cap;
     while (new_cap < need) new_cap *= 2;
-    uint8_t* p = realloc(*buf, new_cap);
+    uint8_t* p = carquet_mem_realloc(*buf, new_cap);
     if (!p) return CARQUET_ERROR_OUT_OF_MEMORY;
     *buf = p;
     *cap = new_cap;
@@ -203,7 +235,7 @@ carquet_page_writer_t* carquet_page_writer_create(
     int32_t type_length,
     int32_t compression_level) {
 
-    carquet_page_writer_t* writer = calloc(1, sizeof(carquet_page_writer_t));
+    carquet_page_writer_t* writer = carquet_mem_calloc(1, sizeof(carquet_page_writer_t));
     if (!writer) return NULL;
 
     carquet_buffer_init(&writer->values_buffer);
@@ -216,6 +248,12 @@ carquet_page_writer_t* carquet_page_writer_create(
     writer->type = type;
     if (logical_type) {
         writer->logical_type = *logical_type;
+        writer->geo_enabled =
+            (logical_type->id == CARQUET_LOGICAL_GEOMETRY ||
+             logical_type->id == CARQUET_LOGICAL_GEOGRAPHY);
+    }
+    if (writer->geo_enabled) {
+        carquet_geo_stats_init(&writer->geo_stats);
     }
     writer->encoding = encoding;
     writer->compression = compression;
@@ -237,9 +275,9 @@ void carquet_page_writer_destroy(carquet_page_writer_t* writer) {
         carquet_buffer_destroy(&writer->staging_buffer);
         carquet_buffer_destroy(&writer->page_buffer);
         carquet_buffer_destroy(&writer->compress_buffer);
-        free(writer->min_value);
-        free(writer->max_value);
-        free(writer);
+        carquet_mem_free(writer->min_value);
+        carquet_mem_free(writer->max_value);
+        carquet_mem_free(writer);
     }
 }
 
@@ -252,6 +290,7 @@ void carquet_page_writer_reset(carquet_page_writer_t* writer) {
     carquet_buffer_clear(&writer->compress_buffer);
     writer->num_values = 0;
     writer->num_nulls = 0;
+    writer->num_rows = 0;
     writer->has_min_max = false;
     writer->min_max_size = 0;
     writer->bool_seen_false = false;
@@ -274,11 +313,15 @@ static int bit_width_for_max(int16_t max_level) {
     return width;
 }
 
+/* V1 data pages prefix each level section with a 4-byte little-endian byte
+ * length; V2 data pages omit it (the length lives in DataPageHeaderV2), so
+ * with_prefix is false for V2. */
 static carquet_status_t encode_levels(
     const int16_t* levels,
     int64_t count,
     int16_t max_level,
-    carquet_buffer_t* output) {
+    carquet_buffer_t* output,
+    bool with_prefix) {
 
     if (max_level == 0) {
         return CARQUET_OK;
@@ -286,11 +329,14 @@ static carquet_status_t encode_levels(
 
     int bit_width = bit_width_for_max(max_level);
     size_t prefix_offset = output->size;
-    carquet_status_t status = carquet_buffer_append_u32_le(output, 0);
-    if (status != CARQUET_OK) {
-        return status;
+    if (with_prefix) {
+        carquet_status_t ps = carquet_buffer_append_u32_le(output, 0);
+        if (ps != CARQUET_OK) {
+            return ps;
+        }
     }
 
+    carquet_status_t status;
     size_t encoded_offset = output->size;
     if (levels) {
         status = carquet_rle_encode_levels(levels, count, bit_width, output);
@@ -314,10 +360,12 @@ static carquet_status_t encode_levels(
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
-    output->data[prefix_offset] = (uint8_t)(encoded_size & 0xFF);
-    output->data[prefix_offset + 1] = (uint8_t)((encoded_size >> 8) & 0xFF);
-    output->data[prefix_offset + 2] = (uint8_t)((encoded_size >> 16) & 0xFF);
-    output->data[prefix_offset + 3] = (uint8_t)((encoded_size >> 24) & 0xFF);
+    if (with_prefix) {
+        output->data[prefix_offset] = (uint8_t)(encoded_size & 0xFF);
+        output->data[prefix_offset + 1] = (uint8_t)((encoded_size >> 8) & 0xFF);
+        output->data[prefix_offset + 2] = (uint8_t)((encoded_size >> 16) & 0xFF);
+        output->data[prefix_offset + 3] = (uint8_t)((encoded_size >> 24) & 0xFF);
+    }
     return CARQUET_OK;
 }
 
@@ -578,11 +626,55 @@ static void update_statistics_byte_array(carquet_page_writer_t* writer,
     }
 }
 
+/* FLOAT16 min/max: ordered by the represented float value with NaNs skipped;
+ * a zero min is stored as -0.0 and a zero max as +0.0 (per the spec). The
+ * stored bytes are the original little-endian half representation of the
+ * achieving value (preserving subnormals), except the normalized zeros. */
+static void update_statistics_float16(carquet_page_writer_t* writer,
+                                       const uint8_t* values, int64_t count) {
+    static const uint8_t NEG_ZERO[2] = { 0x00, 0x80 };
+    static const uint8_t POS_ZERO[2] = { 0x00, 0x00 };
+    int have = 0;
+    float min_f = 0.0f, max_f = 0.0f;
+    uint8_t min_b[2] = {0,0}, max_b[2] = {0,0};
+
+    if (writer->has_min_max && writer->min_value_size == 2 &&
+        writer->max_value_size == 2) {
+        min_b[0] = writer->min_value[0]; min_b[1] = writer->min_value[1];
+        max_b[0] = writer->max_value[0]; max_b[1] = writer->max_value[1];
+        min_f = carquet_half_to_float((uint16_t)(min_b[0] | (min_b[1] << 8)));
+        max_f = carquet_half_to_float((uint16_t)(max_b[0] | (max_b[1] << 8)));
+        have = 1;
+    }
+
+    for (int64_t i = 0; i < count; i++) {
+        const uint8_t* v = values + i * 2;
+        float fv = carquet_half_to_float((uint16_t)(v[0] | (v[1] << 8)));
+        if (isnan(fv)) continue;
+        if (!have) { min_f = max_f = fv; min_b[0]=max_b[0]=v[0];
+                     min_b[1]=max_b[1]=v[1]; have = 1; continue; }
+        if (fv < min_f) { min_f = fv; min_b[0]=v[0]; min_b[1]=v[1]; }
+        if (fv > max_f) { max_f = fv; max_b[0]=v[0]; max_b[1]=v[1]; }
+    }
+    if (!have) return;
+
+    if (min_f == 0.0f) { min_b[0]=NEG_ZERO[0]; min_b[1]=NEG_ZERO[1]; }
+    if (max_f == 0.0f) { max_b[0]=POS_ZERO[0]; max_b[1]=POS_ZERO[1]; }
+    if (stats_set_min(writer, min_b, 2) != CARQUET_OK) return;
+    if (stats_set_max(writer, max_b, 2) != CARQUET_OK) return;
+    writer->has_min_max = true;
+    writer->min_max_size = 2;
+}
+
 static void update_statistics_flba(carquet_page_writer_t* writer,
                                     const uint8_t* values,
                                     int64_t count,
                                     int32_t type_length) {
     if (type_length <= 0 || count <= 0) return;
+    if (writer->logical_type.id == CARQUET_LOGICAL_FLOAT16 && type_length == 2) {
+        update_statistics_float16(writer, values, count);
+        return;
+    }
     size_t tl = (size_t)type_length;
     for (int64_t i = 0; i < count; i++) {
         const uint8_t* v = values + i * tl;
@@ -805,6 +897,119 @@ static carquet_status_t encode_double_values(
     return carquet_encode_plain_double(values, count, &writer->values_buffer);
 }
 
+/* Encode INT32 values honoring the non-PLAIN data encodings:
+ * DELTA_BINARY_PACKED and BYTE_STREAM_SPLIT. PLAIN is handled on the
+ * fast path by the caller. */
+static carquet_status_t encode_int32_values(
+    carquet_page_writer_t* writer, const int32_t* values, int64_t count) {
+
+    /* DELTA_BINARY_PACKED must still emit its 4-varint header for an
+     * all-null (zero value) page, otherwise the decoder hits EOF parsing
+     * the header. PLAIN/BYTE_STREAM_SPLIT legitimately produce no bytes. */
+    if (count == 0 && writer->encoding != CARQUET_ENCODING_DELTA_BINARY_PACKED) {
+        return CARQUET_OK;
+    }
+    size_t offset = writer->values_buffer.size;
+
+    if (writer->encoding == CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
+        size_t need = (size_t)count * sizeof(int32_t);
+        uint8_t* dest = carquet_buffer_advance(&writer->values_buffer, need);
+        if (!dest) return CARQUET_ERROR_OUT_OF_MEMORY;
+        size_t written = 0;
+        carquet_status_t s = carquet_byte_stream_split_encode(
+            (const uint8_t*)values, count, (int32_t)sizeof(int32_t),
+            dest, need, &written);
+        if (s != CARQUET_OK || written != need) {
+            writer->values_buffer.size = offset;
+            return s != CARQUET_OK ? s : CARQUET_ERROR_ENCODE;
+        }
+        return CARQUET_OK;
+    }
+
+    if (writer->encoding == CARQUET_ENCODING_DELTA_BINARY_PACKED) {
+        /* Delta output never exceeds plain size by more than block/miniblock
+         * headers; this bound is comfortably safe. */
+        size_t cap = (size_t)count * sizeof(int32_t) + (size_t)count + 512;
+        uint8_t* dest = carquet_buffer_advance(&writer->values_buffer, cap);
+        if (!dest) return CARQUET_ERROR_OUT_OF_MEMORY;
+        size_t written = 0;
+        carquet_status_t s = carquet_delta_encode_int32(
+            values, (int32_t)count, dest, cap, &written);
+        if (s != CARQUET_OK) { writer->values_buffer.size = offset; return s; }
+        writer->values_buffer.size = offset + written;
+        return CARQUET_OK;
+    }
+
+    return carquet_encode_plain_int32(values, count, &writer->values_buffer);
+}
+
+static carquet_status_t encode_int64_values(
+    carquet_page_writer_t* writer, const int64_t* values, int64_t count) {
+
+    /* DELTA_BINARY_PACKED must still emit its 4-varint header for an
+     * all-null (zero value) page, otherwise the decoder hits EOF parsing
+     * the header. PLAIN/BYTE_STREAM_SPLIT legitimately produce no bytes. */
+    if (count == 0 && writer->encoding != CARQUET_ENCODING_DELTA_BINARY_PACKED) {
+        return CARQUET_OK;
+    }
+    size_t offset = writer->values_buffer.size;
+
+    if (writer->encoding == CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
+        size_t need = (size_t)count * sizeof(int64_t);
+        uint8_t* dest = carquet_buffer_advance(&writer->values_buffer, need);
+        if (!dest) return CARQUET_ERROR_OUT_OF_MEMORY;
+        size_t written = 0;
+        carquet_status_t s = carquet_byte_stream_split_encode(
+            (const uint8_t*)values, count, (int32_t)sizeof(int64_t),
+            dest, need, &written);
+        if (s != CARQUET_OK || written != need) {
+            writer->values_buffer.size = offset;
+            return s != CARQUET_OK ? s : CARQUET_ERROR_ENCODE;
+        }
+        return CARQUET_OK;
+    }
+
+    if (writer->encoding == CARQUET_ENCODING_DELTA_BINARY_PACKED) {
+        size_t cap = (size_t)count * sizeof(int64_t) + (size_t)count + 512;
+        uint8_t* dest = carquet_buffer_advance(&writer->values_buffer, cap);
+        if (!dest) return CARQUET_ERROR_OUT_OF_MEMORY;
+        size_t written = 0;
+        carquet_status_t s = carquet_delta_encode_int64(
+            values, (int32_t)count, dest, cap, &written);
+        if (s != CARQUET_OK) { writer->values_buffer.size = offset; return s; }
+        writer->values_buffer.size = offset + written;
+        return CARQUET_OK;
+    }
+
+    return carquet_encode_plain_int64(values, count, &writer->values_buffer);
+}
+
+/* Encode BYTE_ARRAY values for the delta string encodings. */
+static carquet_status_t encode_byte_array_values(
+    carquet_page_writer_t* writer,
+    const carquet_byte_array_t* values, int64_t count) {
+
+    /* DELTA_LENGTH_BYTE_ARRAY and DELTA_BYTE_ARRAY must still emit their
+     * DELTA header(s) for an all-null (zero value) page, otherwise the
+     * decoder hits EOF parsing the header. PLAIN produces no bytes. */
+    if (count == 0 &&
+        writer->encoding != CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY &&
+        writer->encoding != CARQUET_ENCODING_DELTA_BYTE_ARRAY) {
+        return CARQUET_OK;
+    }
+
+    if (writer->encoding == CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY) {
+        return carquet_delta_length_encode(values, (int32_t)count,
+                                           &writer->values_buffer);
+    }
+    if (writer->encoding == CARQUET_ENCODING_DELTA_BYTE_ARRAY) {
+        return carquet_delta_strings_encode(values, (int32_t)count,
+                                            &writer->values_buffer);
+    }
+    return carquet_encode_plain_byte_array(values, count,
+                                           &writer->values_buffer);
+}
+
 /* ============================================================================
  * Value Encoding
  * ============================================================================
@@ -860,7 +1065,8 @@ carquet_status_t carquet_page_writer_add_values(
      * since Parquet requires definition levels for non-REQUIRED columns. */
     if (writer->max_def_level > 0) {
         status = encode_levels(def_levels, num_values, writer->max_def_level,
-                               &writer->def_levels_buffer);
+                               &writer->def_levels_buffer,
+                               !writer->data_page_v2);
         if (status != CARQUET_OK) {
             goto fail;
         }
@@ -869,7 +1075,8 @@ carquet_status_t carquet_page_writer_add_values(
     /* Encode repetition levels */
     if (writer->max_rep_level > 0 && rep_levels) {
         status = encode_levels(rep_levels, num_values, writer->max_rep_level,
-                               &writer->rep_levels_buffer);
+                               &writer->rep_levels_buffer,
+                               !writer->data_page_v2);
         if (status != CARQUET_OK) {
             goto fail;
         }
@@ -895,17 +1102,31 @@ carquet_status_t carquet_page_writer_add_values(
 
         case CARQUET_PHYSICAL_INT32: {
             const int32_t* ints = (const int32_t*)values;
-            status = writer->write_statistics
-                ? encode_plain_i32_with_stats(writer, ints, num_non_null)
-                : carquet_encode_plain_int32(ints, num_non_null, &writer->values_buffer);
+            if (writer->encoding != CARQUET_ENCODING_PLAIN) {
+                status = encode_int32_values(writer, ints, num_non_null);
+                if (status == CARQUET_OK && writer->write_statistics) {
+                    update_statistics_i32(writer, ints, num_non_null);
+                }
+            } else {
+                status = writer->write_statistics
+                    ? encode_plain_i32_with_stats(writer, ints, num_non_null)
+                    : carquet_encode_plain_int32(ints, num_non_null, &writer->values_buffer);
+            }
             break;
         }
 
         case CARQUET_PHYSICAL_INT64: {
             const int64_t* ints = (const int64_t*)values;
-            status = writer->write_statistics
-                ? encode_plain_i64_with_stats(writer, ints, num_non_null)
-                : carquet_encode_plain_int64(ints, num_non_null, &writer->values_buffer);
+            if (writer->encoding != CARQUET_ENCODING_PLAIN) {
+                status = encode_int64_values(writer, ints, num_non_null);
+                if (status == CARQUET_OK && writer->write_statistics) {
+                    update_statistics_i64(writer, ints, num_non_null);
+                }
+            } else {
+                status = writer->write_statistics
+                    ? encode_plain_i64_with_stats(writer, ints, num_non_null)
+                    : carquet_encode_plain_int64(ints, num_non_null, &writer->values_buffer);
+            }
             break;
         }
 
@@ -937,22 +1158,75 @@ carquet_status_t carquet_page_writer_add_values(
 
         case CARQUET_PHYSICAL_BYTE_ARRAY: {
             const carquet_byte_array_t* arrays = (const carquet_byte_array_t*)values;
-            status = carquet_encode_plain_byte_array(arrays, num_non_null,
-                                                      &writer->values_buffer);
+            status = encode_byte_array_values(writer, arrays, num_non_null);
             if (status == CARQUET_OK && writer->write_statistics) {
                 update_statistics_byte_array(writer, arrays, num_non_null);
+            }
+            if (status == CARQUET_OK && writer->geo_enabled) {
+                /* GEOMETRY/GEOGRAPHY: fold WKB into GeospatialStatistics
+                 * (min/max stats are suppressed for these logical types). */
+                for (int64_t gi = 0; gi < num_non_null; gi++) {
+                    carquet_geo_stats_add_wkb(&writer->geo_stats,
+                        arrays[gi].data, (size_t)arrays[gi].length);
+                }
             }
             break;
         }
 
         case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY: {
             const uint8_t* fixed = (const uint8_t*)values;
-            status = carquet_encode_plain_fixed_byte_array(fixed, num_non_null,
-                                                            writer->type_length,
-                                                            &writer->values_buffer);
+            if (writer->encoding == CARQUET_ENCODING_BYTE_STREAM_SPLIT) {
+                size_t need = (size_t)num_non_null * (size_t)writer->type_length;
+                size_t off = writer->values_buffer.size;
+                uint8_t* dest = carquet_buffer_advance(&writer->values_buffer, need);
+                if (!dest) {
+                    status = CARQUET_ERROR_OUT_OF_MEMORY;
+                } else {
+                    size_t written = 0;
+                    status = carquet_byte_stream_split_encode(
+                        fixed, num_non_null, writer->type_length,
+                        dest, need, &written);
+                    if (status != CARQUET_OK || written != need) {
+                        writer->values_buffer.size = off;
+                        if (status == CARQUET_OK) status = CARQUET_ERROR_ENCODE;
+                    }
+                }
+            } else if (writer->encoding == CARQUET_ENCODING_DELTA_BYTE_ARRAY) {
+                /* Spec allows DELTA_BYTE_ARRAY for FLBA: present each
+                 * fixed-width value as a byte array of length type_length. */
+                if (num_non_null > 0) {
+                    carquet_byte_array_t* tmp = carquet_mem_malloc(
+                        (size_t)num_non_null * sizeof(carquet_byte_array_t));
+                    if (!tmp) {
+                        status = CARQUET_ERROR_OUT_OF_MEMORY;
+                    } else {
+                        for (int64_t i = 0; i < num_non_null; i++) {
+                            tmp[i].data = (uint8_t*)(fixed + i * writer->type_length);
+                            tmp[i].length = writer->type_length;
+                        }
+                        status = carquet_delta_strings_encode(
+                            tmp, (int32_t)num_non_null, &writer->values_buffer);
+                        carquet_mem_free(tmp);
+                    }
+                }
+            } else {
+                status = carquet_encode_plain_fixed_byte_array(fixed, num_non_null,
+                                                                writer->type_length,
+                                                                &writer->values_buffer);
+            }
             if (status == CARQUET_OK && writer->write_statistics) {
                 update_statistics_flba(writer, fixed, num_non_null, writer->type_length);
             }
+            break;
+        }
+
+        case CARQUET_PHYSICAL_INT96: {
+            /* INT96 is deprecated and has undefined sort order, so no
+             * min/max statistics are produced (matching parquet-cpp). PLAIN
+             * is the only valid encoding. */
+            const carquet_int96_t* v96 = (const carquet_int96_t*)values;
+            status = carquet_encode_plain_int96(v96, num_non_null,
+                                                &writer->values_buffer);
             break;
         }
 
@@ -965,6 +1239,15 @@ carquet_status_t carquet_page_writer_add_values(
     }
 
     writer->num_values += num_values;
+    if (writer->data_page_v2) {
+        if (writer->max_rep_level > 0 && rep_levels) {
+            for (int64_t i = 0; i < num_values; i++) {
+                if (rep_levels[i] == 0) writer->num_rows++;
+            }
+        } else {
+            writer->num_rows += num_values;
+        }
+    }
     return status;
 
 fail:
@@ -1223,6 +1506,148 @@ static carquet_status_t append_data_page_header(
     return enc.status;
 }
 
+/* PageHeader carrying a DataPageHeaderV2 (PageType=DATA_PAGE_V2, field 8).
+ * Levels are stored uncompressed ahead of the (optionally compressed) value
+ * region; their byte lengths are carried in the header instead of an inline
+ * 4-byte prefix. */
+static carquet_status_t append_data_page_header_v2(
+    carquet_buffer_t* output_buffer,
+    const carquet_page_writer_t* writer,
+    int32_t uncompressed_size,
+    int32_t compressed_size,
+    uint32_t page_crc,
+    int32_t def_levels_len,
+    int32_t rep_levels_len,
+    bool is_compressed) {
+
+    carquet_status_t status = carquet_buffer_reserve(
+        output_buffer, output_buffer->size + 128);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
+    thrift_encoder_t enc;
+    thrift_encoder_init(&enc, output_buffer);
+
+    thrift_write_struct_begin(&enc);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 1);
+    thrift_write_i32(&enc, CARQUET_PAGE_DATA_V2);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 2);
+    thrift_write_i32(&enc, uncompressed_size);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 3);
+    thrift_write_i32(&enc, compressed_size);
+
+    if (writer->write_crc) {
+        thrift_write_field_header(&enc, THRIFT_TYPE_I32, 4);
+        thrift_write_i32(&enc, (int32_t)page_crc);
+    }
+
+    /* Field 8: DataPageHeaderV2 */
+    thrift_write_field_header(&enc, THRIFT_TYPE_STRUCT, 8);
+    thrift_write_struct_begin(&enc);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 1);
+    thrift_write_i32(&enc, (int32_t)writer->num_values);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 2);
+    thrift_write_i32(&enc, (int32_t)writer->num_nulls);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 3);
+    thrift_write_i32(&enc, (int32_t)writer->num_rows);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 4);
+    thrift_write_i32(&enc, (int32_t)writer->encoding);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 5);
+    thrift_write_i32(&enc, def_levels_len);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 6);
+    thrift_write_i32(&enc, rep_levels_len);
+    /* Field 7: is_compressed (bool encoded in the field-header type). */
+    thrift_write_field_header(&enc,
+        is_compressed ? THRIFT_TYPE_TRUE : THRIFT_TYPE_FALSE, 7);
+
+    if (writer->write_statistics && writer->has_min_max) {
+        thrift_write_field_header(&enc, THRIFT_TYPE_STRUCT, 8);
+        thrift_write_struct_begin(&enc);
+        thrift_write_field_header(&enc, THRIFT_TYPE_I64, 3);
+        thrift_write_i64(&enc, writer->num_nulls);
+        thrift_write_field_header(&enc, THRIFT_TYPE_BINARY, 5);
+        thrift_write_binary(&enc, writer->max_value, (int32_t)writer->max_value_size);
+        thrift_write_field_header(&enc, THRIFT_TYPE_BINARY, 6);
+        thrift_write_binary(&enc, writer->min_value, (int32_t)writer->min_value_size);
+        thrift_write_struct_end(&enc);
+    }
+
+    thrift_write_struct_end(&enc);
+    thrift_write_struct_end(&enc);
+    return enc.status;
+}
+
+/* Finalize a DATA_PAGE_V2: [rep levels][def levels][maybe-compressed values],
+ * levels always uncompressed. */
+static carquet_status_t finalize_v2_to_buffer(
+    carquet_page_writer_t* writer,
+    carquet_buffer_t* output_buffer,
+    size_t* page_size,
+    int32_t* uncompressed_size,
+    int32_t* compressed_size) {
+
+    size_t rep_len = writer->rep_levels_buffer.size;
+    size_t def_len = writer->def_levels_buffer.size;
+    size_t levels_len = rep_len + def_len;
+    size_t page_start = output_buffer->size;
+    carquet_status_t status;
+
+    const uint8_t* value_data = writer->values_buffer.data;
+    size_t value_size = writer->values_buffer.size;
+    bool is_compressed = (writer->compression != CARQUET_COMPRESSION_UNCOMPRESSED);
+
+    const uint8_t* out_values = value_data;
+    size_t out_values_size = value_size;
+    if (is_compressed && value_size > 0) {
+        status = compress_data(writer->compression, value_data, value_size,
+                               &writer->compress_buffer, &out_values,
+                               &out_values_size, writer->compression_level);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+    } else {
+        is_compressed = false;
+    }
+
+    *uncompressed_size = (int32_t)(levels_len + value_size);
+    *compressed_size = (int32_t)(levels_len + out_values_size);
+
+    uint32_t crc = 0;
+    if (writer->write_crc) {
+        crc = carquet_crc32_update(crc, writer->rep_levels_buffer.data, rep_len);
+        crc = carquet_crc32_update(crc, writer->def_levels_buffer.data, def_len);
+        crc = carquet_crc32_update(crc, out_values, out_values_size);
+    }
+
+    status = carquet_buffer_reserve(output_buffer,
+        output_buffer->size + 128 + levels_len + out_values_size);
+    if (status != CARQUET_OK) { output_buffer->size = page_start; return status; }
+
+    status = append_data_page_header_v2(output_buffer, writer,
+        *uncompressed_size, *compressed_size, crc,
+        (int32_t)def_len, (int32_t)rep_len, is_compressed);
+    if (status != CARQUET_OK) { output_buffer->size = page_start; return status; }
+
+    if (rep_len > 0) {
+        status = carquet_buffer_append(output_buffer,
+            writer->rep_levels_buffer.data, rep_len);
+        if (status != CARQUET_OK) { output_buffer->size = page_start; return status; }
+    }
+    if (def_len > 0) {
+        status = carquet_buffer_append(output_buffer,
+            writer->def_levels_buffer.data, def_len);
+        if (status != CARQUET_OK) { output_buffer->size = page_start; return status; }
+    }
+    if (out_values_size > 0) {
+        status = carquet_buffer_append(output_buffer, out_values, out_values_size);
+        if (status != CARQUET_OK) { output_buffer->size = page_start; return status; }
+    }
+
+    *page_size = output_buffer->size - page_start;
+    return CARQUET_OK;
+}
+
 /* ============================================================================
  * Page Finalization
  * ============================================================================
@@ -1259,6 +1684,11 @@ carquet_status_t carquet_page_writer_finalize_to_buffer(
 
     if (!writer || !output_buffer || !page_size) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (writer->data_page_v2) {
+        return finalize_v2_to_buffer(writer, output_buffer, page_size,
+                                     uncompressed_size, compressed_size);
     }
 
     bool has_levels = (writer->rep_levels_buffer.size > 0 ||
@@ -1365,6 +1795,184 @@ carquet_status_t carquet_page_writer_finalize_to_buffer(
 
     *page_size = output_buffer->size - page_start;
     return CARQUET_OK;
+}
+
+/* ============================================================================
+ * Dictionary Page Emission
+ * ============================================================================
+ *
+ * Builds a spec-conformant DICTIONARY_PAGE (PageType=2). The payload is the
+ * already-PLAIN-encoded dictionary entries; it is compressed with the column
+ * codec exactly like a data page. The PageHeader carries DictionaryPageHeader
+ * at field 7 (1: num_values, 2: encoding=PLAIN, 3: is_sorted=false).
+ */
+carquet_status_t carquet_page_writer_emit_dictionary_page(
+    carquet_page_writer_t* writer,
+    carquet_buffer_t* output_buffer,
+    const uint8_t* plain_payload,
+    size_t payload_size,
+    int32_t num_entries,
+    size_t* page_size,
+    int32_t* uncompressed_size,
+    int32_t* compressed_size) {
+
+    if (!writer || !output_buffer || !plain_payload || !page_size ||
+        !uncompressed_size || !compressed_size) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    const uint8_t* compressed_data = NULL;
+    size_t compressed_data_size = 0;
+    carquet_status_t status = compress_data(writer->compression,
+                                            plain_payload, payload_size,
+                                            &writer->compress_buffer,
+                                            &compressed_data,
+                                            &compressed_data_size,
+                                            writer->compression_level);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
+    *uncompressed_size = (int32_t)payload_size;
+    *compressed_size = (int32_t)compressed_data_size;
+
+    size_t page_start = output_buffer->size;
+    status = carquet_buffer_reserve(output_buffer,
+                                    output_buffer->size + 128 + compressed_data_size);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
+    thrift_encoder_t enc;
+    thrift_encoder_init(&enc, output_buffer);
+
+    thrift_write_struct_begin(&enc);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 1);
+    thrift_write_i32(&enc, CARQUET_PAGE_DICTIONARY);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 2);
+    thrift_write_i32(&enc, *uncompressed_size);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 3);
+    thrift_write_i32(&enc, *compressed_size);
+
+    if (writer->write_crc) {
+        thrift_write_field_header(&enc, THRIFT_TYPE_I32, 4);
+        thrift_write_i32(&enc, (int32_t)carquet_crc32(compressed_data,
+                                                      compressed_data_size));
+    }
+
+    /* Field 7: DictionaryPageHeader */
+    thrift_write_field_header(&enc, THRIFT_TYPE_STRUCT, 7);
+    thrift_write_struct_begin(&enc);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 1);
+    thrift_write_i32(&enc, num_entries);
+    thrift_write_field_header(&enc, THRIFT_TYPE_I32, 2);
+    thrift_write_i32(&enc, CARQUET_ENCODING_PLAIN);
+    /* is_sorted=false: thrift compact encodes booleans in the field-header
+     * type itself (TRUE=1, FALSE=2) with no separate value. */
+    thrift_write_field_header(&enc, THRIFT_TYPE_FALSE, 3);
+    thrift_write_struct_end(&enc);
+
+    thrift_write_struct_end(&enc);
+
+    if (enc.status != CARQUET_OK) {
+        output_buffer->size = page_start;
+        return enc.status;
+    }
+
+    status = carquet_buffer_append(output_buffer, compressed_data, compressed_data_size);
+    if (status != CARQUET_OK) {
+        output_buffer->size = page_start;
+        return status;
+    }
+
+    *page_size = output_buffer->size - page_start;
+    return CARQUET_OK;
+}
+
+/* Stage a RLE_DICTIONARY data page: encode the def/rep levels exactly as the
+ * PLAIN path does, then set the values buffer verbatim to the pre-built
+ * [bit-width][RLE indices] payload. The caller subsequently sets the page
+ * encoding (RLE_DICTIONARY) and any min/max stats, then calls
+ * carquet_page_writer_finalize_to_buffer. */
+carquet_status_t carquet_page_writer_add_dictionary_indices(
+    carquet_page_writer_t* writer,
+    const uint8_t* idx_payload,
+    size_t idx_size,
+    const int16_t* def_levels,
+    const int16_t* rep_levels,
+    int64_t num_values_total,
+    int64_t num_nulls) {
+
+    if (!writer || !idx_payload) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    carquet_status_t status = CARQUET_OK;
+    if (writer->max_def_level > 0) {
+        status = encode_levels(def_levels, num_values_total, writer->max_def_level,
+                               &writer->def_levels_buffer,
+                               !writer->data_page_v2);
+        if (status != CARQUET_OK) return status;
+    }
+    if (writer->max_rep_level > 0 && rep_levels) {
+        status = encode_levels(rep_levels, num_values_total, writer->max_rep_level,
+                               &writer->rep_levels_buffer,
+                               !writer->data_page_v2);
+        if (status != CARQUET_OK) return status;
+    }
+
+    status = carquet_buffer_append(&writer->values_buffer, idx_payload, idx_size);
+    if (status != CARQUET_OK) return status;
+
+    writer->num_values = num_values_total;
+    writer->num_nulls = num_nulls;
+    if (writer->data_page_v2) {
+        if (writer->max_rep_level > 0 && rep_levels) {
+            for (int64_t i = 0; i < num_values_total; i++) {
+                if (rep_levels[i] == 0) writer->num_rows++;
+            }
+        } else {
+            writer->num_rows += num_values_total;
+        }
+    }
+    return CARQUET_OK;
+}
+
+void carquet_page_writer_set_encoding(carquet_page_writer_t* writer,
+                                      carquet_encoding_t encoding) {
+    if (writer) writer->encoding = encoding;
+}
+
+/* Inject column-level min/max stats into the page writer so the
+ * RLE_DICTIONARY data page header carries the same statistics the PLAIN
+ * path would have produced from the raw values. */
+carquet_status_t carquet_page_writer_set_min_max(
+    carquet_page_writer_t* writer,
+    const uint8_t* min_value, size_t min_size,
+    const uint8_t* max_value, size_t max_size) {
+    if (!writer) return CARQUET_ERROR_INVALID_ARGUMENT;
+    if (!writer->write_statistics || !min_value || !max_value ||
+        min_size == 0 || max_size == 0) {
+        return CARQUET_OK;
+    }
+    carquet_status_t s = stats_set_min(writer, min_value, min_size);
+    if (s != CARQUET_OK) return s;
+    s = stats_set_max(writer, max_value, max_size);
+    if (s != CARQUET_OK) return s;
+    writer->min_max_size = min_size;
+    writer->has_min_max = true;
+    return CARQUET_OK;
+}
+
+void carquet_page_writer_set_data_page_v2(carquet_page_writer_t* writer,
+                                          bool enabled) {
+    if (writer) writer->data_page_v2 = enabled;
+}
+
+const parquet_geospatial_statistics_t* carquet_page_writer_get_geo_stats(
+    const carquet_page_writer_t* writer) {
+    if (!writer || !writer->geo_enabled) return NULL;
+    return &writer->geo_stats;
 }
 
 size_t carquet_page_writer_estimated_size(const carquet_page_writer_t* writer) {

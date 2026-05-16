@@ -93,6 +93,9 @@ typedef enum carquet_logical_type_id {
     CARQUET_LOGICAL_VARIANT = 15,
     CARQUET_LOGICAL_GEOMETRY = 16,
     CARQUET_LOGICAL_GEOGRAPHY = 17,
+    /* INTERVAL has no modern LogicalType; it is ConvertedType-only and
+       requires FIXED_LEN_BYTE_ARRAY with type_length == 12. */
+    CARQUET_LOGICAL_INTERVAL = 18,
 } carquet_logical_type_id_t;
 
 /* Time unit for temporal types */

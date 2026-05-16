@@ -567,6 +567,31 @@ int64_t carquet_rle_decode_levels(
 
             size_t bytes_per_group = (size_t)bit_width;
 
+            /* Fast path: the whole bit-packed run is present in the input
+             * and fits in the output. Bulk-decode through the wide-SIMD
+             * unpacker (carquet_bitunpack_32) instead of one group at a
+             * time. The division form of the bound avoids size_t overflow.
+             * Truncated input or an output cap mid-run (rare) falls through
+             * to the exact per-8 loop below, whose semantics are unchanged. */
+            if (bit_width >= 1 &&
+                (size_t)num_groups <= (input_size - pos) / bytes_per_group &&
+                count + run_length <= max_values) {
+                int64_t done = 0;
+                uint32_t tmp[256];  /* 256 is a multiple of 8 */
+                while (done < run_length) {
+                    int64_t chunk = run_length - done;
+                    if (chunk > 256) chunk = 256;
+                    size_t used = carquet_bitunpack_32(input + pos,
+                                        (size_t)chunk, bit_width, tmp);
+                    pos += used;
+                    for (int64_t k = 0; k < chunk; k++) {
+                        output[count++] = (int16_t)tmp[k];
+                    }
+                    done += chunk;
+                }
+                continue;
+            }
+
             for (int g = 0; g < num_groups && count < max_values; g++) {
                 if (pos + bytes_per_group > input_size) break;
 

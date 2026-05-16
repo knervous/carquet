@@ -5,18 +5,21 @@
  * Handles reading and decoding of Parquet data pages.
  */
 
+#include "core/allocator.h"
 #include <carquet/carquet.h>
 #include "reader_internal.h"
 #include "thrift/parquet_types.h"
 #include "encoding/plain.h"
 #include "encoding/rle.h"
 #include "core/endian.h"
+#include "core/bitpack.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
 
-#if defined(CARQUET_ARCH_ARM) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+#if defined(CARQUET_ARCH_ARM) && defined(CARQUET_ENABLE_NEON) && \
+    (defined(__ARM_NEON) || defined(__ARM_NEON__))
 #include <arm_neon.h>
 #endif
 
@@ -73,6 +76,43 @@ extern carquet_status_t carquet_byte_stream_split_decode_double(
     size_t data_size,
     double* values,
     int64_t count);
+extern carquet_status_t carquet_byte_stream_split_decode(
+    const uint8_t* data,
+    size_t data_size,
+    int32_t type_length,
+    uint8_t* values,
+    int64_t count);
+extern carquet_status_t carquet_delta_decode_int32(
+    const uint8_t* data,
+    size_t data_size,
+    int32_t* values,
+    int32_t num_values,
+    size_t* bytes_consumed);
+extern carquet_status_t carquet_delta_decode_int64(
+    const uint8_t* data,
+    size_t data_size,
+    int64_t* values,
+    int32_t num_values,
+    size_t* bytes_consumed);
+extern carquet_status_t carquet_delta_length_decode(
+    const uint8_t* data,
+    size_t data_size,
+    carquet_byte_array_t* values,
+    int32_t num_values,
+    size_t* bytes_consumed);
+extern carquet_status_t carquet_delta_strings_decode(
+    const uint8_t* data,
+    size_t data_size,
+    carquet_byte_array_t* values,
+    int32_t num_values,
+    uint8_t* work_buffer,
+    size_t work_buffer_size,
+    size_t* bytes_consumed);
+extern carquet_status_t carquet_delta_strings_decoded_size(
+    const uint8_t* data,
+    size_t data_size,
+    int32_t num_values,
+    size_t* required_size);
 
 static bool checked_add_size(size_t a, size_t b, size_t* out);
 static bool checked_mul_size(size_t a, size_t b, size_t* out);
@@ -285,7 +325,7 @@ static carquet_status_t ensure_decompress_capacity(
     }
 
     if (needed > reader->decompress_capacity) {
-        uint8_t* new_buf = realloc(reader->decompress_buffer, needed);
+        uint8_t* new_buf = carquet_mem_realloc(reader->decompress_buffer, needed);
         if (!new_buf) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "%s", message);
             return CARQUET_ERROR_OUT_OF_MEMORY;
@@ -307,7 +347,8 @@ static inline int bit_width_for_max(int max_val) {
     return width;
 }
 
-#if defined(CARQUET_ARCH_ARM) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+#if defined(CARQUET_ARCH_ARM) && defined(CARQUET_ENABLE_NEON) && \
+    (defined(__ARM_NEON) || defined(__ARM_NEON__))
 static bool gather_fixed_dictionary_values_neon(const uint8_t* dict_data,
                                                  int32_t dict_count,
                                                  const uint32_t* indices,
@@ -387,7 +428,7 @@ void carquet_column_clear_retained_pages(carquet_column_reader_t* reader) {
     carquet_retained_page_t* p = reader->retained_pages;
     while (p) {
         carquet_retained_page_t* next = p->next;
-        free(p);
+        carquet_mem_free(p);
         p = next;
     }
     reader->retained_pages = NULL;
@@ -398,7 +439,7 @@ uint8_t* carquet_column_retain_page(
     const uint8_t* src,
     size_t size) {
     carquet_retained_page_t* node =
-        (carquet_retained_page_t*)malloc(sizeof(carquet_retained_page_t) + size);
+        (carquet_retained_page_t*)carquet_mem_malloc(sizeof(carquet_retained_page_t) + size);
     if (!node) return NULL;
     node->next = reader->retained_pages;
     node->size = size;
@@ -410,8 +451,8 @@ uint8_t* carquet_column_retain_page(
 }
 
 static void release_decoded_level_buffers(carquet_column_reader_t* reader) {
-    free(reader->decoded_def_levels);
-    free(reader->decoded_rep_levels);
+    carquet_mem_free(reader->decoded_def_levels);
+    carquet_mem_free(reader->decoded_rep_levels);
     reader->decoded_def_levels = NULL;
     reader->decoded_rep_levels = NULL;
 }
@@ -432,6 +473,19 @@ static carquet_status_t ensure_decoded_page_buffers(
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
 
+    /* A single data page can never legitimately contain more values than the
+     * column chunk declares. The page header's num_values is attacker-
+     * controlled, so without this bound a crafted header drives a multi-GB
+     * decode-buffer allocation from a tiny file. */
+    if (reader->col_meta &&
+        reader->col_meta->num_values >= 0 &&
+        (int64_t)num_values > reader->col_meta->num_values) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE,
+            "Data page value count (%d) exceeds column chunk total (%lld)",
+            num_values, (long long)reader->col_meta->num_values);
+        return CARQUET_ERROR_INVALID_PAGE;
+    }
+
     if (reader->decoded_ownership == CARQUET_DATA_VIEW) {
         reader->decoded_values = NULL;
         reader->decoded_capacity = 0;
@@ -439,42 +493,42 @@ static carquet_status_t ensure_decoded_page_buffers(
     reader->decoded_ownership = CARQUET_DATA_OWNED;
 
     if (!need_def_levels && reader->decoded_def_levels) {
-        free(reader->decoded_def_levels);
+        carquet_mem_free(reader->decoded_def_levels);
         reader->decoded_def_levels = NULL;
     }
     if (!need_rep_levels && reader->decoded_rep_levels) {
-        free(reader->decoded_rep_levels);
+        carquet_mem_free(reader->decoded_rep_levels);
         reader->decoded_rep_levels = NULL;
     }
 
     if ((size_t)num_values > reader->decoded_capacity) {
-        free(reader->decoded_values);
+        carquet_mem_free(reader->decoded_values);
         reader->decoded_values = NULL;
         release_decoded_level_buffers(reader);
 
         if (values_buffer_size > 0) {
-            reader->decoded_values = calloc(1, values_buffer_size);
+            reader->decoded_values = carquet_mem_calloc(1, values_buffer_size);
         }
         if (need_def_levels && num_values > 0) {
-            reader->decoded_def_levels = malloc(sizeof(int16_t) * (size_t)num_values);
+            reader->decoded_def_levels = carquet_mem_malloc(sizeof(int16_t) * (size_t)num_values);
         }
         if (need_rep_levels && num_values > 0) {
-            reader->decoded_rep_levels = malloc(sizeof(int16_t) * (size_t)num_values);
+            reader->decoded_rep_levels = carquet_mem_malloc(sizeof(int16_t) * (size_t)num_values);
         }
         reader->decoded_capacity = (size_t)num_values;
     } else {
         if (need_def_levels && !reader->decoded_def_levels && num_values > 0) {
-            reader->decoded_def_levels = malloc(sizeof(int16_t) * (size_t)num_values);
+            reader->decoded_def_levels = carquet_mem_malloc(sizeof(int16_t) * (size_t)num_values);
         }
         if (need_rep_levels && !reader->decoded_rep_levels && num_values > 0) {
-            reader->decoded_rep_levels = malloc(sizeof(int16_t) * (size_t)num_values);
+            reader->decoded_rep_levels = carquet_mem_malloc(sizeof(int16_t) * (size_t)num_values);
         }
     }
 
     if ((values_buffer_size > 0 && !reader->decoded_values) ||
         (need_def_levels && num_values > 0 && !reader->decoded_def_levels) ||
         (need_rep_levels && num_values > 0 && !reader->decoded_rep_levels)) {
-        free(reader->decoded_values);
+        carquet_mem_free(reader->decoded_values);
         reader->decoded_values = NULL;
         release_decoded_level_buffers(reader);
         reader->decoded_capacity = 0;
@@ -519,6 +573,72 @@ static carquet_status_t decode_levels_rle(
 
     /* Estimate bytes consumed (not perfect, but good enough) */
     *bytes_consumed = data_size;
+    return CARQUET_OK;
+}
+
+/* Decode the deprecated BIT_PACKED level encoding (Encoding=4). Unlike the
+ * RLE/bit-packing hybrid, legacy BIT_PACKED packs values MSB-first with no
+ * run headers and no length prefix; the byte length is implied by
+ * ceil(num_values * bit_width / 8). Only valid for V1 page levels. */
+static carquet_status_t decode_levels_bitpacked(
+    const uint8_t* data,
+    size_t data_size,
+    int bit_width,
+    int32_t num_values,
+    int16_t* levels,
+    size_t* bytes_consumed) {
+    return carquet_decode_bitpacked_levels(data, data_size, bit_width,
+               num_values, levels, bytes_consumed) == 0
+           ? CARQUET_OK : CARQUET_ERROR_DECODE;
+}
+
+/* Decode a V1 page level section, dispatching on the (deprecated) BIT_PACKED
+ * vs RLE encoding declared in the page header. RLE is length-prefixed (4-byte
+ * LE) in V1; BIT_PACKED is not. Advances *ptr / *remaining past the section. */
+static carquet_status_t decode_v1_level_section(
+    const uint8_t** ptr,
+    size_t* remaining,
+    carquet_encoding_t level_encoding,
+    int bit_width,
+    int32_t num_values,
+    int16_t* levels,
+    carquet_error_t* error) {
+
+    size_t bytes_consumed = 0;
+    carquet_status_t status;
+
+    if (level_encoding == CARQUET_ENCODING_BIT_PACKED) {
+        status = decode_levels_bitpacked(*ptr, *remaining, bit_width,
+                                         num_values, levels, &bytes_consumed);
+        if (status != CARQUET_OK) {
+            CARQUET_SET_ERROR(error, status, "Failed to decode BIT_PACKED levels");
+            return status;
+        }
+        *ptr += bytes_consumed;
+        *remaining -= bytes_consumed;
+        return CARQUET_OK;
+    }
+
+    /* RLE (default): 4-byte LE length prefix, then the hybrid stream. */
+    if (*remaining < 4) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Truncated levels");
+        return CARQUET_ERROR_DECODE;
+    }
+    uint32_t sz = carquet_read_u32_le(*ptr);
+    *ptr += 4;
+    *remaining -= 4;
+    if (sz > *remaining) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Invalid level size");
+        return CARQUET_ERROR_DECODE;
+    }
+    status = decode_levels_rle(*ptr, sz, bit_width, num_values, levels,
+                               &bytes_consumed);
+    if (status != CARQUET_OK) {
+        CARQUET_SET_ERROR(error, status, "Failed to decode RLE levels");
+        return status;
+    }
+    *ptr += sz;
+    *remaining -= sz;
     return CARQUET_OK;
 }
 
@@ -578,10 +698,10 @@ carquet_status_t carquet_read_dictionary_page(
         reader->dictionary_size = page_size;
 
         /* Build offset table for O(1) BYTE_ARRAY lookup */
-        reader->dictionary_offsets = malloc((size_t)header->num_values * sizeof(uint32_t));
+        reader->dictionary_offsets = carquet_mem_malloc((size_t)header->num_values * sizeof(uint32_t));
         if (!reader->dictionary_offsets) {
             if (ownership == CARQUET_DATA_OWNED) {
-                free(reader->dictionary_data);
+                carquet_mem_free(reader->dictionary_data);
             }
             reader->dictionary_data = NULL;
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate offset table");
@@ -594,9 +714,9 @@ carquet_status_t carquet_read_dictionary_page(
         for (int32_t i = 0; i < header->num_values; i++) {
             if (dict_remaining < 4) {
                 if (ownership == CARQUET_DATA_OWNED) {
-                    free(reader->dictionary_data);
+                    carquet_mem_free(reader->dictionary_data);
                 }
-                free(reader->dictionary_offsets);
+                carquet_mem_free(reader->dictionary_offsets);
                 reader->dictionary_data = NULL;
                 reader->dictionary_offsets = NULL;
                 CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Truncated dictionary");
@@ -607,9 +727,9 @@ carquet_status_t carquet_read_dictionary_page(
             size_t entry_size = 4 + len;
             if (dict_remaining < entry_size) {
                 if (ownership == CARQUET_DATA_OWNED) {
-                    free(reader->dictionary_data);
+                    carquet_mem_free(reader->dictionary_data);
                 }
-                free(reader->dictionary_offsets);
+                carquet_mem_free(reader->dictionary_offsets);
                 reader->dictionary_data = NULL;
                 reader->dictionary_offsets = NULL;
                 CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Invalid dictionary entry");
@@ -623,14 +743,14 @@ carquet_status_t carquet_read_dictionary_page(
         size_t dict_size = 0;
         if (!checked_mul_size(value_size, (size_t)header->num_values, &dict_size)) {
             if (ownership == CARQUET_DATA_OWNED) {
-                free(page_data);
+                carquet_mem_free(page_data);
             }
             CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Dictionary size overflow");
             return CARQUET_ERROR_DECODE;
         }
         if (dict_size > page_size) {
             if (ownership == CARQUET_DATA_OWNED) {
-                free(page_data);
+                carquet_mem_free(page_data);
             }
             CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Truncated dictionary");
             return CARQUET_ERROR_DECODE;
@@ -641,6 +761,163 @@ carquet_status_t carquet_read_dictionary_page(
 
     reader->has_dictionary = true;
     return CARQUET_OK;
+}
+
+/* ============================================================================
+ * Phase 3 encoding decode dispatch (DELTA_*, BYTE_STREAM_SPLIT int/FLBA)
+ * ============================================================================
+ *
+ * Returns true via *handled if the encoding was one of the Phase 3 encodings
+ * this helper owns; in that case *status holds the decode result.
+ *
+ * Byte-array lifetime:
+ *  - DELTA_LENGTH_BYTE_ARRAY: value .data pointers reference into `ptr` (the
+ *    page payload), exactly like PLAIN BYTE_ARRAY. *needs_page_retain is set so
+ *    the caller routes it through the same page-retain+fixup path.
+ *  - DELTA_BYTE_ARRAY: strings are reconstructed into a scratch buffer that is
+ *    allocated through carquet_column_retain_page() (so it lives until the
+ *    batch is consumed / row-group reset / reader close). Values are decoded
+ *    directly into that retained buffer, so no pointer fixup is required and
+ *    there is no use-after-free.
+ *  - DELTA_BINARY_PACKED / BSS int/FLBA: decoded into reader->decoded_values
+ *    (fixed-size, owned) — no extra lifetime concern.
+ */
+static carquet_status_t decode_phase3_values(
+    carquet_column_reader_t* reader,
+    int32_t encoding,
+    const uint8_t* ptr,
+    size_t remaining,
+    void* values,
+    int32_t non_null_count,
+    bool* handled,
+    bool* needs_page_retain,
+    carquet_error_t* error) {
+
+    *handled = true;
+    *needs_page_retain = false;
+    size_t consumed = 0;
+
+    switch (encoding) {
+        case CARQUET_ENCODING_DELTA_BINARY_PACKED:
+            if (reader->type == CARQUET_PHYSICAL_INT32) {
+                return carquet_delta_decode_int32(
+                    ptr, remaining, (int32_t*)values, non_null_count, &consumed);
+            } else if (reader->type == CARQUET_PHYSICAL_INT64) {
+                return carquet_delta_decode_int64(
+                    ptr, remaining, (int64_t*)values, non_null_count, &consumed);
+            }
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
+                "DELTA_BINARY_PACKED requires INT32/INT64");
+            return CARQUET_ERROR_INVALID_ENCODING;
+
+        case CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY:
+            if (reader->type != CARQUET_PHYSICAL_BYTE_ARRAY) {
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
+                    "DELTA_LENGTH_BYTE_ARRAY requires BYTE_ARRAY");
+                return CARQUET_ERROR_INVALID_ENCODING;
+            }
+            /* Values point into the page payload — same lifetime as PLAIN
+             * BYTE_ARRAY, so the caller must retain the page buffer. */
+            *needs_page_retain = true;
+            return carquet_delta_length_decode(
+                ptr, remaining, (carquet_byte_array_t*)values,
+                non_null_count, &consumed);
+
+        case CARQUET_ENCODING_DELTA_BYTE_ARRAY:
+            if (reader->type != CARQUET_PHYSICAL_BYTE_ARRAY &&
+                reader->type != CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY) {
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
+                    "DELTA_BYTE_ARRAY requires BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY");
+                return CARQUET_ERROR_INVALID_ENCODING;
+            }
+            {
+                if (non_null_count <= 0) {
+                    return CARQUET_OK;
+                }
+                /* Exact reconstruction size (no guessing). */
+                size_t work_size = 0;
+                carquet_status_t st = carquet_delta_strings_decoded_size(
+                    ptr, remaining, non_null_count, &work_size);
+                if (st != CARQUET_OK) {
+                    return st;
+                }
+                /* Allocate the scratch through the retain list so it outlives
+                 * the batch (freed on row-group reset / reader close). */
+                uint8_t* work = carquet_column_retain_page(
+                    reader, NULL, work_size == 0 ? 1 : work_size);
+                if (!work) {
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
+                        "Failed to allocate DELTA_BYTE_ARRAY scratch");
+                    return CARQUET_ERROR_OUT_OF_MEMORY;
+                }
+                /* For FIXED_LEN_BYTE_ARRAY the column buffer holds raw fixed
+                 * width values; decode into a temporary byte-array view, then
+                 * copy the reconstructed bytes out (values are length
+                 * type_length). For BYTE_ARRAY decode straight into the
+                 * carquet_byte_array_t output. */
+                if (reader->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
+                    return carquet_delta_strings_decode(
+                        ptr, remaining, (carquet_byte_array_t*)values,
+                        non_null_count, work, work_size, &consumed);
+                } else {
+                    carquet_byte_array_t* tmp = (carquet_byte_array_t*)carquet_mem_malloc(
+                        (size_t)non_null_count * sizeof(carquet_byte_array_t));
+                    if (!tmp) {
+                        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
+                            "Failed to allocate FLBA decode view");
+                        return CARQUET_ERROR_OUT_OF_MEMORY;
+                    }
+                    st = carquet_delta_strings_decode(
+                        ptr, remaining, tmp, non_null_count,
+                        work, work_size, &consumed);
+                    if (st != CARQUET_OK) {
+                        carquet_mem_free(tmp);
+                        return st;
+                    }
+                    uint8_t* out = (uint8_t*)values;
+                    size_t len = (size_t)reader->type_length;
+                    for (int32_t i = 0; i < non_null_count; i++) {
+                        if ((size_t)tmp[i].length != len) {
+                            carquet_mem_free(tmp);
+                            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                                "DELTA_BYTE_ARRAY FLBA value length mismatch");
+                            return CARQUET_ERROR_DECODE;
+                        }
+                        memcpy(out + (size_t)i * len, tmp[i].data, len);
+                    }
+                    carquet_mem_free(tmp);
+                    return CARQUET_OK;
+                }
+            }
+
+        case CARQUET_ENCODING_BYTE_STREAM_SPLIT:
+            switch (reader->type) {
+                case CARQUET_PHYSICAL_FLOAT:
+                    return carquet_byte_stream_split_decode_float(
+                        ptr, remaining, (float*)values, non_null_count);
+                case CARQUET_PHYSICAL_DOUBLE:
+                    return carquet_byte_stream_split_decode_double(
+                        ptr, remaining, (double*)values, non_null_count);
+                case CARQUET_PHYSICAL_INT32:
+                    return carquet_byte_stream_split_decode(
+                        ptr, remaining, 4, (uint8_t*)values, non_null_count);
+                case CARQUET_PHYSICAL_INT64:
+                    return carquet_byte_stream_split_decode(
+                        ptr, remaining, 8, (uint8_t*)values, non_null_count);
+                case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+                    return carquet_byte_stream_split_decode(
+                        ptr, remaining, reader->type_length,
+                        (uint8_t*)values, non_null_count);
+                default:
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
+                        "BYTE_STREAM_SPLIT unsupported type");
+                    return CARQUET_ERROR_INVALID_ENCODING;
+            }
+
+        default:
+            *handled = false;
+            return CARQUET_OK;
+    }
 }
 
 /* ============================================================================
@@ -662,7 +939,6 @@ carquet_status_t carquet_read_data_page_v1(
 
     const uint8_t* ptr = page_data;
     size_t remaining = page_size;
-    size_t bytes_consumed;
 
     int32_t num_values = header->num_values;
     if (num_values > max_values) {
@@ -671,58 +947,26 @@ carquet_status_t carquet_read_data_page_v1(
 
     /* Decode repetition levels if needed */
     if (reader->max_rep_level > 0 && rep_levels) {
-        /* Read 4-byte length prefix */
-        if (remaining < 4) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Truncated rep levels");
-            return CARQUET_ERROR_DECODE;
-        }
-        uint32_t rep_size = carquet_read_u32_le(ptr);
-        ptr += 4;
-        remaining -= 4;
-
-        if (rep_size > remaining) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Invalid rep level size");
-            return CARQUET_ERROR_DECODE;
-        }
-
         int bit_width = bit_width_for_max(reader->max_rep_level);
-        carquet_status_t status = decode_levels_rle(
-            ptr, rep_size, bit_width, num_values, rep_levels, &bytes_consumed);
+        carquet_status_t status = decode_v1_level_section(
+            &ptr, &remaining, header->repetition_level_encoding,
+            bit_width, num_values, rep_levels, error);
         if (status != CARQUET_OK) {
-            CARQUET_SET_ERROR(error, status, "Failed to decode rep levels");
             return status;
         }
-        ptr += rep_size;
-        remaining -= rep_size;
     } else if (rep_levels) {
         memset(rep_levels, 0, num_values * sizeof(int16_t));
     }
 
     /* Decode definition levels if needed */
     if (reader->max_def_level > 0 && def_levels) {
-        /* Read 4-byte length prefix */
-        if (remaining < 4) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Truncated def levels");
-            return CARQUET_ERROR_DECODE;
-        }
-        uint32_t def_size = carquet_read_u32_le(ptr);
-        ptr += 4;
-        remaining -= 4;
-
-        if (def_size > remaining) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Invalid def level size");
-            return CARQUET_ERROR_DECODE;
-        }
-
         int bit_width = bit_width_for_max(reader->max_def_level);
-        carquet_status_t status = decode_levels_rle(
-            ptr, def_size, bit_width, num_values, def_levels, &bytes_consumed);
+        carquet_status_t status = decode_v1_level_section(
+            &ptr, &remaining, header->definition_level_encoding,
+            bit_width, num_values, def_levels, error);
         if (status != CARQUET_OK) {
-            CARQUET_SET_ERROR(error, status, "Failed to decode def levels");
             return status;
         }
-        ptr += def_size;
-        remaining -= def_size;
     } else if (def_levels) {
         /* Set all to max level (all values present) - use SIMD dispatch */
         carquet_dispatch_fill_def_levels(def_levels, num_values, reader->max_def_level);
@@ -747,22 +991,6 @@ carquet_status_t carquet_read_data_page_v1(
                 if (bytes < 0) {
                     status = CARQUET_ERROR_DECODE;
                 }
-            }
-            break;
-
-        case CARQUET_ENCODING_BYTE_STREAM_SPLIT:
-            switch (reader->type) {
-                case CARQUET_PHYSICAL_FLOAT:
-                    status = carquet_byte_stream_split_decode_float(
-                        ptr, remaining, (float*)values, non_null_count);
-                    break;
-                case CARQUET_PHYSICAL_DOUBLE:
-                    status = carquet_byte_stream_split_decode_double(
-                        ptr, remaining, (double*)values, non_null_count);
-                    break;
-                default:
-                    status = CARQUET_ERROR_INVALID_ENCODING;
-                    break;
             }
             break;
 
@@ -804,8 +1032,8 @@ carquet_status_t carquet_read_data_page_v1(
                     indices = reader->indices_buffer;
                 } else {
                     /* Need larger buffer - reallocate */
-                    free(reader->indices_buffer);
-                    reader->indices_buffer = malloc((size_t)encoded_count * sizeof(uint32_t));
+                    carquet_mem_free(reader->indices_buffer);
+                    reader->indices_buffer = carquet_mem_malloc((size_t)encoded_count * sizeof(uint32_t));
                     if (!reader->indices_buffer) {
                         reader->indices_capacity = 0;
                         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate indices");
@@ -913,7 +1141,8 @@ carquet_status_t carquet_read_data_page_v1(
                                     ? 12 : (size_t)reader->type_length;
                                 uint8_t* out = (uint8_t*)values;
                                 bool ok;
-#if defined(CARQUET_ARCH_ARM) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+#if defined(CARQUET_ARCH_ARM) && defined(CARQUET_ENABLE_NEON) && \
+    (defined(__ARM_NEON) || defined(__ARM_NEON__))
                                 ok = gather_fixed_dictionary_values_neon(
                                     reader->dictionary_data,
                                     reader->dictionary_count,
@@ -950,9 +1179,23 @@ carquet_status_t carquet_read_data_page_v1(
             break;
 
         default:
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
-                "Unsupported encoding: %d", header->encoding);
-            return CARQUET_ERROR_INVALID_ENCODING;
+            {
+                /* Phase 3 encodings: DELTA_BINARY_PACKED,
+                 * DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, and
+                 * BYTE_STREAM_SPLIT for FLOAT/DOUBLE/INT32/INT64/FLBA. */
+                bool handled = false;
+                bool needs_page_retain = false;
+                status = decode_phase3_values(
+                    reader, header->encoding, ptr, remaining,
+                    values, non_null_count,
+                    &handled, &needs_page_retain, error);
+                if (!handled) {
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
+                        "Unsupported encoding: %d", header->encoding);
+                    return CARQUET_ERROR_INVALID_ENCODING;
+                }
+            }
+            break;
     }
 
     if (status != CARQUET_OK) {
@@ -1091,22 +1334,6 @@ carquet_status_t carquet_read_data_page_v2(
             }
             break;
 
-        case CARQUET_ENCODING_BYTE_STREAM_SPLIT:
-            switch (reader->type) {
-                case CARQUET_PHYSICAL_FLOAT:
-                    status = carquet_byte_stream_split_decode_float(
-                        ptr, remaining, (float*)values, non_null_count);
-                    break;
-                case CARQUET_PHYSICAL_DOUBLE:
-                    status = carquet_byte_stream_split_decode_double(
-                        ptr, remaining, (double*)values, non_null_count);
-                    break;
-                default:
-                    status = CARQUET_ERROR_INVALID_ENCODING;
-                    break;
-            }
-            break;
-
         case CARQUET_ENCODING_RLE_DICTIONARY:
         case CARQUET_ENCODING_PLAIN_DICTIONARY:
             if (!reader->has_dictionary) {
@@ -1143,8 +1370,8 @@ carquet_status_t carquet_read_data_page_v2(
                 if ((size_t)encoded_count <= reader->indices_capacity) {
                     indices = reader->indices_buffer;
                 } else {
-                    free(reader->indices_buffer);
-                    reader->indices_buffer = malloc((size_t)encoded_count * sizeof(uint32_t));
+                    carquet_mem_free(reader->indices_buffer);
+                    reader->indices_buffer = carquet_mem_malloc((size_t)encoded_count * sizeof(uint32_t));
                     if (!reader->indices_buffer) {
                         reader->indices_capacity = 0;
                         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate indices");
@@ -1245,7 +1472,8 @@ carquet_status_t carquet_read_data_page_v2(
                                     ? 12 : (size_t)reader->type_length;
                                 uint8_t* out = (uint8_t*)values;
                                 bool ok;
-#if defined(CARQUET_ARCH_ARM) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+#if defined(CARQUET_ARCH_ARM) && defined(CARQUET_ENABLE_NEON) && \
+    (defined(__ARM_NEON) || defined(__ARM_NEON__))
                                 ok = gather_fixed_dictionary_values_neon(
                                     reader->dictionary_data,
                                     reader->dictionary_count,
@@ -1279,9 +1507,21 @@ carquet_status_t carquet_read_data_page_v2(
             break;
 
         default:
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
-                "Unsupported encoding: %d", header->encoding);
-            return CARQUET_ERROR_INVALID_ENCODING;
+            {
+                /* Phase 3 encodings (shared with V1 path). */
+                bool handled = false;
+                bool needs_page_retain = false;
+                status = decode_phase3_values(
+                    reader, header->encoding, ptr, remaining,
+                    values, non_null_count,
+                    &handled, &needs_page_retain, error);
+                if (!handled) {
+                    CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ENCODING,
+                        "Unsupported encoding: %d", header->encoding);
+                    return CARQUET_ERROR_INVALID_ENCODING;
+                }
+            }
+            break;
     }
 
     if (status != CARQUET_OK) {
@@ -1323,14 +1563,7 @@ static int32_t count_present_levels(
     const int16_t* def_levels,
     int32_t count,
     int16_t max_def_level) {
-
-    int32_t present = 0;
-    for (int32_t i = 0; i < count; i++) {
-        if (def_levels[i] == max_def_level) {
-            present++;
-        }
-    }
-    return present;
+    return (int32_t)carquet_dispatch_count_non_nulls(def_levels, count, max_def_level);
 }
 
 static carquet_status_t prepare_data_page_payload(
@@ -1446,8 +1679,10 @@ static carquet_status_t load_dictionary_page_mmap(
         return CARQUET_ERROR_INVALID_PAGE;
     }
     const uint8_t* header_ptr = mmap_data + dict_offset;
-    size_t remaining = file_reader->file_size - (size_t)dict_offset;
-    size_t max_header = remaining < 256 ? remaining : 256;
+    /* Page headers have no spec size limit (large statistics can exceed any
+     * fixed guess). The whole file is mapped, so let the thrift parser read
+     * the full remaining span; it stops at the struct end. */
+    size_t max_header = file_reader->file_size - (size_t)dict_offset;
 
     parquet_page_header_t page_header;
     size_t header_size;
@@ -1498,7 +1733,7 @@ static carquet_status_t load_dictionary_page_mmap(
         page_size = page_header.compressed_page_size;
     } else {
         /* Must decompress */
-        decompressed = malloc(page_header.uncompressed_page_size);
+        decompressed = carquet_mem_malloc(page_header.uncompressed_page_size);
         if (!decompressed) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate decompress buffer");
             return CARQUET_ERROR_OUT_OF_MEMORY;
@@ -1509,7 +1744,7 @@ static carquet_status_t load_dictionary_page_mmap(
             decompressed, page_header.uncompressed_page_size, &page_size);
 
         if (status != CARQUET_OK) {
-            free(decompressed);
+            carquet_mem_free(decompressed);
             CARQUET_SET_ERROR(error, status, "Failed to decompress dictionary");
             return status;
         }
@@ -1541,9 +1776,66 @@ static carquet_status_t load_dictionary_page_mmap(
     }
 
     if (col_meta->codec != CARQUET_COMPRESSION_UNCOMPRESSED && status != CARQUET_OK) {
-        free(decompressed);
+        carquet_mem_free(decompressed);
     }
     return status;
+}
+
+/* Parquet page headers have no spec size limit: large column statistics
+ * (BYTE_ARRAY min/max) can push a header past any fixed guess. Read from the
+ * prebuffer/file growing the window whenever the thrift parser reports
+ * truncation, until it parses or a hard ceiling is reached. */
+static carquet_status_t read_and_parse_page_header_fread(
+    carquet_reader_t* file_reader,
+    int64_t offset,
+    parquet_page_header_t* page_header,
+    size_t* header_size,
+    carquet_error_t* error) {
+
+    uint8_t stackbuf[256];
+    uint8_t* buf = stackbuf;
+    size_t cap = sizeof(stackbuf);
+
+    for (;;) {
+        size_t n = prebuf_read_at(file_reader, offset, buf, cap);
+        if (n < 8) {
+            if (buf != stackbuf) carquet_mem_free(buf);
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ,
+                              "Failed to read page header");
+            return CARQUET_ERROR_FILE_READ;
+        }
+
+        carquet_status_t status = parquet_parse_page_header(
+            buf, n, page_header, header_size, error);
+        if (status == CARQUET_OK) {
+            if (buf != stackbuf) carquet_mem_free(buf);
+            return CARQUET_OK;
+        }
+
+        /* Only a truncated parse on a completely filled buffer means the
+         * header may extend further; anything else is a real error or we
+         * already have all available bytes. */
+        if (status != CARQUET_ERROR_THRIFT_TRUNCATED || n < cap ||
+            cap >= CARQUET_MAX_PAGE_PAYLOAD_SIZE) {
+            if (buf != stackbuf) carquet_mem_free(buf);
+            return status;
+        }
+
+        size_t new_cap = cap * 4;
+        if (new_cap > CARQUET_MAX_PAGE_PAYLOAD_SIZE) {
+            new_cap = CARQUET_MAX_PAGE_PAYLOAD_SIZE;
+        }
+        uint8_t* nb = carquet_mem_malloc(new_cap);
+        if (!nb) {
+            if (buf != stackbuf) carquet_mem_free(buf);
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
+                              "Failed to allocate page header buffer");
+            return CARQUET_ERROR_OUT_OF_MEMORY;
+        }
+        if (buf != stackbuf) carquet_mem_free(buf);
+        buf = nb;
+        cap = new_cap;
+    }
 }
 
 /* ============================================================================
@@ -1560,18 +1852,10 @@ static carquet_status_t load_dictionary_page_fread(
     int64_t dict_offset = col_meta->dictionary_page_offset;
 
     /* Read page header (from prebuffer cache or file) */
-    uint8_t header_buf[256];
-    size_t header_read = prebuf_read_at(file_reader, dict_offset,
-                                         header_buf, sizeof(header_buf));
-    if (header_read < 8) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read dictionary header");
-        return CARQUET_ERROR_FILE_READ;
-    }
-
     parquet_page_header_t page_header;
     size_t header_size;
-    carquet_status_t status = parquet_parse_page_header(
-        header_buf, header_read, &page_header, &header_size, error);
+    carquet_status_t status = read_and_parse_page_header_fread(
+        file_reader, dict_offset, &page_header, &header_size, error);
     if (status != CARQUET_OK) {
         return status;
     }
@@ -1592,7 +1876,7 @@ static carquet_status_t load_dictionary_page_fread(
     }
 
     /* Read compressed data (from prebuffer cache or file) */
-    uint8_t* compressed = malloc(page_header.compressed_page_size);
+    uint8_t* compressed = carquet_mem_malloc(page_header.compressed_page_size);
     if (!compressed) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate compressed buffer");
         return CARQUET_ERROR_OUT_OF_MEMORY;
@@ -1600,14 +1884,14 @@ static carquet_status_t load_dictionary_page_fread(
 
     int64_t dict_data_offset;
     if (!checked_add_i64(dict_offset, (int64_t)header_size, &dict_data_offset)) {
-        free(compressed);
+        carquet_mem_free(compressed);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Dictionary page offset overflow");
         return CARQUET_ERROR_INVALID_PAGE;
     }
     if (prebuf_read_at(file_reader, dict_data_offset,
                        compressed, page_header.compressed_page_size) !=
         (size_t)page_header.compressed_page_size) {
-        free(compressed);
+        carquet_mem_free(compressed);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read dictionary data");
         return CARQUET_ERROR_FILE_READ;
     }
@@ -1617,7 +1901,7 @@ static carquet_status_t load_dictionary_page_fread(
         uint32_t computed_crc = carquet_crc32(compressed, page_header.compressed_page_size);
         uint32_t expected_crc = (uint32_t)page_header.crc;
         if (computed_crc != expected_crc) {
-            free(compressed);
+            carquet_mem_free(compressed);
             CARQUET_SET_ERROR(error, CARQUET_ERROR_CRC_MISMATCH,
                 "Dictionary page CRC mismatch: expected 0x%08X, got 0x%08X",
                 expected_crc, computed_crc);
@@ -1633,9 +1917,9 @@ static carquet_status_t load_dictionary_page_fread(
         page_data = compressed;
         page_size = page_header.compressed_page_size;
     } else {
-        page_data = malloc(page_header.uncompressed_page_size);
+        page_data = carquet_mem_malloc(page_header.uncompressed_page_size);
         if (!page_data) {
-            free(compressed);
+            carquet_mem_free(compressed);
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate decompress buffer");
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
@@ -1643,10 +1927,10 @@ static carquet_status_t load_dictionary_page_fread(
         status = carquet_decompress_page(col_meta->codec,
             compressed, page_header.compressed_page_size,
             page_data, page_header.uncompressed_page_size, &page_size);
-        free(compressed);
+        carquet_mem_free(compressed);
 
         if (status != CARQUET_OK) {
-            free(page_data);
+            carquet_mem_free(page_data);
             CARQUET_SET_ERROR(error, status, "Failed to decompress dictionary");
             return status;
         }
@@ -1676,9 +1960,9 @@ static carquet_status_t load_dictionary_page_fread(
 
     if (status != CARQUET_OK) {
         if (page_data != compressed) {
-            free(page_data);
+            carquet_mem_free(page_data);
         } else {
-            free(compressed);
+            carquet_mem_free(compressed);
         }
     }
 
@@ -1717,8 +2001,10 @@ static carquet_status_t load_next_page_mmap(
         return CARQUET_ERROR_INVALID_PAGE;
     }
     const uint8_t* header_ptr = mmap_data + page_offset;
-    size_t page_remaining = file_reader->file_size - (size_t)page_offset;
-    size_t max_hdr = page_remaining < 256 ? page_remaining : 256;
+    /* Page headers have no spec size limit (large statistics can exceed any
+     * fixed guess). The whole file is mapped, so let the thrift parser read
+     * the full remaining span; it stops at the struct end. */
+    size_t max_hdr = file_reader->file_size - (size_t)page_offset;
 
     parquet_page_header_t page_header;
     size_t header_size;
@@ -1764,7 +2050,13 @@ static carquet_status_t load_next_page_mmap(
                                : page_header.data_page_header.num_values;
     carquet_encoding_t page_encoding = is_v2 ? page_header.data_page_header_v2.encoding
                                              : page_header.data_page_header.encoding;
-    size_t value_size = get_value_size(reader->type, reader->type_length);
+    /* In dictionary-preserving mode, decoded_values contains uint32_t indices
+     * rather than materialized physical values. The batch reader sizes its
+     * destination buffer accordingly; keep the page-copy path symmetric or a
+     * preserved INT64/DOUBLE page will overrun a uint32_t output buffer. */
+    size_t value_size = reader->preserve_dictionary
+        ? sizeof(uint32_t)
+        : get_value_size(reader->type, reader->type_length);
 
     /* Check if zero-copy is possible (V1 only — V2 has levels interleaved) */
     bool zero_copy_eligible = !is_v2 && carquet_page_is_zero_copy_eligible(
@@ -1779,7 +2071,7 @@ static carquet_status_t load_next_page_mmap(
 
         /* Free previous owned buffer if any */
         if (reader->decoded_ownership == CARQUET_DATA_OWNED) {
-            free(reader->decoded_values);
+            carquet_mem_free(reader->decoded_values);
         }
 
         /* Point directly to mmap data - no copy! */
@@ -1790,11 +2082,11 @@ static carquet_status_t load_next_page_mmap(
          * Level buffers are unused by callers for REQUIRED columns, so set to NULL
          * to avoid unnecessary allocation and memset overhead. */
         if (reader->decoded_def_levels) {
-            free(reader->decoded_def_levels);
+            carquet_mem_free(reader->decoded_def_levels);
             reader->decoded_def_levels = NULL;
         }
         if (reader->decoded_rep_levels) {
-            free(reader->decoded_rep_levels);
+            carquet_mem_free(reader->decoded_rep_levels);
             reader->decoded_rep_levels = NULL;
         }
         reader->decoded_capacity = 0;
@@ -1833,7 +2125,7 @@ static carquet_status_t load_next_page_mmap(
         }
 
         if (reader->decoded_ownership == CARQUET_DATA_OWNED) {
-            free(reader->decoded_values);
+            carquet_mem_free(reader->decoded_values);
         }
         reader->decoded_values = (uint8_t*)page_data;
         reader->decoded_ownership = CARQUET_DATA_VIEW;
@@ -1882,7 +2174,8 @@ static carquet_status_t load_next_page_mmap(
      * may span multiple pages, so every page must be retained until the batch
      * is consumed (list is flushed on row-group reset / reader close). */
     if (used_decompress_buffer && reader->type == CARQUET_PHYSICAL_BYTE_ARRAY &&
-        page_encoding == CARQUET_ENCODING_PLAIN) {
+        (page_encoding == CARQUET_ENCODING_PLAIN ||
+         page_encoding == CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY)) {
         uint8_t* retained = carquet_column_retain_page(reader, page_data, page_size);
         if (!retained) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to retain page data");
@@ -1935,18 +2228,10 @@ static carquet_status_t load_next_page_fread(
         return CARQUET_ERROR_INVALID_PAGE;
     }
 
-    uint8_t header_buf[256];
-    size_t header_read = prebuf_read_at(file_reader, page_file_offset,
-                                         header_buf, sizeof(header_buf));
-    if (header_read < 8) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read page header");
-        return CARQUET_ERROR_FILE_READ;
-    }
-
     parquet_page_header_t page_header;
     size_t header_size;
-    carquet_status_t status = parquet_parse_page_header(
-        header_buf, header_read, &page_header, &header_size, error);
+    carquet_status_t status = read_and_parse_page_header_fread(
+        file_reader, page_file_offset, &page_header, &header_size, error);
     if (status != CARQUET_OK) {
         return status;
     }
@@ -1969,7 +2254,7 @@ static carquet_status_t load_next_page_fread(
 
     /* Read compressed page data into a reusable buffer (from prebuffer or file) */
     if ((size_t)page_header.compressed_page_size > reader->page_buffer_capacity) {
-        uint8_t* new_buffer = realloc(reader->page_buffer, (size_t)page_header.compressed_page_size);
+        uint8_t* new_buffer = carquet_mem_realloc(reader->page_buffer, (size_t)page_header.compressed_page_size);
         if (!new_buffer) {
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate page buffer");
             return CARQUET_ERROR_OUT_OF_MEMORY;
@@ -2010,7 +2295,9 @@ static carquet_status_t load_next_page_fread(
                                : page_header.data_page_header.num_values;
     carquet_encoding_t page_encoding = is_v2 ? page_header.data_page_header_v2.encoding
                                              : page_header.data_page_header.encoding;
-    size_t value_size = get_value_size(reader->type, reader->type_length);
+    size_t value_size = reader->preserve_dictionary
+        ? sizeof(uint32_t)
+        : get_value_size(reader->type, reader->type_length);
 
     /* Decompress if needed. V2 pages keep level bytes uncompressed and only
      * decompress the data tail, so both fread and mmap paths share this helper. */
@@ -2036,7 +2323,7 @@ static carquet_status_t load_next_page_fread(
         }
 
         if (reader->decoded_ownership == CARQUET_DATA_OWNED) {
-            free(reader->decoded_values);
+            carquet_mem_free(reader->decoded_values);
         }
         reader->decoded_values = (uint8_t*)page_data;
         reader->decoded_ownership = CARQUET_DATA_VIEW;
@@ -2083,7 +2370,8 @@ static carquet_status_t load_next_page_fread(
      * so those pointers stay valid across page boundaries within a batch;
      * the retention list is flushed on row-group reset / reader close. */
     bool retain = (reader->type == CARQUET_PHYSICAL_BYTE_ARRAY &&
-                   page_encoding == CARQUET_ENCODING_PLAIN);
+                   (page_encoding == CARQUET_ENCODING_PLAIN ||
+                    page_encoding == CARQUET_ENCODING_DELTA_LENGTH_BYTE_ARRAY));
 
     if (retain) {
         uint8_t* retained = carquet_column_retain_page(reader, page_data, page_size);
@@ -2205,7 +2493,9 @@ carquet_status_t carquet_read_next_page(
 
     /* Copy values from decoded buffers. Optional columns store a dense stream
      * of present values; definition levels preserve the logical row shape. */
-    size_t value_size = get_value_size(reader->type, reader->type_length);
+    size_t value_size = reader->preserve_dictionary
+        ? sizeof(uint32_t)
+        : get_value_size(reader->type, reader->type_length);
     size_t offset = (size_t)reader->page_values_read * value_size;
     int32_t values_to_copy = to_copy;
 

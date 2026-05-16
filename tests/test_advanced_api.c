@@ -351,14 +351,26 @@ static int test_per_column_options(void) {
     st = carquet_writer_set_column_encoding(w, 99, CARQUET_ENCODING_PLAIN);
     if (st == CARQUET_OK) TEST_FAIL("per_column", "should reject invalid index");
 
-    /* Unsupported encodings must be rejected before metadata can diverge from
-       the bytes the writer actually emits. */
+    /* Column 0 is INT64. Per the Parquet spec, DELTA_BINARY_PACKED and
+       BYTE_STREAM_SPLIT are both valid for INT64 and must be accepted. */
     st = carquet_writer_set_column_encoding(w, 0, CARQUET_ENCODING_DELTA_BINARY_PACKED);
-    if (st != CARQUET_ERROR_INVALID_ENCODING)
-        TEST_FAIL("per_column", "should reject unsupported encoding");
+    if (st != CARQUET_OK)
+        TEST_FAIL("per_column", "DELTA_BINARY_PACKED must be accepted for INT64");
     st = carquet_writer_set_column_encoding(w, 0, CARQUET_ENCODING_BYTE_STREAM_SPLIT);
+    if (st != CARQUET_OK)
+        TEST_FAIL("per_column", "BYTE_STREAM_SPLIT must be accepted for INT64");
+
+    /* Genuinely unsupported combinations must still be rejected:
+       DELTA_BINARY_PACKED is integer-only, so it is invalid for the
+       DOUBLE column (index 1). */
+    st = carquet_writer_set_column_encoding(w, 1, CARQUET_ENCODING_DELTA_BINARY_PACKED);
     if (st != CARQUET_ERROR_INVALID_ENCODING)
-        TEST_FAIL("per_column", "should reject byte-stream split for INT64");
+        TEST_FAIL("per_column", "should reject DELTA_BINARY_PACKED for DOUBLE");
+
+    /* Restore column 0 to PLAIN so the remaining metadata checks below are
+       independent of this encoding probe. */
+    st = carquet_writer_set_column_encoding(w, 0, CARQUET_ENCODING_PLAIN);
+    if (st != CARQUET_OK) TEST_FAIL("per_column", "reset col 0 encoding failed");
 
     /* Write data and close so we can read the metadata back */
     int64_t ids[N_ROWS];

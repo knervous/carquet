@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(carquet VERSION 0.4.4 LANGUAGES C)
+project(carquet VERSION 0.5.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -235,10 +235,12 @@ endif()
 # Source files
 set(CARQUET_CORE_SOURCES
     src/core/arena.c
+    src/core/allocator.c
     src/core/buffer.c
     src/core/bitpack.c
     src/core/endian.c
     src/core/error.c
+    src/core/geo_wkb.c
 )
 
 set(CARQUET_THRIFT_SOURCES
@@ -300,6 +302,7 @@ set(CARQUET_WRITER_SOURCES
     src/writer/row_group_writer.c
     src/writer/column_writer.c
     src/writer/page_writer.c
+    src/writer/arrow_schema.c
 )
 
 set(CARQUET_METADATA_SOURCES
@@ -578,6 +581,15 @@ if(CARQUET_BUILD_TESTS)
 
     # Advanced API tests (bloom filter, page index, kv metadata, etc.)
     add_carquet_test(test_advanced_api tests/test_advanced_api.c)
+
+    # carquet-reads-carquet roundtrip for every opt-in encoding
+    add_carquet_test(test_encoding_roundtrip tests/test_encoding_roundtrip.c)
+
+    # INT96 writing, opt-in Data Page V2, ARROW:schema metadata
+    add_carquet_test(test_writer_extensions tests/test_writer_extensions.c)
+
+    # Wide (SIMD) bit-unpack fast path vs independent oracle
+    add_carquet_test(test_bitunpack_wide tests/test_bitunpack_wide.c)
 endif()
 
 # Examples

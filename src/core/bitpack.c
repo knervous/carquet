@@ -14,6 +14,8 @@
 #include <string.h>
 
 extern carquet_bitunpack8_fn carquet_dispatch_get_bitunpack8_fn(int bit_width);
+extern int carquet_dispatch_get_bitunpack_wide(int bit_width,
+                                               carquet_bitunpack8_fn* fn);
 
 /* Read bytes as little-endian integers for bit unpacking */
 static inline uint16_t read_le16(const uint8_t* p) {
@@ -223,6 +225,22 @@ size_t carquet_bitunpack_32(const uint8_t* input, size_t count,
 
     size_t bytes_consumed = 0;
     size_t i = 0;
+
+    /* Wide SIMD fast path: process wvals (16/32) values per call where a
+     * verified wide kernel exists for this width. wvals is a multiple of 8
+     * and the kernel is identical to wvals/8 scalar group unpacks, so byte
+     * accounting (bit_width bytes per 8 values) is preserved for the loops
+     * below. carquet_packed_size(wvals,bit_width) is exact here because
+     * wvals*bit_width is a multiple of 8. */
+    carquet_bitunpack8_fn wide_fn = NULL;
+    int wvals = carquet_dispatch_get_bitunpack_wide(bit_width, &wide_fn);
+    if (wvals > 0) {
+        size_t wbytes = carquet_packed_size((size_t)wvals, bit_width);
+        for (; i + (size_t)wvals <= count; i += (size_t)wvals) {
+            wide_fn(input + bytes_consumed, values + i);
+            bytes_consumed += wbytes;
+        }
+    }
 
     /* Process groups of 8 */
     for (; i + 8 <= count; i += 8) {
@@ -506,4 +524,33 @@ void carquet_bit_writer_flush(carquet_bit_writer_t* writer) {
 
 size_t carquet_bit_writer_bytes_written(const carquet_bit_writer_t* writer) {
     return writer->byte_pos;
+}
+
+int carquet_decode_bitpacked_levels(const uint8_t* data, size_t data_size,
+                                    int bit_width, int32_t count,
+                                    int16_t* out, size_t* consumed) {
+    if (!out || count < 0) return -1;
+    if (bit_width == 0) {
+        memset(out, 0, (size_t)count * sizeof(int16_t));
+        if (consumed) *consumed = 0;
+        return 0;
+    }
+    if (bit_width < 0 || bit_width > 16 || !data) return -1;
+
+    size_t needed = ((size_t)count * (size_t)bit_width + 7) / 8;
+    if (needed > data_size) return -1;
+
+    uint64_t bitpos = 0;
+    for (int32_t i = 0; i < count; i++) {
+        uint32_t v = 0;
+        for (int b = 0; b < bit_width; b++) {
+            size_t byte = (size_t)(bitpos >> 3);
+            int shift = 7 - (int)(bitpos & 7);
+            v = (v << 1) | (uint32_t)((data[byte] >> shift) & 1);
+            bitpos++;
+        }
+        out[i] = (int16_t)v;
+    }
+    if (consumed) *consumed = needed;
+    return 0;
 }

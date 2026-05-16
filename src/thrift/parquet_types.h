@@ -31,6 +31,7 @@ typedef struct parquet_statistics parquet_statistics_t;
 typedef struct parquet_page_encoding_stats parquet_page_encoding_stats_t;
 typedef struct parquet_column_metadata parquet_column_metadata_t;
 typedef struct parquet_column_chunk parquet_column_chunk_t;
+typedef struct parquet_sorting_column parquet_sorting_column_t;
 typedef struct parquet_row_group parquet_row_group_t;
 typedef struct parquet_key_value parquet_key_value_t;
 typedef struct parquet_file_metadata parquet_file_metadata_t;
@@ -121,6 +122,30 @@ struct parquet_statistics {
 };
 
 /* ============================================================================
+ * Geospatial Statistics (for GEOMETRY / GEOGRAPHY logical types)
+ * ============================================================================
+ * Parquet GeospatialStatistics: a coordinate bounding box plus the set of
+ * ISO-WKB geometry type codes present in the column chunk.
+ */
+
+#define CARQUET_GEO_MAX_TYPES 64
+
+struct parquet_geospatial_statistics {
+    bool valid;                 /* at least one finite coordinate accumulated */
+    /* BoundingBox: x/y always present; z/m only if seen. */
+    double xmin, xmax, ymin, ymax;
+    bool has_z;
+    double zmin, zmax;
+    bool has_m;
+    double mmin, mmax;
+    /* Distinct ISO-WKB geometry type codes encountered (e.g. 1=Point XY,
+     * 1001=Point XYZ). Empty list means "unknown". */
+    int32_t types[CARQUET_GEO_MAX_TYPES];
+    int32_t num_types;
+};
+typedef struct parquet_geospatial_statistics parquet_geospatial_statistics_t;
+
+/* ============================================================================
  * Page Encoding Stats
  * ============================================================================
  */
@@ -190,6 +215,10 @@ struct parquet_column_metadata {
     /* Field 15: bloom_filter_length */
     bool has_bloom_filter_length;
     int32_t bloom_filter_length;
+
+    /* Field 17: geospatial_statistics (GEOMETRY / GEOGRAPHY) */
+    bool has_geospatial_statistics;
+    parquet_geospatial_statistics_t geospatial_statistics;
 };
 
 /* ============================================================================
@@ -230,6 +259,16 @@ struct parquet_column_chunk {
  * ============================================================================
  */
 
+/* Parquet Thrift: SortingColumn */
+struct parquet_sorting_column {
+    /* Field 1: column_idx (ordinal position of the column in this row group) */
+    int32_t column_idx;
+    /* Field 2: descending (true => sorted descending) */
+    bool descending;
+    /* Field 3: nulls_first (true => nulls before non-null values) */
+    bool nulls_first;
+};
+
 struct parquet_row_group {
     /* Field 1: columns */
     parquet_column_chunk_t* columns;
@@ -241,7 +280,9 @@ struct parquet_row_group {
     /* Field 3: num_rows */
     int64_t num_rows;
 
-    /* Field 4: sorting_columns (we skip for now) */
+    /* Field 4: sorting_columns (optional) */
+    parquet_sorting_column_t* sorting_columns;
+    int32_t num_sorting_columns;
 
     /* Field 5: file_offset */
     bool has_file_offset;

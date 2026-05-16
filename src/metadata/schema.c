@@ -3,6 +3,7 @@
  * @brief Schema management
  */
 
+#include "core/allocator.h"
 #include <carquet/carquet.h>
 #include "reader/reader_internal.h"
 #include "thrift/parquet_types.h"
@@ -21,14 +22,14 @@
 #define SCHEMA_GROWTH_FACTOR 2
 
 carquet_schema_t* carquet_schema_create(carquet_error_t* error) {
-    carquet_schema_t* schema = calloc(1, sizeof(carquet_schema_t));
+    carquet_schema_t* schema = carquet_mem_calloc(1, sizeof(carquet_schema_t));
     if (!schema) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate schema");
         return NULL;
     }
 
     if (carquet_arena_init_size(&schema->arena, 4096) != CARQUET_OK) {
-        free(schema);
+        carquet_mem_free(schema);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate schema arena");
         return NULL;
     }
@@ -37,10 +38,10 @@ carquet_schema_t* carquet_schema_create(carquet_error_t* error) {
     schema->capacity = SCHEMA_INITIAL_CAPACITY;
     schema->num_elements = 1;  /* Root element */
 
-    schema->elements = calloc(schema->capacity, sizeof(parquet_schema_element_t));
+    schema->elements = carquet_mem_calloc(schema->capacity, sizeof(parquet_schema_element_t));
     if (!schema->elements) {
         carquet_arena_destroy(&schema->arena);
-        free(schema);
+        carquet_mem_free(schema);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate schema elements");
         return NULL;
     }
@@ -50,30 +51,30 @@ carquet_schema_t* carquet_schema_create(carquet_error_t* error) {
     schema->elements[0].num_children = 0;
 
     /* Allocate parent index tracking */
-    schema->parent_indices = calloc(schema->capacity, sizeof(int32_t));
+    schema->parent_indices = carquet_mem_calloc(schema->capacity, sizeof(int32_t));
     if (!schema->parent_indices) {
-        free(schema->elements);
+        carquet_mem_free(schema->elements);
         carquet_arena_destroy(&schema->arena);
-        free(schema);
+        carquet_mem_free(schema);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate parent indices");
         return NULL;
     }
     schema->parent_indices[0] = -1;  /* Root has no parent */
 
     /* Allocate leaf tracking arrays with malloc */
-    schema->leaf_indices = calloc(schema->capacity, sizeof(int32_t));
-    schema->max_def_levels = calloc(schema->capacity, sizeof(int16_t));
-    schema->max_rep_levels = calloc(schema->capacity, sizeof(int16_t));
+    schema->leaf_indices = carquet_mem_calloc(schema->capacity, sizeof(int32_t));
+    schema->max_def_levels = carquet_mem_calloc(schema->capacity, sizeof(int16_t));
+    schema->max_rep_levels = carquet_mem_calloc(schema->capacity, sizeof(int16_t));
     schema->num_leaves = 0;
 
     if (!schema->leaf_indices || !schema->max_def_levels || !schema->max_rep_levels) {
-        free(schema->elements);
-        free(schema->parent_indices);
-        free(schema->leaf_indices);
-        free(schema->max_def_levels);
-        free(schema->max_rep_levels);
+        carquet_mem_free(schema->elements);
+        carquet_mem_free(schema->parent_indices);
+        carquet_mem_free(schema->leaf_indices);
+        carquet_mem_free(schema->max_def_levels);
+        carquet_mem_free(schema->max_rep_levels);
         carquet_arena_destroy(&schema->arena);
-        free(schema);
+        carquet_mem_free(schema);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate schema leaf arrays");
         return NULL;
     }
@@ -83,13 +84,13 @@ carquet_schema_t* carquet_schema_create(carquet_error_t* error) {
 
 void carquet_schema_free(carquet_schema_t* schema) {
     if (schema) {
-        free(schema->elements);
-        free(schema->parent_indices);
-        free(schema->leaf_indices);
-        free(schema->max_def_levels);
-        free(schema->max_rep_levels);
+        carquet_mem_free(schema->elements);
+        carquet_mem_free(schema->parent_indices);
+        carquet_mem_free(schema->leaf_indices);
+        carquet_mem_free(schema->max_def_levels);
+        carquet_mem_free(schema->max_rep_levels);
         carquet_arena_destroy(&schema->arena);
-        free(schema);
+        carquet_mem_free(schema);
     }
 }
 
@@ -104,7 +105,7 @@ static carquet_status_t schema_ensure_capacity(carquet_schema_t* schema, int32_t
         new_capacity *= SCHEMA_GROWTH_FACTOR;
     }
 
-    parquet_schema_element_t* new_elements = realloc(
+    parquet_schema_element_t* new_elements = carquet_mem_realloc(
         schema->elements, new_capacity * sizeof(parquet_schema_element_t));
     if (!new_elements) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
@@ -114,28 +115,28 @@ static carquet_status_t schema_ensure_capacity(carquet_schema_t* schema, int32_t
            (new_capacity - schema->capacity) * sizeof(parquet_schema_element_t));
     schema->elements = new_elements;
 
-    int32_t* new_parent_indices = realloc(
+    int32_t* new_parent_indices = carquet_mem_realloc(
         schema->parent_indices, new_capacity * sizeof(int32_t));
     if (!new_parent_indices) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
     schema->parent_indices = new_parent_indices;
 
-    int32_t* new_leaf_indices = realloc(
+    int32_t* new_leaf_indices = carquet_mem_realloc(
         schema->leaf_indices, new_capacity * sizeof(int32_t));
     if (!new_leaf_indices) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
     schema->leaf_indices = new_leaf_indices;
 
-    int16_t* new_max_def = realloc(
+    int16_t* new_max_def = carquet_mem_realloc(
         schema->max_def_levels, new_capacity * sizeof(int16_t));
     if (!new_max_def) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
     schema->max_def_levels = new_max_def;
 
-    int16_t* new_max_rep = realloc(
+    int16_t* new_max_rep = carquet_mem_realloc(
         schema->max_rep_levels, new_capacity * sizeof(int16_t));
     if (!new_max_rep) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
@@ -252,6 +253,13 @@ static carquet_status_t validate_column_logical_type(
         case CARQUET_LOGICAL_FLOAT16:
             return physical_type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY &&
                    type_length == 2
+                ? CARQUET_OK
+                : CARQUET_ERROR_INVALID_ARGUMENT;
+
+        case CARQUET_LOGICAL_INTERVAL:
+            /* INTERVAL is a 12-byte FIXED_LEN_BYTE_ARRAY (months/days/millis). */
+            return physical_type == CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY &&
+                   type_length == 12
                 ? CARQUET_OK
                 : CARQUET_ERROR_INVALID_ARGUMENT;
 

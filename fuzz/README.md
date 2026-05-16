@@ -34,12 +34,12 @@ python3 fuzz/run_fuzzer.py reader --clean-artifacts
 
 | Target | Modes | Coverage |
 |--------|-------|----------|
-| `fuzz_reader` | 1 | Full file reader: buffer open, schema, batch reader, column reader, type names, bloom filter query, column/offset index parsing, key-value metadata, column chunk metadata |
-| `fuzz_writer` | 1 | Schema creation, all physical types (incl. BYTE_ARRAY), all codecs, config variants, write-read roundtrip |
+| `fuzz_reader` | 1 | Full file reader: buffer open, schema, batch reader, row-group filters, dictionary-preserving batches, column reader, type names, bloom filter query, column/offset index parsing, key-value metadata, column chunk metadata |
+| `fuzz_writer` | 1 | Flat-schema creation, all primitive physical types, valid logical annotations, all codecs, opt-in encodings, Data Page V2, Arrow schema metadata, sorting columns, per-column bloom config, buffer/file outputs, prebuffered readback |
 | `fuzz_compression` | 3 | Snappy/LZ4/GZIP/ZSTD: decompress malformed, compress-decompress roundtrip, undersized buffer |
-| `fuzz_encodings` | 17 | RLE, Delta INT32/INT64, Plain (bool/int32/int64/float/double), Dictionary (int32/int64/float/double), BSS (float/double/generic), Delta Length Byte Array, RLE levels |
+| `fuzz_encodings` | 18 | RLE, Delta INT32/INT64, Plain (bool/int32/int64/float/double), Dictionary (int32/int64/float/double), BSS (float/double/generic), Delta Length Byte Array, Delta Byte Array, RLE levels |
 | `fuzz_thrift` | 8 | Primitives, struct parsing, containers (list/map), file metadata, page headers, encoder-decoder roundtrip, ColumnIndex parsing, OffsetIndex parsing |
-| `fuzz_roundtrip` | 11 | Delta INT32/INT64, LZ4/Snappy/GZIP/ZSTD, BSS float/double, RLE, Dictionary INT32, Plain INT32 |
+| `fuzz_roundtrip` | 16 | Delta INT32/INT64, LZ4/Snappy/GZIP/ZSTD, BSS float/double/generic fixed-width payloads, RLE, Dictionary INT32, Plain INT32, Delta Length Byte Array, Delta Byte Array |
 
 ## Commands
 

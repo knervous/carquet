@@ -64,6 +64,10 @@ opts.write_statistics = true;
 opts.write_crc = true;
 opts.write_page_index = true;
 opts.write_bloom_filters = true;
+opts.write_arrow_schema = false;  /* embed Arrow IPC schema as ARROW:schema (opt-in) */
+opts.data_page_version = 1;       /* 1 = DATA_PAGE (default); 2 = DATA_PAGE_V2 */
+opts.coerce_timestamps = false;   /* rescale all TIMESTAMP columns to one unit */
+opts.write_batch_size = 0;        /* 0 = automatic internal batching */
 
 carquet_writer_t* writer = carquet_writer_create("out.parquet", schema, &opts, &err);
 if (!writer) {
@@ -74,6 +78,13 @@ if (!writer) {
 
 carquet_schema_free(schema);  /* Safe after writer creation */
 ```
+
+Two opt-in options, both off by default so default output bytes are unchanged:
+
+- `write_arrow_schema`: when `true`, embeds the original Arrow schema as a base64-encoded Arrow IPC Schema message under the `ARROW:schema` footer key, so Arrow/PyArrow recover Arrow-specific type information losslessly. Emitted only for flat (non-nested) schemas and only when you have not already set that key yourself.
+- `data_page_version`: `2` writes `DATA_PAGE_V2` (repetition/definition levels stored uncompressed and outside the compressed value region, matching parquet-cpp); any other value keeps the default V1 path.
+- `coerce_timestamps` / `coerce_timestamp_unit` / `allow_timestamp_truncation`: when `coerce_timestamps` is true, every `TIMESTAMP` column is rescaled to `coerce_timestamp_unit` (and its metadata emitted at that unit) regardless of the unit declared in the schema — the equivalent of PyArrow's `coerce_timestamps`. A coarser target loses precision and is rejected unless `allow_timestamp_truncation` is true (PyArrow's `allow_truncated_timestamps`).
+- `write_batch_size`: caps how many values are processed per internal chunk before a page flush is considered (PyArrow's `write_batch_size`); `0` keeps the automatic page-size-derived heuristic. This tunes streaming/memory behavior, not the output format. carquet's "format version" is controlled by `data_page_version` plus its always-compatible metadata (modern `LogicalType` + legacy `ConvertedType`), so there is no separate version-policy knob.
 
 Other writer entry points:
 
@@ -130,14 +141,27 @@ Useful APIs before the first write:
 - `carquet_writer_set_column_compression()`
 - `carquet_writer_set_column_statistics()`
 - `carquet_writer_set_column_bloom_filter()`
+- `carquet_writer_set_sorting_columns()`: declare the row-group sort order (written to every row group's metadata; the writer records the declaration only and does not sort or verify the data)
 
 Per-column overrides must be set after writer creation and before writing data.
+
+### Encoding defaults
+
+By default columns use `PLAIN`, with automatic `BYTE_STREAM_SPLIT` for `FLOAT`/`DOUBLE` columns when a compression codec is set. This favors carquet's fast (near zero-copy) read path; it does not dictionary-encode by default.
+
+Opt into another encoding per column with `carquet_writer_set_column_encoding()`: `RLE_DICTIONARY` (emits a `PLAIN` dictionary page plus `RLE_DICTIONARY` data pages, with automatic fallback to `PLAIN` when the dictionary would exceed `dictionary_page_size` or the data is effectively all-unique), `BYTE_STREAM_SPLIT` (FLOAT/DOUBLE/INT32/INT64/FLBA), `DELTA_BINARY_PACKED` (INT32/INT64), or `DELTA_LENGTH_BYTE_ARRAY` / `DELTA_BYTE_ARRAY` (BYTE_ARRAY). Dictionary encoding produces smaller files but is slower to read, so it is a deliberate choice rather than the default.
 
 ## Column Statistics
 
 With `opts.write_statistics = true` (the default), the writer records per-row-group min/max and null counts for every primitive type — `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `BOOLEAN`, `BYTE_ARRAY`, and `FIXED_LEN_BYTE_ARRAY`. Stats are aggregated across pages and used by `carquet_reader_filter_row_groups()` for predicate pushdown.
 
 `BYTE_ARRAY` min/max are stored using lexicographic order; values longer than 32 bytes are truncated per the Parquet spec (min is truncated to a prefix; max is truncated and incremented so the stored bound is still a valid upper bound).
+
+Type-specific statistics behavior, all automatic:
+
+- `FLOAT16` (`FIXED_LEN_BYTE_ARRAY(2)`) min/max are ordered by the represented floating-point value with NaNs skipped, and a zero bound is normalized to `-0.0` (min) / `+0.0` (max), per the spec — not byte-lexicographically.
+- `INT96` has no defined sort order, so no min/max statistics are written for it (matching parquet-cpp).
+- `GEOMETRY` / `GEOGRAPHY` columns instead get `GeospatialStatistics` written into the column metadata: a coordinate bounding box (`xmin/xmax/ymin/ymax`, plus `z`/`m` when present) and the set of ISO-WKB geometry type codes, computed by parsing the column's WKB values. Regular min/max remain suppressed for these types.
 
 Use `carquet_writer_set_column_statistics(writer, idx, false)` to disable stats for a single column while keeping them on globally.
 

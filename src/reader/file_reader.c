@@ -3,6 +3,7 @@
  * @brief Parquet file reader implementation
  */
 
+#include "core/allocator.h"
 #include <carquet/carquet.h>
 #include "reader_internal.h"
 #include "thrift/parquet_types.h"
@@ -262,7 +263,7 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
      * files, the entire Thrift-encoded footer in a single fread call. */
     size_t spec_size = reader->file_size < CARQUET_FOOTER_SPECULATIVE_SIZE
                      ? reader->file_size : CARQUET_FOOTER_SPECULATIVE_SIZE;
-    uint8_t* spec_buf = malloc(spec_size);
+    uint8_t* spec_buf = carquet_mem_malloc(spec_size);
     if (!spec_buf) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate footer buffer");
         return CARQUET_ERROR_OUT_OF_MEMORY;
@@ -270,20 +271,20 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
 
     long spec_offset = (long)(reader->file_size - spec_size);
     if (fseek(reader->file, spec_offset, SEEK_SET) != 0) {
-        free(spec_buf);
+        carquet_mem_free(spec_buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek to footer");
         return CARQUET_ERROR_FILE_SEEK;
     }
 
     if (fread(spec_buf, 1, spec_size, reader->file) != spec_size) {
-        free(spec_buf);
+        carquet_mem_free(spec_buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read footer tail");
         return CARQUET_ERROR_FILE_READ;
     }
 
     /* Verify trailing magic (last 4 bytes of file) */
     if (memcmp(spec_buf + spec_size - 4, PARQUET_MAGIC, PARQUET_MAGIC_LEN) != 0) {
-        free(spec_buf);
+        carquet_mem_free(spec_buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_MAGIC, "Invalid trailing magic");
         return CARQUET_ERROR_INVALID_MAGIC;
     }
@@ -291,7 +292,7 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
     /* Get footer size (4 bytes before trailing magic) */
     uint32_t footer_size = carquet_read_u32_le(spec_buf + spec_size - 8);
     if (footer_size > reader->file_size - 8) {
-        free(spec_buf);
+        carquet_mem_free(spec_buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_FOOTER, "Footer size too large");
         return CARQUET_ERROR_INVALID_FOOTER;
     }
@@ -304,24 +305,24 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
         footer_data = spec_buf + spec_size - 8 - footer_size;
     } else {
         /* Slow path: footer is larger than speculative buffer, need second read */
-        fallback_buf = malloc(footer_size);
+        fallback_buf = carquet_mem_malloc(footer_size);
         if (!fallback_buf) {
-            free(spec_buf);
+            carquet_mem_free(spec_buf);
             CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate footer buffer");
             return CARQUET_ERROR_OUT_OF_MEMORY;
         }
 
         long footer_offset = (long)(reader->file_size - 8 - footer_size);
         if (fseek(reader->file, footer_offset, SEEK_SET) != 0) {
-            free(fallback_buf);
-            free(spec_buf);
+            carquet_mem_free(fallback_buf);
+            carquet_mem_free(spec_buf);
             CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek to footer data");
             return CARQUET_ERROR_FILE_SEEK;
         }
 
         if (fread(fallback_buf, 1, footer_size, reader->file) != footer_size) {
-            free(fallback_buf);
-            free(spec_buf);
+            carquet_mem_free(fallback_buf);
+            carquet_mem_free(spec_buf);
             CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read footer data");
             return CARQUET_ERROR_FILE_READ;
         }
@@ -333,8 +334,8 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
     carquet_status_t status = parquet_parse_file_metadata(
         footer_data, footer_size, &reader->arena, &reader->metadata, error);
 
-    free(fallback_buf);
-    free(spec_buf);
+    carquet_mem_free(fallback_buf);
+    carquet_mem_free(spec_buf);
 
     if (status != CARQUET_OK) {
         return status;
@@ -404,7 +405,7 @@ carquet_reader_t* carquet_reader_open(
     const carquet_reader_options_t* options,
     carquet_error_t* error) {
 
-    carquet_reader_t* reader = calloc(1, sizeof(carquet_reader_t));
+    carquet_reader_t* reader = carquet_mem_calloc(1, sizeof(carquet_reader_t));
     if (!reader) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate reader");
         return NULL;
@@ -418,7 +419,7 @@ carquet_reader_t* carquet_reader_open(
 
     /* Initialize arena */
     if (carquet_arena_init(&reader->arena) != CARQUET_OK) {
-        free(reader);
+        carquet_mem_free(reader);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to initialize arena");
         return NULL;
     }
@@ -441,7 +442,7 @@ carquet_reader_t* carquet_reader_open(
             if (status != CARQUET_OK) {
                 carquet_mmap_close(reader->mmap_info);
                 carquet_arena_destroy(&reader->arena);
-                free(reader);
+                carquet_mem_free(reader);
                 return NULL;
             }
 
@@ -455,7 +456,7 @@ carquet_reader_t* carquet_reader_open(
     FILE* file = fopen(path, "rb");
     if (!file) {
         carquet_arena_destroy(&reader->arena);
-        free(reader);
+        carquet_mem_free(reader);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_OPEN, "Failed to open file: %s", path);
         return NULL;
     }
@@ -468,12 +469,153 @@ carquet_reader_t* carquet_reader_open(
     if (status != CARQUET_OK) {
         carquet_arena_destroy(&reader->arena);
         fclose(file);
-        free(reader);
+        carquet_mem_free(reader);
         return NULL;
     }
 
     reader->is_open = true;
     return reader;
+}
+
+carquet_reader_t* carquet_reader_open_file(
+    FILE* file,
+    const carquet_reader_options_t* options,
+    carquet_error_t* error) {
+
+    /* file is nonnull per API contract (matches carquet_reader_open) */
+    carquet_reader_t* reader = carquet_mem_calloc(1, sizeof(carquet_reader_t));
+    if (!reader) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate reader");
+        return NULL;
+    }
+
+    if (options) {
+        reader->options = *options;
+    } else {
+        carquet_reader_options_init(&reader->options);
+    }
+    /* mmap is meaningless for a caller-provided stream. */
+    reader->options.use_mmap = false;
+
+    if (carquet_arena_init(&reader->arena) != CARQUET_OK) {
+        carquet_mem_free(reader);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to initialize arena");
+        return NULL;
+    }
+
+    reader->prebuffer.row_group = -1;
+    reader->file = file;
+    reader->owns_file = false;  /* Caller retains ownership of the FILE handle */
+
+    carquet_status_t status = read_footer(reader, error);
+    if (status != CARQUET_OK) {
+        carquet_arena_destroy(&reader->arena);
+        carquet_mem_free(reader);
+        return NULL;
+    }
+
+    reader->is_open = true;
+    return reader;
+}
+
+carquet_status_t carquet_get_file_info(
+    const char* path,
+    carquet_file_info_t* info,
+    carquet_error_t* error) {
+
+    /* path and info are nonnull per API contract */
+    memset(info, 0, sizeof(*info));
+
+    carquet_reader_t* reader = carquet_reader_open(path, NULL, error);
+    if (!reader) {
+        return error ? error->code : CARQUET_ERROR_FILE_OPEN;
+    }
+
+    info->file_size = (int64_t)reader->file_size;
+    info->num_rows = reader->metadata.num_rows;
+    info->num_row_groups = reader->metadata.num_row_groups;
+    info->num_columns = reader->schema ? reader->schema->num_leaves : 0;
+    info->version = reader->metadata.version;
+
+    /* Copy created_by into the caller-owned inline buffer (truncating if
+     * needed) so it stays valid after the reader is closed. */
+    const char* cb = reader->metadata.created_by;
+    if (cb) {
+        size_t n = strlen(cb);
+        if (n >= sizeof(info->created_by)) {
+            n = sizeof(info->created_by) - 1;
+        }
+        memcpy(info->created_by, cb, n);
+        info->created_by[n] = '\0';
+    } else {
+        info->created_by[0] = '\0';
+    }
+
+    carquet_reader_close(reader);
+    return CARQUET_OK;
+}
+
+carquet_status_t carquet_validate_file(
+    const char* path,
+    carquet_error_t* error) {
+
+    /* path is nonnull per API contract.
+     *
+     * Stage 1: carquet_reader_open performs structural validation - magic
+     * bytes, footer size, Thrift metadata parse, and schema construction.
+     *
+     * Stage 2: stream every row group / column / page with verify_checksums
+     * enabled. This forces each page to be read, CRC32-verified (where a CRC
+     * is present), decompressed, and decoded - surfacing any corruption that
+     * a footer-only check would miss. */
+    carquet_error_t local = CARQUET_ERROR_INIT;
+    carquet_reader_options_t ropts;
+    carquet_reader_options_init(&ropts);
+    ropts.verify_checksums = true;
+
+    carquet_reader_t* reader = carquet_reader_open(path, &ropts, &local);
+    if (!reader) {
+        if (error) *error = local;
+        return local.code;
+    }
+
+    carquet_status_t result = CARQUET_OK;
+
+    /* Files with no columns or no rows have no pages to scan; structural
+     * validation alone is conclusive for them. */
+    if (reader->schema && reader->schema->num_leaves > 0 &&
+        reader->metadata.num_rows > 0) {
+
+        carquet_batch_reader_config_t cfg;
+        carquet_batch_reader_config_init(&cfg);  /* NULL projection = all columns */
+
+        carquet_batch_reader_t* br = carquet_batch_reader_create(reader, &cfg, &local);
+        if (!br) {
+            if (error) *error = local;
+            result = local.code;
+        } else {
+            for (;;) {
+                carquet_row_batch_t* batch = NULL;
+                carquet_status_t st = carquet_batch_reader_next(br, &batch);
+                if (st == CARQUET_ERROR_END_OF_DATA) {
+                    break;
+                }
+                if (st != CARQUET_OK) {
+                    CARQUET_SET_ERROR(&local, st,
+                        "Page validation failed (checksum/decode error)");
+                    if (error) *error = local;
+                    result = st;
+                    if (batch) carquet_row_batch_free(batch);
+                    break;
+                }
+                if (batch) carquet_row_batch_free(batch);
+            }
+            carquet_batch_reader_free(br);
+        }
+    }
+
+    carquet_reader_close(reader);
+    return result;
 }
 
 void carquet_reader_close(carquet_reader_t* reader) {
@@ -494,7 +636,7 @@ void carquet_reader_close(carquet_reader_t* reader) {
     }
 
     carquet_arena_destroy(&reader->arena);
-    free(reader);
+    carquet_mem_free(reader);
 }
 
 const carquet_schema_t* carquet_reader_schema(const carquet_reader_t* reader) {
@@ -619,7 +761,7 @@ carquet_status_t carquet_reader_prebuffer(
     carquet_reader_release_prebuffer(reader);
 
     /* Allocate and read the coalesced range */
-    uint8_t* buf = malloc(total_size);
+    uint8_t* buf = carquet_mem_malloc(total_size);
     if (!buf) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
             "Failed to allocate prebuffer (%zu bytes)", total_size);
@@ -628,13 +770,13 @@ carquet_status_t carquet_reader_prebuffer(
 
     if (min_offset > LONG_MAX ||
         fseek(reader->file, (long)min_offset, SEEK_SET) != 0) {
-        free(buf);
+        carquet_mem_free(buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek for prebuffer");
         return CARQUET_ERROR_FILE_SEEK;
     }
 
     if (fread(buf, 1, total_size, reader->file) != total_size) {
-        free(buf);
+        carquet_mem_free(buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read prebuffer data");
         return CARQUET_ERROR_FILE_READ;
     }
@@ -649,7 +791,7 @@ carquet_status_t carquet_reader_prebuffer(
 
 void carquet_reader_release_prebuffer(carquet_reader_t* reader) {
     if (reader->prebuffer.data) {
-        free(reader->prebuffer.data);
+        carquet_mem_free(reader->prebuffer.data);
         reader->prebuffer.data = NULL;
         reader->prebuffer.file_offset = 0;
         reader->prebuffer.size = 0;
@@ -689,7 +831,7 @@ carquet_column_reader_t* carquet_reader_get_column(
         return NULL;
     }
 
-    carquet_column_reader_t* col_reader = calloc(1, sizeof(carquet_column_reader_t));
+    carquet_column_reader_t* col_reader = carquet_mem_calloc(1, sizeof(carquet_column_reader_t));
     if (!col_reader) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
             "Failed to allocate column reader");
@@ -705,7 +847,7 @@ carquet_column_reader_t* carquet_reader_get_column(
         col_reader->col_meta = &col_reader->chunk->metadata;
     } else {
         /* Metadata might be in separate file - not supported yet */
-        free(col_reader);
+        carquet_mem_free(col_reader);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
             "External column metadata not supported");
         return NULL;
@@ -729,24 +871,24 @@ carquet_column_reader_t* carquet_reader_get_column(
 void carquet_column_reader_free(carquet_column_reader_t* reader) {
     if (!reader) return;
 
-    free(reader->page_buffer);
+    carquet_mem_free(reader->page_buffer);
     carquet_column_clear_retained_pages(reader);
     if (reader->dictionary_ownership == CARQUET_DATA_OWNED) {
-        free(reader->dictionary_data);
+        carquet_mem_free(reader->dictionary_data);
     }
-    free(reader->dictionary_offsets);
+    carquet_mem_free(reader->dictionary_offsets);
 
     /* Only free decoded_values if we own the memory (not a mmap view) */
     if (reader->decoded_ownership == CARQUET_DATA_OWNED) {
-        free(reader->decoded_values);
+        carquet_mem_free(reader->decoded_values);
     }
 
     /* Levels are always owned (decoded from RLE) */
-    free(reader->decoded_def_levels);
-    free(reader->decoded_rep_levels);
-    free(reader->indices_buffer);
-    free(reader->decompress_buffer);
-    free(reader);
+    carquet_mem_free(reader->decoded_def_levels);
+    carquet_mem_free(reader->decoded_rep_levels);
+    carquet_mem_free(reader->indices_buffer);
+    carquet_mem_free(reader->decompress_buffer);
+    carquet_mem_free(reader);
 }
 
 bool carquet_column_has_next(const carquet_column_reader_t* reader) {
@@ -896,7 +1038,7 @@ static carquet_status_t reader_read_bytes(
         return CARQUET_ERROR_INVALID_STATE;
     }
 
-    uint8_t* buf = malloc((size_t)size);
+    uint8_t* buf = carquet_mem_malloc((size_t)size);
     if (!buf) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY,
             "Failed to allocate %d bytes for read", size);
@@ -914,14 +1056,14 @@ static carquet_status_t reader_read_bytes(
     seek_ok = fseek(reader->file, (long)offset, SEEK_SET);
 #endif
     if (seek_ok != 0) {
-        free(buf);
+        carquet_mem_free(buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK,
             "Failed to seek to offset %lld", (long long)offset);
         return CARQUET_ERROR_FILE_SEEK;
     }
 
     if (fread(buf, 1, (size_t)size, reader->file) != (size_t)size) {
-        free(buf);
+        carquet_mem_free(buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ,
             "Failed to read %d bytes at offset %lld", size, (long long)offset);
         return CARQUET_ERROR_FILE_READ;
@@ -1077,7 +1219,7 @@ carquet_bloom_filter_t* carquet_reader_get_bloom_filter(
 
     /* Validate and read the raw filter data after the header */
     if (num_bytes <= 0 || header_size + (size_t)num_bytes > total_len) {
-        if (allocated) free((void*)data);
+        if (allocated) carquet_mem_free((void*)data);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_METADATA,
             "Invalid bloom filter header (numBytes=%d, header=%llu, total=%llu)",
             num_bytes, (unsigned long long)header_size, (unsigned long long)total_len);
@@ -1088,7 +1230,7 @@ carquet_bloom_filter_t* carquet_reader_get_bloom_filter(
     status = carquet_bloom_filter_read(&filter, data + header_size, (size_t)num_bytes);
 
     if (allocated) {
-        free((void*)data);
+        carquet_mem_free((void*)data);
     }
 
     if (status != CARQUET_OK) {
@@ -1193,6 +1335,41 @@ carquet_status_t carquet_reader_column_chunk_metadata(
     return CARQUET_OK;
 }
 
+carquet_status_t carquet_reader_geospatial_statistics(
+    const carquet_reader_t* reader,
+    int32_t row_group_index,
+    int32_t column_index,
+    carquet_geospatial_statistics_t* stats) {
+
+    const parquet_column_chunk_t* chunk = reader_get_column_chunk(
+        reader, row_group_index, column_index, NULL);
+    if (!chunk) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+    if (!chunk->has_metadata ||
+        !chunk->metadata.has_geospatial_statistics) {
+        return CARQUET_ERROR_INVALID_METADATA;
+    }
+
+    const parquet_geospatial_statistics_t* g =
+        &chunk->metadata.geospatial_statistics;
+
+    memset(stats, 0, sizeof(*stats));
+    stats->has_bbox = g->valid;
+    stats->xmin = g->xmin; stats->xmax = g->xmax;
+    stats->ymin = g->ymin; stats->ymax = g->ymax;
+    stats->has_z = g->has_z; stats->zmin = g->zmin; stats->zmax = g->zmax;
+    stats->has_m = g->has_m; stats->mmin = g->mmin; stats->mmax = g->mmax;
+
+    int32_t n = g->num_types;
+    if (n > CARQUET_MAX_GEOSPATIAL_TYPES) n = CARQUET_MAX_GEOSPATIAL_TYPES;
+    stats->num_geometry_types = n;
+    for (int32_t i = 0; i < n; i++) {
+        stats->geometry_types[i] = g->types[i];
+    }
+    return CARQUET_OK;
+}
+
 /* ============================================================================
  * Page Index API (Column Index + Offset Index)
  * ============================================================================
@@ -1232,7 +1409,7 @@ carquet_column_index_t* carquet_reader_get_column_index(
         data, (size_t)chunk->column_index_length);
 
     if (allocated) {
-        free((void*)data);
+        carquet_mem_free((void*)data);
     }
 
     if (!ci) {
@@ -1277,7 +1454,7 @@ carquet_offset_index_t* carquet_reader_get_offset_index(
         data, (size_t)chunk->offset_index_length);
 
     if (allocated) {
-        free((void*)data);
+        carquet_mem_free((void*)data);
     }
 
     if (!oi) {

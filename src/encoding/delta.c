@@ -469,17 +469,25 @@ carquet_status_t carquet_delta_encode_int32(
     size_t data_capacity,
     size_t* bytes_written) {
 
-    if (num_values == 0) {
-        *bytes_written = 0;
-        return CARQUET_OK;
-    }
-
     delta_encoder_t enc;
     delta_encoder_init(&enc, data, data_capacity);
 
     /* Check capacity for header (max 40 bytes for 4 varints) */
     if (data_capacity < 40) {
         return CARQUET_ERROR_ENCODE;
+    }
+
+    /* A DELTA_BINARY_PACKED page must always carry the 4-varint header
+     * (block size, miniblocks, total count, first value) even when it holds
+     * zero values; otherwise the decoder hits EOF parsing the header. For an
+     * empty page emit the header with count=0 and first value=0. */
+    if (num_values == 0) {
+        enc.pos += write_uleb128(data + enc.pos, DELTA_BLOCK_SIZE);
+        enc.pos += write_uleb128(data + enc.pos, DELTA_MINI_BLOCKS);
+        enc.pos += write_uleb128(data + enc.pos, 0);
+        enc.pos += write_uleb128(data + enc.pos, zigzag_encode64(0));
+        *bytes_written = enc.pos;
+        return CARQUET_OK;
     }
 
     /* Write header */
@@ -520,17 +528,25 @@ carquet_status_t carquet_delta_encode_int64(
     size_t data_capacity,
     size_t* bytes_written) {
 
-    if (num_values == 0) {
-        *bytes_written = 0;
-        return CARQUET_OK;
-    }
-
     delta_encoder_t enc;
     delta_encoder_init(&enc, data, data_capacity);
 
     /* Check capacity for header (max 40 bytes for 4 varints) */
     if (data_capacity < 40) {
         return CARQUET_ERROR_ENCODE;
+    }
+
+    /* A DELTA_BINARY_PACKED page must always carry the 4-varint header
+     * (block size, miniblocks, total count, first value) even when it holds
+     * zero values; otherwise the decoder hits EOF parsing the header. For an
+     * empty page emit the header with count=0 and first value=0. */
+    if (num_values == 0) {
+        enc.pos += write_uleb128(data + enc.pos, DELTA_BLOCK_SIZE);
+        enc.pos += write_uleb128(data + enc.pos, DELTA_MINI_BLOCKS);
+        enc.pos += write_uleb128(data + enc.pos, 0);
+        enc.pos += write_uleb128(data + enc.pos, zigzag_encode64(0));
+        *bytes_written = enc.pos;
+        return CARQUET_OK;
     }
 
     /* Write header */

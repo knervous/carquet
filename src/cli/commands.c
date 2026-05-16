@@ -5,6 +5,7 @@
 
 #include "cli.h"
 #include "core/compat.h"
+#include "core/float16.h"
 #include "reader/reader_internal.h"
 #include "thrift/parquet_types.h"
 #include <stdlib.h>
@@ -198,6 +199,15 @@ const char* cli_format_value(carquet_physical_type_t type,
             break;
         }
         case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY: {
+            /* FLOAT16 (FLBA length 2) prints as its float value, not hex. */
+            if (logical && logical->id == CARQUET_LOGICAL_FLOAT16 &&
+                type_len == 2) {
+                const uint8_t* b = (const uint8_t*)value;
+                snprintf(buf, buf_size, "%g",
+                         (double)carquet_half_to_float(
+                             (uint16_t)(b[0] | (b[1] << 8))));
+                break;
+            }
             /* Print as hex */
             const uint8_t* bytes = (const uint8_t*)value;
             int32_t len = type_len;
@@ -504,6 +514,33 @@ int cmd_stat(const char* path) {
                         cli_format_value(phys, stats.max_value, tl, lt,
                                          max_buf, sizeof(max_buf));
                     }
+                }
+            }
+
+            /* GEOMETRY/GEOGRAPHY have no min/max; surface the bounding box
+             * and ISO-WKB type codes from GeospatialStatistics instead. */
+            if (lt && (lt->id == CARQUET_LOGICAL_GEOMETRY ||
+                       lt->id == CARQUET_LOGICAL_GEOGRAPHY)) {
+                carquet_geospatial_statistics_t gs;
+                if (carquet_reader_geospatial_statistics(reader, rg, c, &gs)
+                        == CARQUET_OK) {
+                    if (gs.has_bbox) {
+                        char zb[48] = "";
+                        if (gs.has_z)
+                            snprintf(zb, sizeof(zb), " z[%g,%g]",
+                                     gs.zmin, gs.zmax);
+                        snprintf(min_buf, sizeof(min_buf),
+                                 "bbox x[%g,%g] y[%g,%g]%s",
+                                 gs.xmin, gs.xmax, gs.ymin, gs.ymax, zb);
+                    }
+                    int off = snprintf(max_buf, sizeof(max_buf), "types[");
+                    for (int32_t t = 0; t < gs.num_geometry_types &&
+                         off < (int)sizeof(max_buf) - 8; t++) {
+                        off += snprintf(max_buf + off, sizeof(max_buf) - off,
+                                        "%s%d", t ? "," : "",
+                                        gs.geometry_types[t]);
+                    }
+                    snprintf(max_buf + off, sizeof(max_buf) - off, "]");
                 }
             }
 

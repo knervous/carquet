@@ -3,6 +3,7 @@
  * @brief Thrift Compact Protocol decoder implementation
  */
 
+#include "core/allocator.h"
 #include "thrift_decode.h"
 #include "core/endian.h"
 #include <stdlib.h>
@@ -166,7 +167,7 @@ char* thrift_read_string_alloc(thrift_decoder_t* dec) {
 
     if (!data && length == 0 && dec->status == CARQUET_OK) {
         /* Empty string */
-        char* str = (char*)malloc(1);
+        char* str = (char*)carquet_mem_malloc(1);
         if (str) str[0] = '\0';
         return str;
     }
@@ -175,7 +176,7 @@ char* thrift_read_string_alloc(thrift_decoder_t* dec) {
         return NULL;
     }
 
-    char* str = (char*)malloc((size_t)length + 1);
+    char* str = (char*)carquet_mem_malloc((size_t)length + 1);
     if (!str) {
         set_error(dec, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate string");
         return NULL;

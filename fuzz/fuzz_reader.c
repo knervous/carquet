@@ -13,6 +13,16 @@
 #include <stdlib.h>
 #include <carquet/carquet.h>
 
+static bool fuzz_row_group_filter(
+    const carquet_reader_t* reader,
+    int32_t row_group_index,
+    void* user_data) {
+
+    (void)reader;
+    uint8_t mask = user_data ? *(const uint8_t*)user_data : 0;
+    return ((uint8_t)row_group_index & mask) == 0;
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size < 12) return 0;
     (void)carquet_init();
@@ -46,7 +56,14 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     /* Batch reader API */
     carquet_batch_reader_config_t config;
     carquet_batch_reader_config_init(&config);
-    config.batch_size = 1000;
+    config.batch_size = (int32_t)((data[0] % 64) + 1) * 32;
+    config.num_threads = data[1] % 4;
+    config.use_mmap = (data[2] & 1) != 0;
+    config.preserve_dictionaries = (data[2] & 2) != 0;
+    if (data[2] & 4) {
+        config.row_group_filter = fuzz_row_group_filter;
+        config.row_group_filter_ctx = (void*)&data[3];
+    }
 
     carquet_batch_reader_t* batch_reader = carquet_batch_reader_create(reader, &config, &err);
     if (batch_reader) {
@@ -59,6 +76,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 const uint8_t* nulls;
                 int64_t count;
                 (void)carquet_row_batch_column(batch, col, &data_ptr, &nulls, &count);
+                if (config.preserve_dictionaries) {
+                    const uint32_t* indices;
+                    const uint8_t* dict_data;
+                    int32_t dict_count;
+                    const uint32_t* dict_offsets;
+                    (void)carquet_row_batch_column_dictionary(
+                        batch, col, &indices, &nulls, &count,
+                        &dict_data, &dict_count, &dict_offsets);
+                }
             }
             carquet_row_batch_free(batch);
             batch = NULL;

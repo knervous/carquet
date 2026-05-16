@@ -11,6 +11,7 @@
  */
 
 #include <carquet/error.h>
+#include "simd/simd_unaligned.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -98,19 +99,6 @@ void carquet_avx2_bitunpack8_3bit(const uint8_t* input, uint32_t* values) {
     _mm256_storeu_si256((__m256i*)values, result);
 }
 
-/**
- * Unpack 64 1-bit values using AVX2.
- * Input: 8 bytes, Output: 64 x uint32_t
- */
-void carquet_avx2_bitunpack64_1bit(const uint8_t* input, uint32_t* values) {
-    /* For each byte, extract bits */
-    for (int b = 0; b < 8; b++) {
-        uint8_t byte_val = input[b];
-        for (int i = 0; i < 8; i++) {
-            values[b * 8 + i] = (byte_val >> i) & 1;
-        }
-    }
-}
 
 /**
  * Unpack 8 4-bit values using AVX2.
@@ -682,7 +670,7 @@ void carquet_avx2_gather_i32(const int32_t* dict, const uint32_t* indices,
 
     /* Handle remaining */
     for (; i < count; i++) {
-        output[i] = dict[indices[i]];
+        output[i] = cq_loadu(dict + (indices[i]));
     }
 }
 
@@ -702,7 +690,7 @@ void carquet_avx2_gather_i64(const int64_t* dict, const uint32_t* indices,
 
     /* Handle remaining */
     for (; i < count; i++) {
-        output[i] = dict[indices[i]];
+        output[i] = cq_loadu(dict + (indices[i]));
     }
 }
 
@@ -759,7 +747,7 @@ bool carquet_avx2_checked_gather_i32(const int32_t* dict, int32_t dict_count,
         if (a >= limit || b >= limit || c >= limit || d >= limit) {
             return false;
         }
-        __m128i result = _mm_set_epi32(dict[d], dict[c], dict[b], dict[a]);
+        __m128i result = _mm_set_epi32(cq_loadu(dict + (d)), cq_loadu(dict + (c)), cq_loadu(dict + (b)), cq_loadu(dict + (a)));
         _mm_storeu_si128((__m128i*)(output + i), result);
     }
 
@@ -768,7 +756,7 @@ bool carquet_avx2_checked_gather_i32(const int32_t* dict, int32_t dict_count,
         if (idx >= limit) {
             return false;
         }
-        output[i] = dict[idx];
+        output[i] = cq_loadu(dict + (idx));
     }
 
     return true;
@@ -801,7 +789,7 @@ bool carquet_avx2_checked_gather_i64(const int64_t* dict, int32_t dict_count,
         if (a >= limit || b >= limit || c >= limit || d >= limit) {
             return false;
         }
-        __m256i result = _mm256_set_epi64x(dict[d], dict[c], dict[b], dict[a]);
+        __m256i result = _mm256_set_epi64x(cq_loadu(dict + (d)), cq_loadu(dict + (c)), cq_loadu(dict + (b)), cq_loadu(dict + (a)));
         _mm256_storeu_si256((__m256i*)(output + i), result);
     }
 
@@ -810,7 +798,7 @@ bool carquet_avx2_checked_gather_i64(const int64_t* dict, int32_t dict_count,
         if (idx >= limit) {
             return false;
         }
-        output[i] = dict[idx];
+        output[i] = cq_loadu(dict + (idx));
     }
 
     return true;

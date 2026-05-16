@@ -4,7 +4,7 @@
  *
  * Tests decoders for: RLE, Delta (INT32/INT64), Plain (all types),
  * Dictionary (all types), Byte Stream Split, Delta Length Byte Array,
- * and boolean pack/unpack via SIMD dispatch.
+ * Delta Byte Array, and boolean pack/unpack via SIMD dispatch.
  *
  * First byte selects encoding mode, second byte provides parameters.
  */
@@ -59,6 +59,15 @@ carquet_status_t carquet_delta_length_decode(
     const uint8_t* data, size_t data_size,
     carquet_byte_array_t* values, int32_t num_values, size_t* bytes_consumed);
 
+/* Delta byte array decode */
+carquet_status_t carquet_delta_strings_decode(
+    const uint8_t* data, size_t data_size,
+    carquet_byte_array_t* values, int32_t num_values,
+    uint8_t* work_buffer, size_t work_buffer_size, size_t* bytes_consumed);
+carquet_status_t carquet_delta_strings_decoded_size(
+    const uint8_t* data, size_t data_size,
+    int32_t num_values, size_t* required_size);
+
 /* SIMD dispatch for bool packing */
 void carquet_dispatch_unpack_bools(const uint8_t* input, uint8_t* output, int64_t count);
 void carquet_dispatch_pack_bools(const uint8_t* input, uint8_t* output, int64_t count);
@@ -76,7 +85,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     void* output = malloc((size_t)max_values * 16);
     if (!output) return 0;
 
-    switch (encoding % 17) {
+    switch (encoding % 18) {
         case 0: {
             /* RLE decode — variable bit width */
             int bit_width = (param % 32) + 1;
@@ -252,6 +261,34 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 (void)carquet_byte_stream_split_decode(
                     payload, (size_t)count * type_len,
                     type_len, (uint8_t*)output, count);
+            break;
+        }
+        case 17: {
+            /* Delta byte array: decoded-size probe + reconstruction path */
+            int32_t count = (param % 100) + 1;
+            carquet_byte_array_t* arrays = calloc((size_t)count, sizeof(carquet_byte_array_t));
+            if (arrays) {
+                size_t required = 0;
+                if (carquet_delta_strings_decoded_size(
+                        payload, payload_size, count, &required) == CARQUET_OK &&
+                    required <= 1024 * 1024) {
+                    uint8_t* work = malloc(required ? required : 1);
+                    if (work) {
+                        size_t consumed = 0;
+                        (void)carquet_delta_strings_decode(
+                            payload, payload_size, arrays, count,
+                            work, required ? required : 1, &consumed);
+                        free(work);
+                    }
+                } else {
+                    uint8_t work[256];
+                    size_t consumed = 0;
+                    (void)carquet_delta_strings_decode(
+                        payload, payload_size, arrays, count,
+                        work, sizeof(work), &consumed);
+                }
+                free(arrays);
+            }
             break;
         }
     }

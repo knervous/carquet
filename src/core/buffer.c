@@ -3,6 +3,7 @@
  * @brief Growable byte buffer implementation
  */
 
+#include "allocator.h"
 #include "buffer.h"
 #include "endian.h"
 #include <assert.h>
@@ -55,7 +56,7 @@ static carquet_status_t ensure_capacity(carquet_buffer_t* buf, size_t needed) {
         new_capacity = CARQUET_BUFFER_DEFAULT_CAPACITY;
     }
 
-    uint8_t* new_data = (uint8_t*)realloc(buf->data, new_capacity);
+    uint8_t* new_data = (uint8_t*)carquet_mem_realloc(buf->data, new_capacity);
     if (!new_data) {
         return CARQUET_ERROR_OUT_OF_MEMORY;
     }
@@ -123,7 +124,7 @@ void carquet_buffer_destroy(carquet_buffer_t* buf) {
     assert(buf != NULL);
 
     if (buf->owns_data && buf->data) {
-        free(buf->data);
+        carquet_mem_free(buf->data);
     }
 
     buf->data = NULL;
@@ -164,14 +165,14 @@ carquet_status_t carquet_buffer_shrink_to_fit(carquet_buffer_t* buf) {
     assert(buf->owns_data);
 
     if (buf->size == 0) {
-        free(buf->data);
+        carquet_mem_free(buf->data);
         buf->data = NULL;
         buf->capacity = 0;
         return CARQUET_OK;
     }
 
     if (buf->size < buf->capacity) {
-        uint8_t* new_data = (uint8_t*)realloc(buf->data, buf->size);
+        uint8_t* new_data = (uint8_t*)carquet_mem_realloc(buf->data, buf->size);
         if (new_data) {
             buf->data = new_data;
             buf->capacity = buf->size;

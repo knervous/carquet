@@ -3,6 +3,7 @@
  * @brief Arena (bump) memory allocator implementation
  */
 
+#include "allocator.h"
 #include "arena.h"
 #include <assert.h>
 #include <stddef.h>
@@ -45,7 +46,7 @@ static carquet_arena_block_t* arena_new_block(size_t min_size) {
     if (add_overflows_size(header_size, block_size, &alloc_size)) {
         return NULL;
     }
-    carquet_arena_block_t* block = (carquet_arena_block_t*)malloc(alloc_size);
+    carquet_arena_block_t* block = (carquet_arena_block_t*)carquet_mem_malloc(alloc_size);
 
     if (!block) {
         return NULL;
@@ -94,7 +95,7 @@ void carquet_arena_destroy(carquet_arena_t* arena) {
     carquet_arena_block_t* block = arena->head;
     while (block) {
         carquet_arena_block_t* next = block->next;
-        free(block);
+        carquet_mem_free(block);
         block = next;
     }
 

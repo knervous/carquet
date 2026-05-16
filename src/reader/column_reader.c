@@ -3,6 +3,7 @@
  * @brief Column reading implementation
  */
 
+#include "core/allocator.h"
 #include <carquet/carquet.h>
 #include "reader_internal.h"
 #include "thrift/parquet_types.h"
@@ -22,6 +23,8 @@ extern carquet_status_t carquet_read_next_page(
     int16_t* rep_levels,
     int64_t* values_read,
     carquet_error_t* error);
+extern int64_t carquet_dispatch_count_non_nulls(const int16_t* def_levels, int64_t count,
+                                                 int16_t max_def_level);
 
 /* ============================================================================
  * Batch Reading
@@ -32,14 +35,7 @@ static int64_t count_present_levels(
     const int16_t* def_levels,
     int64_t count,
     int16_t max_def_level) {
-
-    int64_t present = 0;
-    for (int64_t i = 0; i < count; i++) {
-        if (def_levels[i] == max_def_level) {
-            present++;
-        }
-    }
-    return present;
+    return carquet_dispatch_count_non_nulls(def_levels, count, max_def_level);
 }
 
 int64_t carquet_column_read_batch(
@@ -73,8 +69,11 @@ int64_t carquet_column_read_batch(
     size_t value_size = 0;
     int16_t* scratch_def_levels = NULL;
 
-    /* Determine value size for pointer arithmetic */
-    switch (reader->type) {
+    /* Determine value size for pointer arithmetic. Preserved dictionary pages
+     * expose uint32_t indices instead of materialized physical values. */
+    if (reader->preserve_dictionary) {
+        value_size = sizeof(uint32_t);
+    } else switch (reader->type) {
         case CARQUET_PHYSICAL_BOOLEAN:
             value_size = 1;
             break;
@@ -101,7 +100,7 @@ int64_t carquet_column_read_batch(
     }
 
     if (reader->max_def_level > 0 && !def_levels) {
-        scratch_def_levels = malloc((size_t)max_values * sizeof(*scratch_def_levels));
+        scratch_def_levels = carquet_mem_malloc((size_t)max_values * sizeof(*scratch_def_levels));
         if (!scratch_def_levels) {
             return -1;
         }
@@ -127,7 +126,7 @@ int64_t carquet_column_read_batch(
                 /* Return what we have so far */
                 break;
             }
-            free(scratch_def_levels);
+            carquet_mem_free(scratch_def_levels);
             return -1;
         }
 
@@ -144,7 +143,7 @@ int64_t carquet_column_read_batch(
         total_read += values_read;
     }
 
-    free(scratch_def_levels);
+    carquet_mem_free(scratch_def_levels);
     return total_read;
 }
 
@@ -193,7 +192,7 @@ int64_t carquet_column_skip(
     int64_t total_skipped = 0;
     int64_t chunk_size = 1024;
 
-    void* temp = malloc(chunk_size * value_size);
+    void* temp = carquet_mem_malloc(chunk_size * value_size);
     if (!temp) {
         return 0;
     }
@@ -211,6 +210,6 @@ int64_t carquet_column_skip(
         total_skipped += skipped;
     }
 
-    free(temp);
+    carquet_mem_free(temp);
     return total_skipped;
 }
