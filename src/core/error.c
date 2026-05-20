@@ -45,10 +45,18 @@ void carquet_error_set(carquet_error_t* error,
     error->function = function;
 
     if (format) {
+#ifdef CARQUET_ARCH_WASM
+        size_t i = 0;
+        for (; format[i] && i + 1 < CARQUET_ERROR_MESSAGE_MAX; i++) {
+            error->message[i] = format[i];
+        }
+        error->message[i] = '\0';
+#else
         va_list args;
         va_start(args, format);
         vsnprintf(error->message, CARQUET_ERROR_MESSAGE_MAX, format, args);
         va_end(args);
+#endif
     } else {
         error->message[0] = '\0';
     }
@@ -279,6 +287,22 @@ const char* carquet_error_recovery_hint(carquet_status_t status) {
 int carquet_error_format(const carquet_error_t* error, char* buffer, size_t buffer_size) {
     if (!error || !buffer || buffer_size == 0) return 0;
 
+#ifdef CARQUET_ARCH_WASM
+    size_t written = 0;
+    const char* status = carquet_status_string(error->code);
+    const char* message = error->message[0] ? error->message : "(no details)";
+    const char* parts[] = {"[", status, "] ", message};
+
+    buffer[0] = '\0';
+    for (size_t part = 0; part < sizeof(parts) / sizeof(parts[0]); part++) {
+        const char* text = parts[part];
+        while (*text && written + 1 < buffer_size) {
+            buffer[written++] = *text++;
+        }
+        buffer[written] = '\0';
+    }
+    return (int)written;
+#else
     int written = 0;
 
     /* Basic error info */
@@ -326,6 +350,7 @@ int carquet_error_format(const carquet_error_t* error, char* buffer, size_t buff
     }
 
     return written;
+#endif
 }
 
 void carquet_error_set_context(carquet_error_t* error,

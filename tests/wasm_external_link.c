@@ -16,6 +16,19 @@ extern int carquet_gzip_decompress(
     size_t dst_capacity,
     size_t* dst_size);
 extern size_t carquet_gzip_compress_bound(size_t src_size);
+extern carquet_status_t carquet_snappy_compress(
+    const uint8_t* src,
+    size_t src_size,
+    uint8_t* dst,
+    size_t dst_capacity,
+    size_t* dst_size);
+extern carquet_status_t carquet_snappy_decompress(
+    const uint8_t* src,
+    size_t src_size,
+    uint8_t* dst,
+    size_t dst_capacity,
+    size_t* dst_size);
+extern size_t carquet_snappy_compress_bound(size_t src_size);
 
 int carquet_wasm_external_link_probe(void) {
     int major = -1;
@@ -50,6 +63,33 @@ int carquet_wasm_gzip_external_link_probe(void) {
     if (carquet_gzip_decompress(compressed, compressed_size,
                                 restored, sizeof(restored),
                                 &restored_size) != CARQUET_OK) {
+        return 0;
+    }
+
+    return restored_size == sizeof(source) &&
+           memcmp(restored, source, sizeof(source)) == 0;
+}
+
+int carquet_wasm_snappy_external_link_probe(void) {
+    const uint8_t source[] = "carquet snappy wasm probe";
+    uint8_t compressed[128] = {0};
+    uint8_t restored[sizeof(source)] = {0};
+    size_t compressed_size = 0;
+    size_t restored_size = 0;
+
+    if (carquet_snappy_compress_bound(sizeof(source)) > sizeof(compressed)) {
+        return 0;
+    }
+
+    if (carquet_snappy_compress(source, sizeof(source),
+                                compressed, sizeof(compressed),
+                                &compressed_size) != CARQUET_OK) {
+        return 0;
+    }
+
+    if (carquet_snappy_decompress(compressed, compressed_size,
+                                  restored, sizeof(restored),
+                                  &restored_size) != CARQUET_OK) {
         return 0;
     }
 

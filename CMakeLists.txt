@@ -341,26 +341,23 @@ endif()
 
 set(CARQUET_READER_SOURCES
     src/reader/worker_pool.c
+    src/reader/file_reader.c
+    src/reader/row_group_reader.c
+    src/reader/column_reader.c
+    src/reader/page_reader.c
+    src/reader/batch_reader.c
+    src/reader/statistics.c
+    src/reader/buffer_reader.c
 )
 
 if(CARQUET_ENABLE_FILE_IO)
-    list(APPEND CARQUET_READER_SOURCES
-        src/reader/file_reader.c
-        src/reader/row_group_reader.c
-        src/reader/column_reader.c
-        src/reader/page_reader.c
-        src/reader/batch_reader.c
-        src/reader/statistics.c
-    )
     if(CARQUET_ENABLE_MMAP)
         list(APPEND CARQUET_READER_SOURCES src/reader/mmap_reader.c)
-    else()
-        list(APPEND CARQUET_READER_SOURCES src/reader/buffer_reader.c)
     endif()
 endif()
 
 set(CARQUET_WRITER_SOURCES)
-if(CARQUET_ENABLE_FILE_IO AND CARQUET_ENABLE_WRITER)
+if(CARQUET_ENABLE_WRITER)
     set(CARQUET_WRITER_SOURCES
         src/writer/file_writer.c
         src/writer/row_group_writer.c

@@ -300,6 +300,7 @@ struct carquet_writer {
 
     /* Buffer writer support */
     bool is_buffer_writer;
+    carquet_buffer_t output;
     uint8_t* output_buffer;
     size_t output_buffer_size;
 };
@@ -337,11 +338,41 @@ void carquet_writer_options_init(carquet_writer_options_t* options) {
  * ============================================================================
  */
 
-static carquet_status_t write_magic(FILE* file) {
-    if (fwrite(PARQUET_MAGIC, 1, 4, file) != 4) {
+static carquet_status_t writer_append(carquet_writer_t* writer, const void* data, size_t size) {
+    if (size == 0) {
+        return CARQUET_OK;
+    }
+    if (!writer || !data) {
+        return CARQUET_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (writer->is_buffer_writer) {
+        return carquet_buffer_append(&writer->output, data, size);
+    }
+
+#ifdef CARQUET_NO_FILE_IO
+    return CARQUET_ERROR_NOT_IMPLEMENTED;
+#else
+    if (!writer->file || fwrite(data, 1, size, writer->file) != size) {
         return CARQUET_ERROR_FILE_WRITE;
     }
     return CARQUET_OK;
+#endif
+}
+
+static carquet_status_t write_magic(carquet_writer_t* writer) {
+    return writer_append(writer, PARQUET_MAGIC, 4);
+}
+
+static bool writer_streq(const char* lhs, const char* rhs) {
+    if (!lhs || !rhs) {
+        return lhs == rhs;
+    }
+    while (*lhs && *rhs && *lhs == *rhs) {
+        lhs++;
+        rhs++;
+    }
+    return *lhs == *rhs;
 }
 
 static int64_t saturating_add_i64(int64_t lhs, int64_t rhs) {
@@ -441,7 +472,7 @@ static carquet_status_t ensure_header_written(carquet_writer_t* writer) {
         return CARQUET_OK;
     }
 
-    carquet_status_t status = write_magic(writer->file);
+    carquet_status_t status = write_magic(writer);
     if (status != CARQUET_OK) {
         return status;
     }
@@ -968,12 +999,28 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
         return CARQUET_OK;
     }
 
-    /* Finalize and write each column directly to file, avoiding
-     * an intermediate copy of the entire row group into one buffer */
     size_t size;
-    carquet_status_t status = carquet_row_group_writer_write_to_file(
-        writer->current_row_group, writer->file, &size,
-        writer->current_row_group_rows);
+    carquet_status_t status;
+    if (writer->is_buffer_writer) {
+        const uint8_t* data = NULL;
+        status = carquet_row_group_writer_finalize(
+            writer->current_row_group, &data, &size,
+            writer->current_row_group_rows);
+        if (status == CARQUET_OK && size > 0) {
+            status = writer_append(writer, data, size);
+        }
+    } else {
+#ifdef CARQUET_NO_FILE_IO
+        status = CARQUET_ERROR_NOT_IMPLEMENTED;
+        size = 0;
+#else
+        /* Finalize and write each column directly to file, avoiding
+         * an intermediate copy of the entire row group into one buffer */
+        status = carquet_row_group_writer_write_to_file(
+            writer->current_row_group, writer->file, &size,
+            writer->current_row_group_rows);
+#endif
+    }
 
     if (status != CARQUET_OK) {
         return status;
@@ -1107,6 +1154,7 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
     writer->file_offset += (int64_t)size;
     writer->total_rows += writer->current_row_group_rows;
 
+#ifndef CARQUET_NO_FILE_IO
     /* Write bloom filters for each column (after row group data) */
     if (writer->options.write_bloom_filters) {
         for (int i = 0; i < num_cols; i++) {
@@ -1164,14 +1212,14 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
             chunk->bloom_filter_length = (int32_t)(bf_header.size + bf_size);
 
             /* Write header + data */
-            if (fwrite(bf_header.data, 1, bf_header.size, writer->file) != bf_header.size) {
+            if (writer_append(writer, bf_header.data, bf_header.size) != CARQUET_OK) {
                 carquet_buffer_destroy(&bf_header);
                 return CARQUET_ERROR_FILE_WRITE;
             }
             writer->file_offset += (int64_t)bf_header.size;
             carquet_buffer_destroy(&bf_header);
 
-            if (fwrite(bf_data, 1, bf_size, writer->file) != bf_size) {
+            if (writer_append(writer, bf_data, bf_size) != CARQUET_OK) {
                 return CARQUET_ERROR_FILE_WRITE;
             }
             writer->file_offset += (int64_t)bf_size;
@@ -1195,7 +1243,7 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
                     chunk->column_index_offset = writer->file_offset;
                     chunk->has_column_index_length = true;
                     chunk->column_index_length = (int32_t)ci_buf.size;
-                    if (fwrite(ci_buf.data, 1, ci_buf.size, writer->file) != ci_buf.size) {
+                    if (writer_append(writer, ci_buf.data, ci_buf.size) != CARQUET_OK) {
                         carquet_buffer_destroy(&ci_buf);
                         return CARQUET_ERROR_FILE_WRITE;
                     }
@@ -1216,7 +1264,7 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
                     chunk->offset_index_offset = writer->file_offset;
                     chunk->has_offset_index_length = true;
                     chunk->offset_index_length = (int32_t)oi_buf.size;
-                    if (fwrite(oi_buf.data, 1, oi_buf.size, writer->file) != oi_buf.size) {
+                    if (writer_append(writer, oi_buf.data, oi_buf.size) != CARQUET_OK) {
                         carquet_buffer_destroy(&oi_buf);
                         return CARQUET_ERROR_FILE_WRITE;
                     }
@@ -1226,6 +1274,7 @@ static carquet_status_t flush_row_group(carquet_writer_t* writer) {
             }
         }
     }
+#endif
 
     /* Reuse the current row group writer for the next group. */
     carquet_row_group_writer_reset(writer->current_row_group, writer->file_offset);
@@ -1269,7 +1318,7 @@ static carquet_status_t build_file_metadata(
         bool user_set = false;
         for (int32_t i = 0; i < writer->num_kv_metadata; i++) {
             if (writer->kv_metadata[i].key &&
-                strcmp(writer->kv_metadata[i].key, "ARROW:schema") == 0) {
+                writer_streq(writer->kv_metadata[i].key, "ARROW:schema")) {
                 user_set = true;
                 break;
             }
@@ -1514,6 +1563,14 @@ carquet_writer_t* carquet_writer_create(
     const carquet_writer_options_t* options,
     carquet_error_t* error) {
 
+#ifdef CARQUET_NO_FILE_IO
+    (void)path;
+    (void)schema;
+    (void)options;
+    CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+        "file writer API is not available in this build");
+    return NULL;
+#else
     carquet_writer_t* writer = carquet_mem_calloc(1, sizeof(carquet_writer_t));
     if (!writer) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate writer");
@@ -1596,6 +1653,7 @@ carquet_writer_t* carquet_writer_create(
     }
 
     return writer;
+#endif
 }
 
 carquet_writer_t* carquet_writer_create_file(
@@ -1604,6 +1662,14 @@ carquet_writer_t* carquet_writer_create_file(
     const carquet_writer_options_t* options,
     carquet_error_t* error) {
 
+#ifdef CARQUET_NO_FILE_IO
+    (void)file;
+    (void)schema;
+    (void)options;
+    CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+        "file writer API is not available in this build");
+    return NULL;
+#else
     /* file and schema are nonnull per API contract */
     carquet_writer_t* writer = carquet_mem_calloc(1, sizeof(carquet_writer_t));
     if (!writer) {
@@ -1671,6 +1737,7 @@ carquet_writer_t* carquet_writer_create_file(
     }
 
     return writer;
+#endif
 }
 
 /* 1000^|rank diff| between time units (MILLIS=0, MICROS=1, NANOS=2). */
@@ -1866,7 +1933,7 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
     }
 
     /* Write metadata */
-    if (fwrite(metadata_buffer.data, 1, metadata_buffer.size, writer->file) != metadata_buffer.size) {
+    if (writer_append(writer, metadata_buffer.data, metadata_buffer.size) != CARQUET_OK) {
         carquet_buffer_destroy(&metadata_buffer);
         status = CARQUET_ERROR_FILE_WRITE;
         goto cleanup;
@@ -1880,7 +1947,7 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
     len_bytes[2] = (uint8_t)((metadata_len >> 16) & 0xFF);
     len_bytes[3] = (uint8_t)((metadata_len >> 24) & 0xFF);
 
-    if (fwrite(len_bytes, 1, 4, writer->file) != 4) {
+    if (writer_append(writer, len_bytes, 4) != CARQUET_OK) {
         carquet_buffer_destroy(&metadata_buffer);
         status = CARQUET_ERROR_FILE_WRITE;
         goto cleanup;
@@ -1889,43 +1956,9 @@ carquet_status_t carquet_writer_close(carquet_writer_t* writer) {
     carquet_buffer_destroy(&metadata_buffer);
 
     /* Write footer magic */
-    status = write_magic(writer->file);
+    status = write_magic(writer);
     if (status != CARQUET_OK) {
         goto cleanup;
-    }
-
-    /* For buffer writers, read back the entire file into memory.
-     * Use 64-bit seek/tell to handle files >2 GB on all platforms. */
-    if (writer->is_buffer_writer && writer->file) {
-        fflush(writer->file);
-        int64_t file_size = -1;
-#if defined(_WIN32)
-        if (_fseeki64(writer->file, 0, SEEK_END) == 0)
-            file_size = _ftelli64(writer->file);
-#elif defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L || \
-      defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
-        if (fseeko(writer->file, 0, SEEK_END) == 0)
-            file_size = (int64_t)ftello(writer->file);
-#else
-        if (fseek(writer->file, 0, SEEK_END) == 0)
-            file_size = (int64_t)ftell(writer->file);
-#endif
-        if (file_size > 0) {
-            writer->output_buffer = carquet_mem_malloc((size_t)file_size);
-            if (!writer->output_buffer) {
-                status = CARQUET_ERROR_OUT_OF_MEMORY;
-                goto cleanup;
-            }
-            rewind(writer->file);
-            size_t nread = fread(writer->output_buffer, 1, (size_t)file_size, writer->file);
-            if (nread != (size_t)file_size) {
-                carquet_mem_free(writer->output_buffer);
-                writer->output_buffer = NULL;
-                status = CARQUET_ERROR_FILE_READ;
-                goto cleanup;
-            }
-            writer->output_buffer_size = (size_t)file_size;
-        }
     }
 
 cleanup:
@@ -1935,10 +1968,12 @@ cleanup:
         writer->current_row_group = NULL;
     }
 
+#ifndef CARQUET_NO_FILE_IO
     if (writer->owns_file && writer->file) {
         fclose(writer->file);
         writer->file = NULL;
     }
+#endif
 
     /* Free column definitions */
     if (writer->columns) {
@@ -1983,6 +2018,7 @@ cleanup:
     }
 
     carquet_mem_free(writer->output_buffer);
+    carquet_buffer_destroy(&writer->output);
     carquet_arena_destroy(&writer->arena);
     carquet_mem_free(writer);
 
@@ -1999,6 +2035,7 @@ void carquet_writer_abort(carquet_writer_t* writer) {
     }
 
     /* Close and delete file */
+#ifndef CARQUET_NO_FILE_IO
     if (writer->owns_file && writer->file) {
         fclose(writer->file);
         writer->file = NULL;
@@ -2007,6 +2044,7 @@ void carquet_writer_abort(carquet_writer_t* writer) {
             remove(writer->path);
         }
     }
+#endif
 
     /* Free column definitions */
     if (writer->columns) {
@@ -2045,6 +2083,7 @@ void carquet_writer_abort(carquet_writer_t* writer) {
 
     /* Free buffer writer output */
     carquet_mem_free(writer->output_buffer);
+    carquet_buffer_destroy(&writer->output);
 
     carquet_arena_destroy(&writer->arena);
     carquet_mem_free(writer);
@@ -2245,36 +2284,65 @@ carquet_writer_t* carquet_writer_create_buffer(
     const carquet_writer_options_t* options,
     carquet_error_t* error) {
 
-    /* Create a temporary FILE* for writing.
-     * tmpfile() can fail on Windows when the process lacks write access to
-     * the root directory.  Fall back to a named temp file in that case. */
-    FILE* tmp = tmpfile();
-#ifdef _WIN32
-    if (!tmp) {
-        /* _tempnam uses %TMP%, %TEMP%, or the current directory */
-        char* tpath = _tempnam(NULL, "cqt");
-        if (tpath) {
-            tmp = fopen(tpath, "w+bTD");   /* T=short-lived, D=delete-on-close */
-            carquet_mem_free(tpath);
+    carquet_writer_t* writer = carquet_mem_calloc(1, sizeof(carquet_writer_t));
+    if (!writer) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate writer");
+        return NULL;
+    }
+
+    if (carquet_arena_init_size(&writer->arena, 4096) != CARQUET_OK) {
+        carquet_mem_free(writer);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate arena");
+        return NULL;
+    }
+
+    writer->is_buffer_writer = true;
+    carquet_buffer_init(&writer->output);
+
+    if (options) {
+        writer->options = *options;
+    } else {
+        carquet_writer_options_init(&writer->options);
+    }
+
+    {
+        carquet_status_t status = store_schema_elements(writer, schema);
+        if (status != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            CARQUET_SET_ERROR(error, status, "Failed to store schema elements");
+            return NULL;
+        }
+
+        status = build_column_metadata_cache(writer, schema);
+        if (status != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            CARQUET_SET_ERROR(error, status, "Failed to build writer metadata cache");
+            return NULL;
         }
     }
-#endif
-    if (!tmp) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_OPEN,
-            "Failed to create temporary file for buffer writer");
-        return NULL;
-    }
 
-    /* Create a writer using the FILE* handle */
-    carquet_writer_t* writer = carquet_writer_create_file(tmp, schema, options, error);
-    if (!writer) {
-        fclose(tmp);
-        return NULL;
-    }
+    for (int32_t i = 0; i < schema->num_leaves; i++) {
+        int32_t elem_idx = schema->leaf_indices[i];
+        parquet_schema_element_t* elem = &schema->elements[elem_idx];
+        carquet_logical_type_t* lt = elem->has_logical_type ? &elem->logical_type : NULL;
 
-    /* Mark as buffer writer and take ownership of the tmpfile */
-    writer->is_buffer_writer = true;
-    writer->owns_file = true;
+        carquet_status_t status = add_column_internal(
+            writer,
+            elem->name,
+            elem->type,
+            lt,
+            elem->repetition_type,
+            elem->type_length,
+            schema->max_def_levels[i],
+            schema->max_rep_levels[i],
+            leaf_statistics_sort_order_defined(schema, elem_idx));
+
+        if (status != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            CARQUET_SET_ERROR(error, status, "Failed to add column from schema");
+            return NULL;
+        }
+    }
 
     return writer;
 }
@@ -2289,17 +2357,19 @@ carquet_status_t carquet_writer_get_buffer(
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
-    if (!writer->output_buffer || writer->output_buffer_size == 0) {
+    if (!writer->output.data || writer->output.size == 0) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
 
     /* Transfer ownership of the buffer to the caller */
-    *buffer = writer->output_buffer;
-    *size = writer->output_buffer_size;
-    writer->output_buffer = NULL;
-    writer->output_buffer_size = 0;
+    *buffer = writer->output.data;
+    *size = writer->output.size;
+    writer->output.data = NULL;
+    writer->output.size = 0;
+    writer->output.capacity = 0;
 
     /* Free the writer struct (close already freed internal resources) */
+    carquet_buffer_destroy(&writer->output);
     carquet_arena_destroy(&writer->arena);
     carquet_mem_free(writer);
 

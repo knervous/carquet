@@ -157,8 +157,19 @@ static int32_t decimal_max_precision_for_fixed_len(int32_t type_length) {
         return 0;
     }
 
-    long double bits = (long double)type_length * 8.0L - 1.0L;
-    return (int32_t)floorl(bits * log10l(2.0L));
+    double bits = (double)type_length * 8.0 - 1.0;
+    return (int32_t)(bits * 0.3010299956639812);
+}
+
+static bool schema_streq(const char* lhs, const char* rhs) {
+    if (!lhs || !rhs) {
+        return lhs == rhs;
+    }
+    while (*lhs && *rhs && *lhs == *rhs) {
+        lhs++;
+        rhs++;
+    }
+    return *lhs == *rhs;
 }
 
 static carquet_status_t validate_column_logical_type(
@@ -418,7 +429,7 @@ int32_t carquet_schema_find_column(
     for (int32_t i = 0; i < schema->num_leaves; i++) {
         int32_t elem_idx = schema->leaf_indices[i];
         if (schema->elements[elem_idx].name &&
-            strcmp(schema->elements[elem_idx].name, name) == 0) {
+            schema_streq(schema->elements[elem_idx].name, name)) {
             return i;
         }
     }

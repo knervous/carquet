@@ -2984,6 +2984,21 @@ carquet_status_t carquet_save_buffer_with_options(
     carquet_error_t* error);
 
 /**
+ * @brief Save a complete flat table to an owned in-memory Parquet buffer using
+ * scalar compression options for simpler cross-language ABI bindings.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_save_buffer_with_compression(
+    const carquet_schema_t* schema,
+    carquet_compression_t compression,
+    int32_t compression_level,
+    const carquet_column_view_t* columns,
+    int32_t num_columns,
+    void** buffer,
+    size_t* size,
+    carquet_error_t* error);
+
+/**
  * @brief Address of a single logical cell.
  */
 typedef struct carquet_cell_location {

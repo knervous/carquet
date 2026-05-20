@@ -72,6 +72,7 @@ carquet_status_t carquet_save_buffer_with_options(
     void** buffer,
     size_t* size,
     carquet_error_t* error) {
+#ifdef CARQUET_NO_WRITER
     (void)schema;
     (void)options;
     (void)columns;
@@ -79,7 +80,71 @@ carquet_status_t carquet_save_buffer_with_options(
     if (buffer) *buffer = NULL;
     if (size) *size = 0;
     return helper_error(error, CARQUET_ERROR_NOT_IMPLEMENTED,
-                        "buffer writer helpers are not available in this build");
+                        "writer helpers are not available in this build");
+#else
+    if (!schema || !buffer || !size || (num_columns > 0 && !columns) || num_columns < 0) {
+        return helper_error(error, CARQUET_ERROR_INVALID_ARGUMENT,
+                            "schema, output buffer, output size, and valid column views are required");
+    }
+
+    *buffer = NULL;
+    *size = 0;
+
+    carquet_writer_t* writer = carquet_writer_create_buffer(schema, options, error);
+    if (!writer) {
+        return error ? error->code : CARQUET_ERROR_FILE_OPEN;
+    }
+
+    for (int32_t i = 0; i < num_columns; i++) {
+        carquet_status_t status = carquet_writer_write_batch(
+            writer,
+            columns[i].column_index,
+            columns[i].values,
+            columns[i].num_values,
+            columns[i].def_levels,
+            columns[i].rep_levels);
+        if (status != CARQUET_OK) {
+            carquet_writer_abort(writer);
+            return status;
+        }
+    }
+
+    carquet_status_t status = carquet_writer_close(writer);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+
+    return carquet_writer_get_buffer(writer, buffer, size);
+#endif
+}
+
+carquet_status_t carquet_save_buffer_with_compression(
+    const carquet_schema_t* schema,
+    carquet_compression_t compression,
+    int32_t compression_level,
+    const carquet_column_view_t* columns,
+    int32_t num_columns,
+    void** buffer,
+    size_t* size,
+    carquet_error_t* error) {
+#ifdef CARQUET_NO_WRITER
+    (void)schema;
+    (void)compression;
+    (void)compression_level;
+    (void)columns;
+    (void)num_columns;
+    if (buffer) *buffer = NULL;
+    if (size) *size = 0;
+    return helper_error(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+                        "writer helpers are not available in this build");
+#else
+    carquet_writer_options_t options;
+    carquet_writer_options_init(&options);
+    options.compression = compression;
+    options.compression_level = compression_level;
+    return carquet_save_buffer_with_options(
+        schema, &options, columns, num_columns, buffer, size, error);
+#endif
 }
 
 carquet_status_t carquet_update_cell_in_file(

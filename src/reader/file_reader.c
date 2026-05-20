@@ -35,6 +35,17 @@ extern carquet_offset_index_t* carquet_offset_index_parse(const uint8_t* data, s
 #define PARQUET_MAGIC_LEN 4
 #define PARQUET_FOOTER_SIZE_LEN 4
 
+static bool carquet_string_equal(const char* a, const char* b) {
+    if (!a || !b) {
+        return false;
+    }
+    while (*a && *b && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
 /* ============================================================================
  * Schema Building
  * ============================================================================
@@ -241,6 +252,7 @@ void carquet_reader_options_init(carquet_reader_options_t* options) {
  */
 #define CARQUET_FOOTER_SPECULATIVE_SIZE (64 * 1024)
 
+#ifndef CARQUET_NO_FILE_IO
 static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* error) {
     /* Seek to end to get file size */
     if (fseek(reader->file, 0, SEEK_END) != 0) {
@@ -352,6 +364,7 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
 
     return CARQUET_OK;
 }
+#endif
 
 /**
  * Read footer from memory-mapped data.
@@ -408,6 +421,13 @@ carquet_reader_t* carquet_reader_open(
     const carquet_reader_options_t* options,
     carquet_error_t* error) {
 
+#ifdef CARQUET_NO_FILE_IO
+    (void)path;
+    (void)options;
+    CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+                      "File I/O is not available in this build; use carquet_reader_open_buffer");
+    return NULL;
+#else
     carquet_reader_t* reader = carquet_mem_calloc(1, sizeof(carquet_reader_t));
     if (!reader) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate reader");
@@ -480,6 +500,7 @@ carquet_reader_t* carquet_reader_open(
 
     reader->is_open = true;
     return reader;
+#endif
 }
 
 carquet_reader_t* carquet_reader_open_file(
@@ -487,6 +508,13 @@ carquet_reader_t* carquet_reader_open_file(
     const carquet_reader_options_t* options,
     carquet_error_t* error) {
 
+#ifdef CARQUET_NO_FILE_IO
+    (void)file;
+    (void)options;
+    CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+                      "File I/O is not available in this build; use carquet_reader_open_buffer");
+    return NULL;
+#else
     /* file is nonnull per API contract (matches carquet_reader_open) */
     carquet_reader_t* reader = carquet_mem_calloc(1, sizeof(carquet_reader_t));
     if (!reader) {
@@ -521,6 +549,7 @@ carquet_reader_t* carquet_reader_open_file(
 
     reader->is_open = true;
     return reader;
+#endif
 }
 
 carquet_status_t carquet_get_file_info(
@@ -528,6 +557,13 @@ carquet_status_t carquet_get_file_info(
     carquet_file_info_t* info,
     carquet_error_t* error) {
 
+#ifdef CARQUET_NO_FILE_IO
+    (void)path;
+    if (info) memset(info, 0, sizeof(*info));
+    CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+                      "File I/O is not available in this build");
+    return CARQUET_ERROR_NOT_IMPLEMENTED;
+#else
     /* path and info are nonnull per API contract */
     memset(info, 0, sizeof(*info));
 
@@ -558,12 +594,19 @@ carquet_status_t carquet_get_file_info(
 
     carquet_reader_close(reader);
     return CARQUET_OK;
+#endif
 }
 
 carquet_status_t carquet_validate_file(
     const char* path,
     carquet_error_t* error) {
 
+#ifdef CARQUET_NO_FILE_IO
+    (void)path;
+    CARQUET_SET_ERROR(error, CARQUET_ERROR_NOT_IMPLEMENTED,
+                      "File I/O is not available in this build");
+    return CARQUET_ERROR_NOT_IMPLEMENTED;
+#else
     /* path is nonnull per API contract.
      *
      * Stage 1: carquet_reader_open performs structural validation - magic
@@ -621,6 +664,7 @@ carquet_status_t carquet_validate_file(
 
     carquet_reader_close(reader);
     return result;
+#endif
 }
 
 void carquet_reader_close(carquet_reader_t* reader) {
@@ -639,7 +683,9 @@ void carquet_reader_close(carquet_reader_t* reader) {
 #endif
 
     if (reader->owns_file && reader->file) {
+#ifndef CARQUET_NO_FILE_IO
         fclose(reader->file);
+#endif
     }
 
     carquet_arena_destroy(&reader->arena);
@@ -705,6 +751,10 @@ carquet_status_t carquet_reader_prebuffer(
         return CARQUET_OK;
     }
 
+#ifdef CARQUET_NO_FILE_IO
+    CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "Reader has no file handle");
+    return CARQUET_ERROR_INVALID_STATE;
+#else
     if (!reader->file) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "Reader has no file handle");
         return CARQUET_ERROR_INVALID_STATE;
@@ -794,6 +844,7 @@ carquet_status_t carquet_reader_prebuffer(
     reader->prebuffer.row_group = row_group_index;
 
     return CARQUET_OK;
+#endif
 }
 
 void carquet_reader_release_prebuffer(carquet_reader_t* reader) {
@@ -1036,6 +1087,10 @@ static carquet_status_t reader_read_bytes(
         return CARQUET_OK;
     }
 
+#ifdef CARQUET_NO_FILE_IO
+    CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "Reader has no file handle");
+    return CARQUET_ERROR_INVALID_STATE;
+#else
     /* fread path: allocate buffer and read */
     if (!reader->file) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "Reader has no file handle");
@@ -1076,6 +1131,7 @@ static carquet_status_t reader_read_bytes(
     *out_buf = buf;
     *allocated = true;
     return CARQUET_OK;
+#endif
 }
 
 /**
@@ -1277,7 +1333,7 @@ const char* carquet_reader_find_metadata(
 
     for (int32_t i = 0; i < reader->metadata.num_key_value; i++) {
         const parquet_key_value_t* kv = &reader->metadata.key_value_metadata[i];
-        if (kv->key && strcmp(kv->key, key) == 0) {
+        if (carquet_string_equal(kv->key, key)) {
             return kv->value;
         }
     }

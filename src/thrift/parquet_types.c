@@ -24,6 +24,22 @@
 #define CARQUET_MAX_ENCODING_STATS    100     /* Max encoding stats entries */
 
 /* Validate count is within reasonable bounds before allocation */
+#ifdef CARQUET_ARCH_WASM
+#define VALIDATE_COUNT(count, max, dec) \
+    do { \
+        if ((count) < 0 || (count) > (max)) { \
+            (dec)->status = CARQUET_ERROR_THRIFT_DECODE; \
+            (dec)->error_message[0] = '\0'; \
+            const char* msg__ = "Invalid count"; \
+            size_t i__; \
+            for (i__ = 0; msg__[i__] && i__ + 1 < sizeof((dec)->error_message); i__++) { \
+                (dec)->error_message[i__] = msg__[i__]; \
+            } \
+            (dec)->error_message[i__] = '\0'; \
+            return; \
+        } \
+    } while(0)
+#else
 #define VALIDATE_COUNT(count, max, dec) \
     do { \
         if ((count) < 0 || (count) > (max)) { \
@@ -33,6 +49,7 @@
             return; \
         } \
     } while(0)
+#endif
 
 #define VALIDATE_COUNT_STATUS(count, max, error) \
     do { \

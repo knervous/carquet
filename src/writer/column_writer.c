@@ -21,6 +21,7 @@ typedef struct carquet_bloom_filter carquet_bloom_filter_t;
 typedef struct carquet_column_index_builder carquet_column_index_builder_t;
 typedef struct carquet_offset_index_builder carquet_offset_index_builder_t;
 
+#ifndef CARQUET_NO_FILE_IO
 extern carquet_bloom_filter_t* carquet_bloom_filter_create_with_ndv(int64_t ndv, double fpp);
 extern void carquet_bloom_filter_destroy(carquet_bloom_filter_t* filter);
 extern void carquet_bloom_filter_insert_i32(carquet_bloom_filter_t* filter, int32_t value);
@@ -31,6 +32,7 @@ extern void carquet_bloom_filter_insert_bytes(carquet_bloom_filter_t* filter,
                                                const uint8_t* data, size_t len);
 extern const uint8_t* carquet_bloom_filter_data(const carquet_bloom_filter_t* filter);
 extern size_t carquet_bloom_filter_size(const carquet_bloom_filter_t* filter);
+#endif
 extern int64_t carquet_dispatch_count_non_nulls(const int16_t* def_levels, int64_t count,
                                                  int16_t max_def_level);
 extern void carquet_dispatch_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
@@ -304,9 +306,11 @@ void carquet_column_writer_destroy(carquet_column_writer_internal_t* writer) {
             carquet_mem_free(writer->path_in_schema);
         }
 
+#ifndef CARQUET_NO_FILE_IO
         if (writer->bloom_filter) {
             carquet_bloom_filter_destroy(writer->bloom_filter);
         }
+#endif
         if (writer->column_index) {
             carquet_column_index_builder_destroy(writer->column_index);
         }
@@ -364,6 +368,7 @@ void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
     writer->has_dictionary_page = false;
     writer->dictionary_page_size_bytes = 0;
 
+#ifndef CARQUET_NO_FILE_IO
     if (writer->bloom_filter) {
         carquet_bloom_filter_destroy(writer->bloom_filter);
         writer->bloom_filter = NULL;
@@ -374,6 +379,10 @@ void carquet_column_writer_reset(carquet_column_writer_internal_t* writer) {
         writer->bloom_filter = carquet_bloom_filter_create_with_ndv(
             writer->bloom_ndv, fpp);
     }
+#else
+    writer->bloom_filter = NULL;
+    writer->bloom_ndv = 0;
+#endif
 
     if (writer->column_index) {
         carquet_column_index_builder_destroy(writer->column_index);
@@ -634,6 +643,12 @@ static void bloom_filter_insert_chunk(
     int64_t num_values,
     const int16_t* def_levels) {
 
+#ifdef CARQUET_NO_FILE_IO
+    (void)writer;
+    (void)values;
+    (void)num_values;
+    (void)def_levels;
+#else
     if (!writer->bloom_filter) return;
 
     int64_t num_non_null = num_values;
@@ -683,6 +698,7 @@ static void bloom_filter_insert_chunk(
         default:
             break;
     }
+#endif
 }
 
 /* ============================================================================
@@ -1260,11 +1276,17 @@ void carquet_column_writer_enable_bloom_filter(
 
 void carquet_column_writer_enable_bloom_filter_fpp(
     carquet_column_writer_internal_t* writer, int64_t ndv, double fpp) {
+#ifdef CARQUET_NO_FILE_IO
+    (void)writer;
+    (void)ndv;
+    (void)fpp;
+#else
     if (!writer || writer->bloom_filter) return;
     writer->bloom_ndv = ndv > 0 ? ndv : 100000;
     writer->bloom_fpp = (fpp > 0.0 && fpp < 1.0) ? fpp : 0.01;
     writer->bloom_filter = carquet_bloom_filter_create_with_ndv(
         writer->bloom_ndv, writer->bloom_fpp);
+#endif
 }
 
 /* Reconfigure (or enable) the bloom filter with explicit ndv/fpp. Safe to
@@ -1273,6 +1295,15 @@ void carquet_column_writer_enable_bloom_filter_fpp(
 void carquet_column_writer_configure_bloom_filter(
     carquet_column_writer_internal_t* writer,
     bool enabled, int64_t ndv, double fpp) {
+#ifdef CARQUET_NO_FILE_IO
+    (void)enabled;
+    (void)ndv;
+    (void)fpp;
+    if (writer) {
+        writer->bloom_filter = NULL;
+        writer->bloom_ndv = 0;
+    }
+#else
     if (!writer) return;
     if (writer->bloom_filter) {
         carquet_bloom_filter_destroy(writer->bloom_filter);
@@ -1286,6 +1317,7 @@ void carquet_column_writer_configure_bloom_filter(
     writer->bloom_fpp = (fpp > 0.0 && fpp < 1.0) ? fpp : 0.01;
     writer->bloom_filter = carquet_bloom_filter_create_with_ndv(
         writer->bloom_ndv, writer->bloom_fpp);
+#endif
 }
 
 void carquet_column_writer_enable_page_index(
@@ -1308,7 +1340,12 @@ void carquet_column_writer_set_file_offset(
 
 carquet_bloom_filter_t* carquet_column_writer_get_bloom_filter(
     const carquet_column_writer_internal_t* writer) {
+#ifdef CARQUET_NO_FILE_IO
+    (void)writer;
+    return NULL;
+#else
     return writer ? writer->bloom_filter : NULL;
+#endif
 }
 
 carquet_column_index_builder_t* carquet_column_writer_get_column_index(

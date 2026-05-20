@@ -48,6 +48,40 @@ extern bool carquet_dispatch_checked_gather_double(const double* dict, int32_t d
                                                     const uint32_t* indices, int64_t count,
                                                     double* output);
 
+#ifdef CARQUET_NO_MMAP
+bool carquet_page_is_zero_copy_eligible(
+    carquet_compression_t codec,
+    carquet_encoding_t encoding,
+    carquet_physical_type_t type) {
+
+#if !CARQUET_LITTLE_ENDIAN
+    (void)codec;
+    (void)encoding;
+    (void)type;
+    return false;
+#else
+    if (codec != CARQUET_COMPRESSION_UNCOMPRESSED) {
+        return false;
+    }
+    if (encoding != CARQUET_ENCODING_PLAIN) {
+        return false;
+    }
+
+    switch (type) {
+        case CARQUET_PHYSICAL_INT32:
+        case CARQUET_PHYSICAL_INT64:
+        case CARQUET_PHYSICAL_FLOAT:
+        case CARQUET_PHYSICAL_DOUBLE:
+        case CARQUET_PHYSICAL_INT96:
+        case CARQUET_PHYSICAL_FIXED_LEN_BYTE_ARRAY:
+            return true;
+        default:
+            return false;
+    }
+#endif
+}
+#endif
+
 /* SIMD dispatch functions for definition level processing */
 extern int64_t carquet_dispatch_count_non_nulls(const int16_t* def_levels, int64_t count,
                                                   int16_t max_def_level);
@@ -163,10 +197,15 @@ static size_t prebuf_read_at(carquet_reader_t* file_reader,
         return size;
     }
 
+#ifdef CARQUET_NO_FILE_IO
+    (void)file_reader;
+    return 0;
+#else
     /* Fall back to fseek + fread */
     if (offset > LONG_MAX) return 0;
     if (fseek(file_reader->file, (long)offset, SEEK_SET) != 0) return 0;
     return fread(buf, 1, size, file_reader->file);
+#endif
 }
 
 /* ============================================================================
@@ -1867,6 +1906,7 @@ static carquet_status_t read_and_parse_page_header_fread(
  * ============================================================================
  */
 
+#ifndef CARQUET_NO_FILE_IO
 static carquet_status_t load_dictionary_page_fread(
     carquet_column_reader_t* reader,
     carquet_error_t* error) {
@@ -1992,6 +2032,7 @@ static carquet_status_t load_dictionary_page_fread(
 
     return status;
 }
+#endif
 
 /* ============================================================================
  * Helper: Load and decode a new page (mmap path with zero-copy support)
@@ -2229,6 +2270,7 @@ static carquet_status_t load_next_page_mmap(
  * ============================================================================
  */
 
+#ifndef CARQUET_NO_FILE_IO
 static carquet_status_t load_next_page_fread(
     carquet_column_reader_t* reader,
     carquet_error_t* error) {
@@ -2422,6 +2464,7 @@ static carquet_status_t load_next_page_fread(
 
     return CARQUET_OK;
 }
+#endif
 
 /* ============================================================================
  * Helper: Load and decode a new page (dispatcher)
@@ -2439,12 +2482,17 @@ static carquet_status_t load_next_page(
         return load_next_page_mmap(reader, error);
     }
 
+#ifdef CARQUET_NO_FILE_IO
+    CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "No buffer data source available");
+    return CARQUET_ERROR_INVALID_STATE;
+#else
     /* Fall back to fread path (requires valid file handle) */
     if (file_reader->file == NULL) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "No data source available");
         return CARQUET_ERROR_INVALID_STATE;
     }
     return load_next_page_fread(reader, error);
+#endif
 }
 
 /* ============================================================================

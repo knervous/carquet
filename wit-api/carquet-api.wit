@@ -317,14 +317,20 @@ interface types {
   }
 
   record binary-column {
-    values: list<list<u8>>,
-    nulls: option<list<bool>>,
+    offsets: list<u32>,
+    values: list<u8>,
+    null-bitmap: option<list<u8>>,
+    num-values: u64,
   }
 
   record column-view {
     column-index: u32,
+    physical-type: physical-type,
+    logical-type: option<logical-type>,
+    type-length: s32,
     values: list<u8>,
-    nulls: option<list<bool>>,
+    null-bitmap: option<list<u8>>,
+    num-values: u64,
   }
 
   record table-view {
@@ -370,9 +376,10 @@ interface types {
   record block-column {
     column-index: u32,
     physical-type: physical-type,
+    logical-type: option<logical-type>,
     type-length: s32,
     values: list<u8>,
-    nulls: option<list<bool>>,
+    null-bitmap: option<list<u8>>,
     num-values: u64,
   }
 
@@ -380,6 +387,21 @@ interface types {
     start-row: u64,
     num-rows: u64,
     columns: list<block-column>,
+  }
+
+  record arrow-array-data {
+    physical-type: physical-type,
+    logical-type: option<logical-type>,
+    length: u64,
+    null-count: u64,
+    null-bitmap: option<list<u8>>,
+    offsets: option<list<u32>>,
+    values: list<u8>,
+  }
+
+  record arrow-record-batch {
+    num-rows: u64,
+    columns: list<arrow-array-data>,
   }
 }
 
@@ -428,6 +450,9 @@ interface reader-api {
     column-statistics,
     error,
     file-info,
+    arrow-record-batch,
+    block-column,
+    data-block,
     page-location,
     page-stats,
     reader-options,
@@ -477,23 +502,23 @@ interface reader-api {
   column-reader-read-booleans: func(
     column-reader: borrow<column-reader>,
     max-values: u64,
-  ) -> result<tuple<list<bool>, list<bool>>, error>;
+  ) -> result<tuple<list<bool>, list<u8>>, error>;
   column-reader-read-i32: func(
     column-reader: borrow<column-reader>,
     max-values: u64,
-  ) -> result<tuple<list<s32>, list<bool>>, error>;
+  ) -> result<tuple<list<s32>, list<u8>>, error>;
   column-reader-read-i64: func(
     column-reader: borrow<column-reader>,
     max-values: u64,
-  ) -> result<tuple<list<s64>, list<bool>>, error>;
+  ) -> result<tuple<list<s64>, list<u8>>, error>;
   column-reader-read-f32: func(
     column-reader: borrow<column-reader>,
     max-values: u64,
-  ) -> result<tuple<list<f32>, list<bool>>, error>;
+  ) -> result<tuple<list<f32>, list<u8>>, error>;
   column-reader-read-f64: func(
     column-reader: borrow<column-reader>,
     max-values: u64,
-  ) -> result<tuple<list<f64>, list<bool>>, error>;
+  ) -> result<tuple<list<f64>, list<u8>>, error>;
   column-reader-read-binary: func(
     column-reader: borrow<column-reader>,
     max-values: u64,
@@ -505,9 +530,12 @@ interface reader-api {
     column-indices: option<list<u32>>,
   ) -> result<own<batch-reader>, error>;
   batch-reader-next: func(batch-reader: borrow<batch-reader>) -> result<option<own<row-batch>>, error>;
+  batch-reader-next-arrow: func(batch-reader: borrow<batch-reader>) -> result<option<arrow-record-batch>, error>;
   batch-reader-close: func(batch-reader: own<batch-reader>);
   row-batch-num-rows: func(row-batch: borrow<row-batch>) -> u64;
   row-batch-num-columns: func(row-batch: borrow<row-batch>) -> u32;
+  row-batch-column: func(row-batch: borrow<row-batch>, column-index: u32) -> result<block-column, error>;
+  row-batch-block: func(row-batch: borrow<row-batch>) -> result<data-block, error>;
   row-batch-close: func(row-batch: own<row-batch>);
 
   reader-bloom-filter: func(
@@ -558,31 +586,31 @@ interface writer-api {
     writer: borrow<writer>,
     column-index: u32,
     values: list<bool>,
-    nulls: option<list<bool>>,
+    null-bitmap: option<list<u8>>,
   ) -> result<_, error>;
   writer-write-i32: func(
     writer: borrow<writer>,
     column-index: u32,
     values: list<s32>,
-    nulls: option<list<bool>>,
+    null-bitmap: option<list<u8>>,
   ) -> result<_, error>;
   writer-write-i64: func(
     writer: borrow<writer>,
     column-index: u32,
     values: list<s64>,
-    nulls: option<list<bool>>,
+    null-bitmap: option<list<u8>>,
   ) -> result<_, error>;
   writer-write-f32: func(
     writer: borrow<writer>,
     column-index: u32,
     values: list<f32>,
-    nulls: option<list<bool>>,
+    null-bitmap: option<list<u8>>,
   ) -> result<_, error>;
   writer-write-f64: func(
     writer: borrow<writer>,
     column-index: u32,
     values: list<f64>,
-    nulls: option<list<bool>>,
+    null-bitmap: option<list<u8>>,
   ) -> result<_, error>;
   writer-write-binary: func(
     writer: borrow<writer>,

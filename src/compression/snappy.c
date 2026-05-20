@@ -28,6 +28,13 @@
 #include <stddef.h>
 #include <string.h>
 
+#if defined(CARQUET_ENABLE_WASM_SIMD) && defined(__wasm_simd128__)
+#include <wasm_simd128.h>
+#define SNAPPY_HAVE_WASM_SIMD 1
+#else
+#define SNAPPY_HAVE_WASM_SIMD 0
+#endif
+
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 #define SNAPPY_HAVE_NEON 1
@@ -49,7 +56,7 @@
 #define SNAPPY_HAVE_SSSE3 0
 #endif
 
-#if SNAPPY_HAVE_SSSE3 || SNAPPY_HAVE_NEON
+#if SNAPPY_HAVE_SSSE3 || SNAPPY_HAVE_NEON || SNAPPY_HAVE_WASM_SIMD
 #define SNAPPY_HAVE_VECTOR_SHUFFLE 1
 #else
 #define SNAPPY_HAVE_VECTOR_SHUFFLE 0
@@ -127,11 +134,15 @@ static inline void copy64(const void* src, void* dst) {
 }
 
 static inline void copy128(const void* src, void* dst) {
+#if SNAPPY_HAVE_WASM_SIMD
+    wasm_v128_store(dst, wasm_v128_load(src));
+#else
     uint64_t lo, hi;
     memcpy(&lo, src, 8);
     memcpy(&hi, (const char*)src + 8, 8);
     memcpy(dst, &lo, 8);
     memcpy((char*)dst + 8, &hi, 8);
+#endif
 }
 
 /* ============================================================================
@@ -266,7 +277,19 @@ static const uint8_t snappy_masks_offset16[16][16] = {
     {1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,1}, /* ps=15 */
 };
 
-#if SNAPPY_HAVE_NEON
+#if SNAPPY_HAVE_WASM_SIMD
+
+static inline v128_t wasm_load_pattern(const uint8_t* src, int pattern_size) {
+    v128_t gen_mask = wasm_v128_load(snappy_masks_offset0[pattern_size]);
+    v128_t raw = wasm_v128_load(src);
+    return wasm_i8x16_swizzle(raw, gen_mask);
+}
+
+static inline v128_t wasm_reshuffle_mask(int pattern_size) {
+    return wasm_v128_load(snappy_masks_offset16[pattern_size]);
+}
+
+#elif SNAPPY_HAVE_NEON
 
 static inline uint8x16_t neon_load_pattern(const uint8_t* src, int pattern_size) {
     uint8x16_t gen_mask = vld1q_u8(snappy_masks_offset0[pattern_size]);
@@ -316,7 +339,23 @@ static inline uint8_t* incremental_copy(const uint8_t* src, uint8_t* op,
     if (pattern_size < (size_t)big_pattern) {
 #if SNAPPY_HAVE_VECTOR_SHUFFLE
         if (SNAPPY_PREDICT_TRUE(op_limit <= buf_limit - 15)) {
-#if SNAPPY_HAVE_NEON
+#if SNAPPY_HAVE_WASM_SIMD
+            v128_t pattern = wasm_load_pattern(src, (int)pattern_size);
+            v128_t reshuffle = wasm_reshuffle_mask((int)pattern_size);
+            wasm_v128_store(op, pattern);
+            if (op + 16 < op_limit) {
+                pattern = wasm_i8x16_swizzle(pattern, reshuffle);
+                wasm_v128_store(op + 16, pattern);
+            }
+            if (op + 32 < op_limit) {
+                pattern = wasm_i8x16_swizzle(pattern, reshuffle);
+                wasm_v128_store(op + 32, pattern);
+            }
+            if (op + 48 < op_limit) {
+                pattern = wasm_i8x16_swizzle(pattern, reshuffle);
+                wasm_v128_store(op + 48, pattern);
+            }
+#elif SNAPPY_HAVE_NEON
             uint8x16_t pattern = neon_load_pattern(src, (int)pattern_size);
             uint8x16_t reshuffle = neon_reshuffle_mask((int)pattern_size);
             vst1q_u8(op, pattern);

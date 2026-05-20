@@ -574,6 +574,13 @@ carquet_status_t carquet_row_group_writer_write_to_file(
     size_t* total_size,
     int64_t num_rows) {
 
+#ifdef CARQUET_NO_FILE_IO
+    (void)writer;
+    (void)file;
+    (void)total_size;
+    (void)num_rows;
+    return CARQUET_ERROR_NOT_IMPLEMENTED;
+#else
     if (!writer || !file) {
         return CARQUET_ERROR_INVALID_ARGUMENT;
     }
@@ -658,6 +665,7 @@ carquet_status_t carquet_row_group_writer_write_to_file(
 
     if (total_size) *total_size = written;
     return CARQUET_OK;
+#endif
 }
 
 int carquet_row_group_writer_num_columns(const carquet_row_group_writer_t* writer) {
