@@ -23,7 +23,7 @@
 #include <omp.h>
 #endif
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(CARQUET_NO_MMAP)
 #include <sys/mman.h>
 #endif
 
@@ -1279,7 +1279,7 @@ static void pipeline_fill(carquet_batch_reader_t* br) {
          * shared mmap's page table lock.  Falls back to the shared mmap
          * if the per-slot mmap fails. */
         const uint8_t* slot_data = br->reader->mmap_data;  /* fallback */
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(CARQUET_NO_MMAP)
         if (br->reader->mmap_info && br->reader->mmap_info->fd >= 0) {
             /* Find byte range spanning all projected column chunks */
             int64_t range_lo = INT64_MAX, range_hi = 0;
@@ -1714,7 +1714,7 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
             }
             carquet_mem_free(slot->col_buf_sizes);
             carquet_mem_free(slot->col_num_values);
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(CARQUET_NO_MMAP)
             if (slot->slot_mmap && slot->slot_mmap_size > 0)
                 munmap(slot->slot_mmap, slot->slot_mmap_size);
 #endif

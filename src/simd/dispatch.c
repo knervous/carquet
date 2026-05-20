@@ -759,6 +759,15 @@ extern void carquet_sve_copy_minmax_double(const double* values, int64_t count, 
 
 #endif /* AArch64 */
 
+#if defined(CARQUET_ARCH_WASM)
+
+#if defined(CARQUET_ENABLE_WASM_SIMD) && defined(__wasm_simd128__)
+extern void carquet_wasm128_bitunpack8_4bit(const uint8_t* input, uint32_t* values);
+extern void carquet_wasm128_bitunpack8_8bit(const uint8_t* input, uint32_t* values);
+#endif
+
+#endif /* CARQUET_ARCH_WASM */
+
 /* ============================================================================
  * Dispatch Table
  * ============================================================================
@@ -1148,6 +1157,15 @@ void carquet_simd_dispatch_init(void) {
 #endif
 
 #endif /* ARM */
+
+#if defined(CARQUET_ARCH_WASM)
+
+#if defined(CARQUET_ENABLE_WASM_SIMD) && defined(__wasm_simd128__)
+    g_dispatch.bitunpack8_u32[4] = carquet_wasm128_bitunpack8_4bit;
+    g_dispatch.bitunpack8_u32[8] = carquet_wasm128_bitunpack8_8bit;
+#endif
+
+#endif /* CARQUET_ARCH_WASM */
 
     dispatch_set_initialized();
 }

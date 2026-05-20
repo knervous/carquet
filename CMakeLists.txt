@@ -39,134 +39,165 @@ option(CARQUET_BUILD_ARROW_CPP_BENCHMARK "Build the optional Arrow C++ compariso
 option(CARQUET_BUILD_INTEROP "Build interoperability test programs" ${CARQUET_BUILD_DEV})
 option(CARQUET_BUILD_CLI "Build carquet CLI tool" ON)
 option(CARQUET_BUILD_SHARED "Build shared library" OFF)
+option(CARQUET_ENABLE_FILE_IO "Enable file reader and writer APIs" ON)
+option(CARQUET_ENABLE_WRITER "Enable writer APIs" ON)
+option(CARQUET_ENABLE_COMPRESSION "Enable compression codec support" ON)
+option(CARQUET_ENABLE_GZIP "Enable GZIP codec support; requires zlib ABI" ON)
+option(CARQUET_ENABLE_SNAPPY "Enable Snappy codec support" ON)
+option(CARQUET_ENABLE_LZ4 "Enable LZ4 codec support" ON)
+option(CARQUET_ENABLE_ZSTD "Enable ZSTD codec support" ON)
+option(CARQUET_ENABLE_MMAP "Enable memory-mapped file reading" ON)
+option(CARQUET_ENABLE_WORKER_THREADS "Enable internal worker-pool threads" ON)
+option(CARQUET_ENABLE_OPENMP "Enable OpenMP parallel loops when available" ON)
+option(CARQUET_ENABLE_WASM_SIMD "Enable WebAssembly wasm128 SIMD optimizations" OFF)
 option(CARQUET_ENABLE_SSE "Enable SSE optimizations" ON)
 option(CARQUET_ENABLE_AVX "Enable AVX optimizations" ON)
 option(CARQUET_ENABLE_AVX2 "Enable AVX2 optimizations" ON)
 option(CARQUET_ENABLE_AVX512 "Enable AVX-512 optimizations" ON)
 option(CARQUET_ENABLE_NEON "Enable NEON optimizations" ON)
 option(CARQUET_ENABLE_SVE "Enable SVE optimizations" OFF)
+option(CARQUET_ENABLE_LTO "Enable link-time optimization in release builds" ON)
+set(CARQUET_ZLIB_RS_INCLUDE_DIR "" CACHE PATH
+    "zlib-rs include directory containing zlib.h and zconf.h")
+set(CARQUET_ZLIB_RS_LIBRARY "" CACHE FILEPATH
+    "zlib-rs static library implementing the zlib C ABI")
 set(CARQUET_ARROW_CPP_ROOT "" CACHE PATH
     "Optional Arrow/Parquet install prefix used only for benchmark_arrow_cpp")
 
 # External compression libraries
 include(FetchContent)
 
-# Try to find system zstd first, fetch if not found
-# Method 1: Try modern CMake config (works best on Windows/vcpkg/conda)
-find_package(zstd CONFIG QUIET)
-if(zstd_FOUND)
-    message(STATUS "Found zstd via CMake config")
-    # When building a shared library, prefer shared deps to avoid -fPIC issues
-    # with static libraries that weren't compiled with -fPIC.
-    if(CARQUET_BUILD_SHARED AND TARGET zstd::libzstd_shared)
-        set(ZSTD_LIBRARIES zstd::libzstd_shared)
-    elseif(TARGET zstd::libzstd_static)
-        set(ZSTD_LIBRARIES zstd::libzstd_static)
-    elseif(TARGET zstd::libzstd_shared)
-        set(ZSTD_LIBRARIES zstd::libzstd_shared)
-    endif()
-    set(ZSTD_FOUND TRUE)
-else()
-    # Method 2: Try pkg-config (Linux/macOS)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(ZSTD QUIET libzstd)
-    endif()
-endif()
-
-if(ZSTD_FOUND)
-    message(STATUS "Found system libzstd")
-else()
-    # Method 3: Fetch from source
-    message(STATUS "Fetching zstd...")
-    FetchContent_Declare(
-        zstd
-        GIT_REPOSITORY https://github.com/facebook/zstd.git
-        GIT_TAG        v1.5.6
-        SOURCE_SUBDIR  build/cmake
-    )
-    set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
-    set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-    set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(zstd)
-    set(ZSTD_LIBRARIES libzstd_static)
-    set(ZSTD_INCLUDE_DIRS ${zstd_SOURCE_DIR}/lib)
-endif()
-
-# Try to find system zlib first, fetch if not found
-find_package(ZLIB QUIET)
-if(ZLIB_FOUND)
-    message(STATUS "Found system zlib: ${ZLIB_VERSION_STRING}")
-else()
-    message(STATUS "Fetching zlib...")
-    FetchContent_Declare(
-        zlib
-        GIT_REPOSITORY https://github.com/madler/zlib.git
-        GIT_TAG        v1.3.1
-    )
-    set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(zlib)
-    set(ZLIB_LIBRARIES zlibstatic)
-    set(ZLIB_INCLUDE_DIRS ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
-endif()
-
-# Try to find system lz4 first, fetch if not found
-# Prefer CMake config (gives proper targets with full paths on all platforms)
-find_package(lz4 CONFIG QUIET)
-if(lz4_FOUND)
-    message(STATUS "Found lz4 via CMake config")
-    if(CARQUET_BUILD_SHARED AND TARGET LZ4::lz4_shared)
-        set(LZ4_LIBRARIES LZ4::lz4_shared)
-    elseif(TARGET LZ4::lz4_static)
-        set(LZ4_LIBRARIES LZ4::lz4_static)
-    elseif(TARGET LZ4::lz4_shared)
-        set(LZ4_LIBRARIES LZ4::lz4_shared)
-    elseif(TARGET lz4::lz4)
-        set(LZ4_LIBRARIES lz4::lz4)
-    endif()
-    # Only mark as found if we actually resolved a target
-    if(LZ4_LIBRARIES)
-        set(LZ4_FOUND TRUE)
-    else()
-        message(STATUS "lz4 CMake config found but no known target — trying pkg-config")
-        set(LZ4_FOUND FALSE)
-    endif()
-endif()
-
-if(NOT LZ4_FOUND)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(LZ4 QUIET liblz4)
-        if(LZ4_FOUND)
-            message(STATUS "Found system liblz4 via pkg-config")
-            # Use LINK_LIBRARIES (full paths) instead of LIBRARIES (bare names)
-            # to avoid MSVC linker failing to locate the .lib file
-            if(LZ4_LINK_LIBRARIES)
-                set(LZ4_LIBRARIES ${LZ4_LINK_LIBRARIES})
+if(CARQUET_ENABLE_COMPRESSION)
+    if(CARQUET_ENABLE_GZIP)
+        if(CARQUET_ZLIB_RS_INCLUDE_DIR AND CARQUET_ZLIB_RS_LIBRARY)
+            message(STATUS "Using zlib-rs for zlib ABI: ${CARQUET_ZLIB_RS_LIBRARY}")
+            set(ZLIB_FOUND FALSE)
+            set(ZLIB_LIBRARIES "${CARQUET_ZLIB_RS_LIBRARY}")
+            set(ZLIB_INCLUDE_DIRS "${CARQUET_ZLIB_RS_INCLUDE_DIR}")
+        else()
+            # Try to find system zlib first, fetch if not found
+            find_package(ZLIB QUIET)
+            if(ZLIB_FOUND)
+                message(STATUS "Found system zlib: ${ZLIB_VERSION_STRING}")
+            else()
+                message(STATUS "Fetching zlib...")
+                FetchContent_Declare(
+                    zlib
+                    GIT_REPOSITORY https://github.com/madler/zlib.git
+                    GIT_TAG        v1.3.1
+                )
+                set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+                FetchContent_MakeAvailable(zlib)
+                set(ZLIB_LIBRARIES zlibstatic)
+                set(ZLIB_INCLUDE_DIRS ${zlib_SOURCE_DIR} ${zlib_BINARY_DIR})
             endif()
         endif()
     endif()
-endif()
 
-if(NOT LZ4_FOUND)
-    message(STATUS "Fetching lz4...")
-    FetchContent_Declare(
-        lz4
-        GIT_REPOSITORY https://github.com/lz4/lz4.git
-        GIT_TAG        v1.10.0
-        SOURCE_SUBDIR  build/cmake
-    )
-    set(LZ4_BUILD_CLI OFF CACHE BOOL "" FORCE)
-    set(LZ4_BUILD_LEGACY_LZ4C OFF CACHE BOOL "" FORCE)
-    # Save and restore BUILD_SHARED_LIBS to avoid corrupting cache for rest of build
-    set(_saved_BSL ${BUILD_SHARED_LIBS})
-    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-    set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(lz4)
-    set(BUILD_SHARED_LIBS ${_saved_BSL} CACHE BOOL "" FORCE)
-    set(LZ4_LIBRARIES lz4_static)
-    set(LZ4_INCLUDE_DIRS ${lz4_SOURCE_DIR}/lib)
+    # Try to find system zstd first, fetch if not found
+    # Method 1: Try modern CMake config (works best on Windows/vcpkg/conda)
+    if(CARQUET_ENABLE_ZSTD)
+        find_package(zstd CONFIG QUIET)
+        if(zstd_FOUND)
+            message(STATUS "Found zstd via CMake config")
+            # When building a shared library, prefer shared deps to avoid -fPIC issues
+            # with static libraries that weren't compiled with -fPIC.
+            if(CARQUET_BUILD_SHARED AND TARGET zstd::libzstd_shared)
+                set(ZSTD_LIBRARIES zstd::libzstd_shared)
+            elseif(TARGET zstd::libzstd_static)
+                set(ZSTD_LIBRARIES zstd::libzstd_static)
+            elseif(TARGET zstd::libzstd_shared)
+                set(ZSTD_LIBRARIES zstd::libzstd_shared)
+            endif()
+            set(ZSTD_FOUND TRUE)
+        else()
+            # Method 2: Try pkg-config (Linux/macOS)
+            find_package(PkgConfig QUIET)
+            if(PkgConfig_FOUND)
+                pkg_check_modules(ZSTD QUIET libzstd)
+            endif()
+        endif()
+
+        if(ZSTD_FOUND)
+            message(STATUS "Found system libzstd")
+        else()
+            # Method 3: Fetch from source
+            message(STATUS "Fetching zstd...")
+            FetchContent_Declare(
+                zstd
+                GIT_REPOSITORY https://github.com/facebook/zstd.git
+                GIT_TAG        v1.5.6
+                SOURCE_SUBDIR  build/cmake
+            )
+            set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+            set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+            set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+            set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
+            FetchContent_MakeAvailable(zstd)
+            set(ZSTD_LIBRARIES libzstd_static)
+            set(ZSTD_INCLUDE_DIRS ${zstd_SOURCE_DIR}/lib)
+        endif()
+    endif()
+
+    # Try to find system lz4 first, fetch if not found
+    # Prefer CMake config (gives proper targets with full paths on all platforms)
+    if(CARQUET_ENABLE_LZ4)
+        find_package(lz4 CONFIG QUIET)
+        if(lz4_FOUND)
+            message(STATUS "Found lz4 via CMake config")
+            if(CARQUET_BUILD_SHARED AND TARGET LZ4::lz4_shared)
+                set(LZ4_LIBRARIES LZ4::lz4_shared)
+            elseif(TARGET LZ4::lz4_static)
+                set(LZ4_LIBRARIES LZ4::lz4_static)
+            elseif(TARGET LZ4::lz4_shared)
+                set(LZ4_LIBRARIES LZ4::lz4_shared)
+            elseif(TARGET lz4::lz4)
+                set(LZ4_LIBRARIES lz4::lz4)
+            endif()
+            # Only mark as found if we actually resolved a target
+            if(LZ4_LIBRARIES)
+                set(LZ4_FOUND TRUE)
+            else()
+                message(STATUS "lz4 CMake config found but no known target — trying pkg-config")
+                set(LZ4_FOUND FALSE)
+            endif()
+        endif()
+
+        if(NOT LZ4_FOUND)
+            find_package(PkgConfig QUIET)
+            if(PkgConfig_FOUND)
+                pkg_check_modules(LZ4 QUIET liblz4)
+                if(LZ4_FOUND)
+                    message(STATUS "Found system liblz4 via pkg-config")
+                    # Use LINK_LIBRARIES (full paths) instead of LIBRARIES (bare names)
+                    # to avoid MSVC linker failing to locate the .lib file
+                    if(LZ4_LINK_LIBRARIES)
+                        set(LZ4_LIBRARIES ${LZ4_LINK_LIBRARIES})
+                    endif()
+                endif()
+            endif()
+        endif()
+
+        if(NOT LZ4_FOUND)
+            message(STATUS "Fetching lz4...")
+            FetchContent_Declare(
+                lz4
+                GIT_REPOSITORY https://github.com/lz4/lz4.git
+                GIT_TAG        v1.10.0
+                SOURCE_SUBDIR  build/cmake
+            )
+            set(LZ4_BUILD_CLI OFF CACHE BOOL "" FORCE)
+            set(LZ4_BUILD_LEGACY_LZ4C OFF CACHE BOOL "" FORCE)
+            # Save and restore BUILD_SHARED_LIBS to avoid corrupting cache for rest of build
+            set(_saved_BSL ${BUILD_SHARED_LIBS})
+            set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+            set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+            FetchContent_MakeAvailable(lz4)
+            set(BUILD_SHARED_LIBS ${_saved_BSL} CACHE BOOL "" FORCE)
+            set(LZ4_LIBRARIES lz4_static)
+            set(LZ4_INCLUDE_DIRS ${lz4_SOURCE_DIR}/lib)
+        endif()
+    endif()
 endif()
 
 # Compiler detection
@@ -194,13 +225,24 @@ check_c_source_compiles("
     #endif
 " CARQUET_ARCH_ARM)
 
+check_c_source_compiles("
+    #if defined(__wasm32__) || defined(__wasm64__)
+    int main() { return 0; }
+    #else
+    #error Not WebAssembly
+    #endif
+" CARQUET_ARCH_WASM)
+
 # Compiler flags
 if(CARQUET_COMPILER_GCC_LIKE)
     add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
 
     # Debug/Release flags
     set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DCARQUET_DEBUG")
-    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -flto=auto")
+    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
+    if(CARQUET_ENABLE_LTO)
+        set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -flto=auto")
+    endif()
     set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
 
     # When using LTO, ensure ar/ranlib match the compiler toolchain
@@ -241,6 +283,8 @@ set(CARQUET_CORE_SOURCES
     src/core/endian.c
     src/core/error.c
     src/core/geo_wkb.c
+    src/core/helpers.c
+    src/core/version.c
 )
 
 set(CARQUET_THRIFT_SOURCES
@@ -259,12 +303,21 @@ set(CARQUET_ENCODING_SOURCES
     src/encoding/byte_stream_split.c
 )
 
-set(CARQUET_COMPRESSION_SOURCES
-    src/compression/lz4.c
-    src/compression/snappy.c
-    src/compression/zstd.c
-    src/compression/gzip.c
-)
+set(CARQUET_COMPRESSION_SOURCES)
+if(CARQUET_ENABLE_COMPRESSION)
+    if(CARQUET_ENABLE_LZ4)
+        list(APPEND CARQUET_COMPRESSION_SOURCES src/compression/lz4.c)
+    endif()
+    if(CARQUET_ENABLE_SNAPPY)
+        list(APPEND CARQUET_COMPRESSION_SOURCES src/compression/snappy.c)
+    endif()
+    if(CARQUET_ENABLE_ZSTD)
+        list(APPEND CARQUET_COMPRESSION_SOURCES src/compression/zstd.c)
+    endif()
+    if(CARQUET_ENABLE_GZIP)
+        list(APPEND CARQUET_COMPRESSION_SOURCES src/compression/gzip.c)
+    endif()
+endif()
 
 # Snappy uses SSSE3 (pshufb) for pattern extension on x86.
 # SSSE3 is baseline since Core 2 (2006) / x86-64-v2.
@@ -287,23 +340,35 @@ if(CARQUET_COMPILER_GCC_LIKE)
 endif()
 
 set(CARQUET_READER_SOURCES
-    src/reader/file_reader.c
-    src/reader/row_group_reader.c
-    src/reader/column_reader.c
-    src/reader/page_reader.c
-    src/reader/batch_reader.c
-    src/reader/statistics.c
-    src/reader/mmap_reader.c
     src/reader/worker_pool.c
 )
 
-set(CARQUET_WRITER_SOURCES
-    src/writer/file_writer.c
-    src/writer/row_group_writer.c
-    src/writer/column_writer.c
-    src/writer/page_writer.c
-    src/writer/arrow_schema.c
-)
+if(CARQUET_ENABLE_FILE_IO)
+    list(APPEND CARQUET_READER_SOURCES
+        src/reader/file_reader.c
+        src/reader/row_group_reader.c
+        src/reader/column_reader.c
+        src/reader/page_reader.c
+        src/reader/batch_reader.c
+        src/reader/statistics.c
+    )
+    if(CARQUET_ENABLE_MMAP)
+        list(APPEND CARQUET_READER_SOURCES src/reader/mmap_reader.c)
+    else()
+        list(APPEND CARQUET_READER_SOURCES src/reader/buffer_reader.c)
+    endif()
+endif()
+
+set(CARQUET_WRITER_SOURCES)
+if(CARQUET_ENABLE_FILE_IO AND CARQUET_ENABLE_WRITER)
+    set(CARQUET_WRITER_SOURCES
+        src/writer/file_writer.c
+        src/writer/row_group_writer.c
+        src/writer/column_writer.c
+        src/writer/page_writer.c
+        src/writer/arrow_schema.c
+    )
+endif()
 
 set(CARQUET_METADATA_SOURCES
     src/metadata/schema.c
@@ -402,10 +467,20 @@ if(CARQUET_ARCH_ARM)
     endif()
 endif()
 
+if(CARQUET_ARCH_WASM AND CARQUET_ENABLE_WASM_SIMD)
+    set(CARQUET_SIMD_WASM_SOURCES src/simd/wasm/wasm128_ops.c)
+    if(CARQUET_COMPILER_GCC_LIKE)
+        set_source_files_properties(src/simd/wasm/wasm128_ops.c PROPERTIES
+            COMPILE_FLAGS "-msimd128")
+    endif()
+endif()
+
 # OpenMP support for parallel column reading
-find_package(OpenMP)
-if(OpenMP_C_FOUND)
-    message(STATUS "OpenMP found - enabling parallel column reading")
+if(CARQUET_ENABLE_OPENMP)
+    find_package(OpenMP)
+    if(OpenMP_C_FOUND)
+        message(STATUS "OpenMP found - enabling parallel column reading")
+    endif()
 endif()
 
 # Combine all sources
@@ -426,6 +501,9 @@ if(CARQUET_ARCH_X86)
 endif()
 if(CARQUET_ARCH_ARM)
     list(APPEND CARQUET_SOURCES ${CARQUET_SIMD_ARM_SOURCES})
+endif()
+if(CARQUET_ARCH_WASM)
+    list(APPEND CARQUET_SOURCES ${CARQUET_SIMD_WASM_SOURCES})
 endif()
 
 # Create library
@@ -452,7 +530,15 @@ target_include_directories(carquet
 )
 
 # Link external compression libraries
-set(CARQUET_COMPRESSION_LIBS ${ZSTD_LIBRARIES} ${LZ4_LIBRARIES})
+set(CARQUET_COMPRESSION_LIBS)
+if(CARQUET_ENABLE_COMPRESSION)
+    if(CARQUET_ENABLE_ZSTD)
+        list(APPEND CARQUET_COMPRESSION_LIBS ${ZSTD_LIBRARIES})
+    endif()
+    if(CARQUET_ENABLE_LZ4)
+        list(APPEND CARQUET_COMPRESSION_LIBS ${LZ4_LIBRARIES})
+    endif()
+endif()
 
 function(carquet_private_link_libraries_for_export out_var)
     set(_result)
@@ -475,15 +561,19 @@ carquet_private_link_libraries_for_export(
     CARQUET_PRIVATE_COMPRESSION_LIBS
     ${CARQUET_COMPRESSION_LIBS})
 
-if(ZLIB_FOUND)
-    target_link_libraries(carquet PRIVATE ${CARQUET_PRIVATE_COMPRESSION_LIBS} ZLIB::ZLIB)
-else()
-    carquet_private_link_libraries_for_export(
-        CARQUET_PRIVATE_ZLIB_LIBS
-        ${ZLIB_LIBRARIES})
-    target_link_libraries(carquet PRIVATE
-        ${CARQUET_PRIVATE_COMPRESSION_LIBS}
-        ${CARQUET_PRIVATE_ZLIB_LIBS})
+if(CARQUET_ENABLE_COMPRESSION)
+    target_link_libraries(carquet PRIVATE ${CARQUET_PRIVATE_COMPRESSION_LIBS})
+    if(CARQUET_ENABLE_GZIP)
+        if(ZLIB_FOUND)
+            target_link_libraries(carquet PRIVATE ZLIB::ZLIB)
+        else()
+            carquet_private_link_libraries_for_export(
+                CARQUET_PRIVATE_ZLIB_LIBS
+                ${ZLIB_LIBRARIES})
+            target_link_libraries(carquet PRIVATE
+                ${CARQUET_PRIVATE_ZLIB_LIBS})
+        endif()
+    endif()
 endif()
 
 # Link libm for math functions (bloom_filter.c uses log())
@@ -494,7 +584,7 @@ if(UNIX)
 endif()
 
 # Link pthreads for worker pool (POSIX)
-if(UNIX)
+if(UNIX AND CARQUET_ENABLE_WORKER_THREADS)
     find_package(Threads REQUIRED)
     target_link_libraries(carquet PRIVATE Threads::Threads)
 endif()
@@ -502,6 +592,39 @@ endif()
 # Link OpenMP for parallel column reading
 if(OpenMP_C_FOUND)
     target_link_libraries(carquet PRIVATE OpenMP::OpenMP_C)
+endif()
+
+if(NOT CARQUET_ENABLE_MMAP)
+    target_compile_definitions(carquet PRIVATE CARQUET_NO_MMAP)
+endif()
+
+if(NOT CARQUET_ENABLE_FILE_IO)
+    target_compile_definitions(carquet PRIVATE CARQUET_NO_FILE_IO)
+endif()
+
+if(NOT CARQUET_ENABLE_WRITER)
+    target_compile_definitions(carquet PRIVATE CARQUET_NO_WRITER)
+endif()
+
+if(NOT CARQUET_ENABLE_WORKER_THREADS)
+    target_compile_definitions(carquet PRIVATE CARQUET_NO_WORKER_THREADS)
+endif()
+
+if(NOT CARQUET_ENABLE_COMPRESSION)
+    target_compile_definitions(carquet PRIVATE CARQUET_NO_COMPRESSION)
+else()
+    if(CARQUET_ENABLE_GZIP)
+        target_compile_definitions(carquet PRIVATE CARQUET_HAVE_GZIP)
+    endif()
+    if(CARQUET_ENABLE_SNAPPY)
+        target_compile_definitions(carquet PRIVATE CARQUET_HAVE_SNAPPY)
+    endif()
+    if(CARQUET_ENABLE_LZ4)
+        target_compile_definitions(carquet PRIVATE CARQUET_HAVE_LZ4)
+    endif()
+    if(CARQUET_ENABLE_ZSTD)
+        target_compile_definitions(carquet PRIVATE CARQUET_HAVE_ZSTD)
+    endif()
 endif()
 
 # Architecture definitions
@@ -528,6 +651,13 @@ if(CARQUET_ARCH_ARM)
     endif()
     if(CARQUET_ENABLE_SVE)
         target_compile_definitions(carquet PRIVATE CARQUET_ENABLE_SVE)
+    endif()
+endif()
+
+if(CARQUET_ARCH_WASM)
+    target_compile_definitions(carquet PRIVATE CARQUET_ARCH_WASM)
+    if(CARQUET_ENABLE_WASM_SIMD)
+        target_compile_definitions(carquet PRIVATE CARQUET_ENABLE_WASM_SIMD)
     endif()
 endif()
 

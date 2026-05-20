@@ -31,10 +31,16 @@
 static carquet_cpu_info_t g_cpu_info = {0};
 static int g_initialized = 0;
 
+#ifndef CARQUET_NO_COMPRESSION
 /* External initialization/cleanup functions for compression */
+#ifdef CARQUET_HAVE_GZIP
 extern void carquet_gzip_init_tables(void);
+#endif
+#ifdef CARQUET_HAVE_ZSTD
 extern void carquet_zstd_init_tables(void);
 extern void carquet_zstd_cleanup(void);
+#endif
+#endif
 
 static void carquet_clear_initialized(void) {
 #if defined(__GNUC__) || defined(__clang__)
@@ -216,8 +222,14 @@ carquet_status_t carquet_init(void) {
     /* Initialize compression lookup tables.
      * This ensures tables are built before any multi-threaded use,
      * making compression/decompression thread-safe. */
+#ifndef CARQUET_NO_COMPRESSION
+#ifdef CARQUET_HAVE_GZIP
     carquet_gzip_init_tables();
+#endif
+#ifdef CARQUET_HAVE_ZSTD
     carquet_zstd_init_tables();
+#endif
+#endif
 
     /* Use memory barrier to ensure all writes are visible before flag is set.
      * Note: For full thread safety, callers should ensure carquet_init()
@@ -228,7 +240,11 @@ carquet_status_t carquet_init(void) {
 }
 
 void carquet_cleanup(void) {
+#ifndef CARQUET_NO_COMPRESSION
+#ifdef CARQUET_HAVE_ZSTD
     carquet_zstd_cleanup();
+#endif
+#endif
     carquet_clear_initialized();
 }
 

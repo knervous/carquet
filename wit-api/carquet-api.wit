@@ -1,0 +1,645 @@
+package simul8:carquet-api;
+
+interface types {
+  enum status {
+    ok,
+    invalid-argument,
+    out-of-memory,
+    not-implemented,
+    internal,
+    file-not-found,
+    file-open,
+    file-read,
+    file-write,
+    file-seek,
+    file-truncated,
+    invalid-magic,
+    invalid-footer,
+    invalid-schema,
+    invalid-metadata,
+    invalid-page,
+    invalid-encoding,
+    version-not-supported,
+    thrift-decode,
+    thrift-encode,
+    thrift-invalid-type,
+    thrift-truncated,
+    decode,
+    encode,
+    dictionary-not-found,
+    invalid-rle,
+    invalid-delta,
+    compression,
+    decompression,
+    unsupported-codec,
+    invalid-compressed-data,
+    type-mismatch,
+    column-not-found,
+    row-group-not-found,
+    end-of-data,
+    checksum,
+    crc-mismatch,
+    invalid-state,
+    already-closed,
+    not-open,
+  }
+
+  enum physical-type {
+    boolean,
+    int32,
+    int64,
+    int96,
+    float,
+    double,
+    byte-array,
+    fixed-len-byte-array,
+  }
+
+  enum converted-type {
+    none,
+    utf8,
+    map-type,
+    map-key-value,
+    list-type,
+    enum-type,
+    decimal,
+    date,
+    time-millis,
+    time-micros,
+    timestamp-millis,
+    timestamp-micros,
+    uint8,
+    uint16,
+    uint32,
+    uint64,
+    int8,
+    int16,
+    int32,
+    int64,
+    json,
+    bson,
+    interval,
+  }
+
+  enum logical-type-id {
+    unknown,
+    string-type,
+    map-type,
+    list-type,
+    enum-type,
+    decimal,
+    date,
+    time,
+    timestamp,
+    integer,
+    null-type,
+    json,
+    bson,
+    uuid,
+    float16,
+    variant-type,
+    geometry,
+    geography,
+    interval,
+  }
+
+  enum time-unit {
+    millis,
+    micros,
+    nanos,
+  }
+
+  enum geospatial-edge-algorithm {
+    spherical,
+    vincenty,
+    thomas,
+    andoyer,
+    karney,
+  }
+
+  enum field-repetition {
+    required,
+    optional,
+    repeated,
+  }
+
+  enum encoding {
+    plain,
+    plain-dictionary,
+    rle,
+    bit-packed,
+    delta-binary-packed,
+    delta-length-byte-array,
+    delta-byte-array,
+    rle-dictionary,
+    byte-stream-split,
+  }
+
+  enum compression-codec {
+    uncompressed,
+    snappy,
+    gzip,
+    lzo,
+    brotli,
+    lz4,
+    zstd,
+    lz4-raw,
+  }
+
+  enum page-type {
+    data,
+    index,
+    dictionary,
+    data-v2,
+  }
+
+  enum data-page-version {
+    v1,
+    v2,
+  }
+
+  enum compare-op {
+    eq,
+    ne,
+    lt,
+    le,
+    gt,
+    ge,
+  }
+
+  record error {
+    code: status,
+    message: string,
+    offset: s64,
+    column-index: option<s32>,
+    row-group-index: option<s32>,
+  }
+
+  record version {
+    major: u32,
+    minor: u32,
+    patch: u32,
+  }
+
+  record cpu-info {
+    has-sse42: bool,
+    has-avx2: bool,
+    has-avx512f: bool,
+    has-avx512bw: bool,
+    has-avx512vl: bool,
+    has-neon: bool,
+    has-sve: bool,
+    sve-vector-length: u32,
+    has-wasm-simd128: bool,
+  }
+
+  record logical-type {
+    id: logical-type-id,
+    precision: option<s32>,
+    scale: option<s32>,
+    bit-width: option<s8>,
+    is-signed: option<bool>,
+    time-unit: option<time-unit>,
+    is-adjusted-to-utc: option<bool>,
+    variant-specification-version: option<s8>,
+    crs: option<string>,
+    geospatial-algorithm: option<geospatial-edge-algorithm>,
+  }
+
+  record reader-options {
+    verify-checksums: bool,
+    buffer-size: u64,
+  }
+
+  record writer-options {
+    compression: compression-codec,
+    compression-level: s32,
+    row-group-size: u64,
+    page-size: u64,
+    write-statistics: bool,
+    write-crc: bool,
+    write-page-index: bool,
+    write-bloom-filters: bool,
+    dictionary-encoding: bool,
+    dictionary-page-size: u64,
+    created-by: option<string>,
+    max-rows-per-page: u64,
+    write-arrow-schema: bool,
+    data-page-version: data-page-version,
+    coerce-timestamps: bool,
+    coerce-timestamp-unit: time-unit,
+    allow-timestamp-truncation: bool,
+    write-batch-size: u64,
+  }
+
+  record schema-column {
+    name: string,
+    physical-type: physical-type,
+    logical-type: option<logical-type>,
+    repetition: field-repetition,
+    type-length: s32,
+  }
+
+  record schema-summary {
+    columns: list<schema-column>,
+  }
+
+  record file-info {
+    file-size: u64,
+    num-rows: s64,
+    num-row-groups: s32,
+    num-columns: s32,
+    version: s32,
+    created-by: string,
+  }
+
+  record row-group-metadata {
+    num-rows: s64,
+    total-byte-size: s64,
+    total-compressed-size: s64,
+  }
+
+  record column-statistics {
+    has-min-max: bool,
+    null-count: s64,
+    distinct-count: s64,
+    min-value: option<list<u8>>,
+    max-value: option<list<u8>>,
+  }
+
+  record page-stats {
+    null-count: s64,
+    min-value: option<list<u8>>,
+    max-value: option<list<u8>>,
+    is-null-page: bool,
+  }
+
+  record page-location {
+    offset: s64,
+    compressed-size: s32,
+    first-row-index: s64,
+  }
+
+  record column-chunk-metadata {
+    physical-type: physical-type,
+    codec: compression-codec,
+    num-values: s64,
+    total-uncompressed-size: s64,
+    total-compressed-size: s64,
+    data-page-offset: s64,
+    dictionary-page-offset: option<s64>,
+    encodings: list<encoding>,
+    has-dictionary: bool,
+    has-column-index: bool,
+    has-offset-index: bool,
+    bloom-filter-offset: option<s64>,
+  }
+
+  record geospatial-statistics {
+    has-bbox: bool,
+    xmin: f64,
+    ymin: f64,
+    xmax: f64,
+    ymax: f64,
+    has-z-bounds: bool,
+    zmin: f64,
+    zmax: f64,
+    has-m-bounds: bool,
+    mmin: f64,
+    mmax: f64,
+    geometry-types: list<u32>,
+  }
+
+  record sorting-column {
+    column-index: s32,
+    descending: bool,
+    nulls-first: bool,
+  }
+
+  record binary-column {
+    values: list<list<u8>>,
+    nulls: option<list<bool>>,
+  }
+
+  record column-view {
+    column-index: u32,
+    values: list<u8>,
+    nulls: option<list<bool>>,
+  }
+
+  record table-view {
+    columns: list<column-view>,
+    num-rows: u64,
+  }
+
+  variant cell-value {
+    null,
+    boolean(bool),
+    int32(s32),
+    int64(s64),
+    int96(list<u8>),
+    float(f32),
+    double(f64),
+    bytes(list<u8>),
+    fixed-bytes(list<u8>),
+  }
+
+  record cell-location {
+    row-index: u64,
+    column-index: u32,
+  }
+
+  record cell-update-options {
+    reader-options: option<reader-options>,
+    writer-options: option<writer-options>,
+    preserve-metadata: bool,
+  }
+
+  record block-range {
+    start-row: u64,
+    end-row: u64,
+    start-column: u32,
+    end-column: u32,
+  }
+
+  record block-options {
+    batch-size: u32,
+    include-null-bitmap: bool,
+  }
+
+  record block-column {
+    column-index: u32,
+    physical-type: physical-type,
+    type-length: s32,
+    values: list<u8>,
+    nulls: option<list<bool>>,
+    num-values: u64,
+  }
+
+  record data-block {
+    start-row: u64,
+    num-rows: u64,
+    columns: list<block-column>,
+  }
+}
+
+interface lifecycle {
+  use types.{cpu-info, error, version};
+
+  init: func() -> result<_, error>;
+  cleanup: func();
+  library-version: func() -> version;
+  version-string: func() -> string;
+  get-cpu-info: func() -> cpu-info;
+}
+
+interface schema-api {
+  use types.{error, field-repetition, logical-type, physical-type, schema-summary};
+
+  resource schema;
+
+  schema-create: func() -> result<own<schema>, error>;
+  schema-add-column: func(
+    schema: borrow<schema>,
+    name: string,
+    physical-type: physical-type,
+    logical-type: option<logical-type>,
+    repetition: field-repetition,
+    type-length: s32,
+  ) -> result<_, error>;
+  schema-num-columns: func(schema: borrow<schema>) -> u32;
+  schema-column-name: func(schema: borrow<schema>, column-index: u32) -> result<string, error>;
+  schema-column-physical-type: func(
+    schema: borrow<schema>,
+    column-index: u32,
+  ) -> result<physical-type, error>;
+  schema-column-logical-type: func(
+    schema: borrow<schema>,
+    column-index: u32,
+  ) -> result<option<logical-type>, error>;
+  schema-describe: func(schema: borrow<schema>) -> result<schema-summary, error>;
+}
+
+interface reader-api {
+  use schema-api.{schema};
+  use types.{
+    binary-column,
+    column-chunk-metadata,
+    column-statistics,
+    error,
+    file-info,
+    page-location,
+    page-stats,
+    reader-options,
+    row-group-metadata,
+    schema-summary,
+  };
+
+  resource reader;
+  resource column-reader;
+  resource batch-reader;
+  resource row-batch;
+  resource bloom-filter;
+  resource column-index;
+  resource offset-index;
+
+  reader-open-buffer: func(
+    data: list<u8>,
+    options: option<reader-options>,
+  ) -> result<own<reader>, error>;
+  reader-close: func(reader: own<reader>);
+  reader-num-rows: func(reader: borrow<reader>) -> s64;
+  reader-num-columns: func(reader: borrow<reader>) -> u32;
+  reader-num-row-groups: func(reader: borrow<reader>) -> u32;
+  reader-file-info: func(reader: borrow<reader>) -> result<file-info, error>;
+  reader-schema: func(reader: borrow<reader>) -> result<schema-summary, error>;
+  reader-get-schema-handle: func(reader: borrow<reader>) -> result<own<schema>, error>;
+  reader-row-group-metadata: func(
+    reader: borrow<reader>,
+    row-group-index: u32,
+  ) -> result<row-group-metadata, error>;
+  reader-column-metadata: func(
+    reader: borrow<reader>,
+    row-group-index: u32,
+    column-index: u32,
+  ) -> result<column-chunk-metadata, error>;
+  reader-column-statistics: func(
+    reader: borrow<reader>,
+    row-group-index: u32,
+    column-index: u32,
+  ) -> result<column-statistics, error>;
+  reader-column-reader: func(
+    reader: borrow<reader>,
+    column-index: u32,
+  ) -> result<own<column-reader>, error>;
+
+  column-reader-close: func(column-reader: own<column-reader>);
+  column-reader-read-booleans: func(
+    column-reader: borrow<column-reader>,
+    max-values: u64,
+  ) -> result<tuple<list<bool>, list<bool>>, error>;
+  column-reader-read-i32: func(
+    column-reader: borrow<column-reader>,
+    max-values: u64,
+  ) -> result<tuple<list<s32>, list<bool>>, error>;
+  column-reader-read-i64: func(
+    column-reader: borrow<column-reader>,
+    max-values: u64,
+  ) -> result<tuple<list<s64>, list<bool>>, error>;
+  column-reader-read-f32: func(
+    column-reader: borrow<column-reader>,
+    max-values: u64,
+  ) -> result<tuple<list<f32>, list<bool>>, error>;
+  column-reader-read-f64: func(
+    column-reader: borrow<column-reader>,
+    max-values: u64,
+  ) -> result<tuple<list<f64>, list<bool>>, error>;
+  column-reader-read-binary: func(
+    column-reader: borrow<column-reader>,
+    max-values: u64,
+  ) -> result<binary-column, error>;
+
+  batch-reader-create: func(
+    reader: borrow<reader>,
+    batch-size: u64,
+    column-indices: option<list<u32>>,
+  ) -> result<own<batch-reader>, error>;
+  batch-reader-next: func(batch-reader: borrow<batch-reader>) -> result<option<own<row-batch>>, error>;
+  batch-reader-close: func(batch-reader: own<batch-reader>);
+  row-batch-num-rows: func(row-batch: borrow<row-batch>) -> u64;
+  row-batch-num-columns: func(row-batch: borrow<row-batch>) -> u32;
+  row-batch-close: func(row-batch: own<row-batch>);
+
+  reader-bloom-filter: func(
+    reader: borrow<reader>,
+    row-group-index: u32,
+    column-index: u32,
+  ) -> result<option<own<bloom-filter>>, error>;
+  bloom-filter-might-contain: func(
+    bloom-filter: borrow<bloom-filter>,
+    value: list<u8>,
+  ) -> result<bool, error>;
+  bloom-filter-close: func(bloom-filter: own<bloom-filter>);
+
+  reader-column-index: func(
+    reader: borrow<reader>,
+    row-group-index: u32,
+    column-index: u32,
+  ) -> result<option<own<column-index>>, error>;
+  column-index-page-stats: func(
+    column-index: borrow<column-index>,
+    page-index: u32,
+  ) -> result<page-stats, error>;
+  column-index-close: func(column-index: own<column-index>);
+
+  reader-offset-index: func(
+    reader: borrow<reader>,
+    row-group-index: u32,
+    column-index: u32,
+  ) -> result<option<own<offset-index>>, error>;
+  offset-index-page-location: func(
+    offset-index: borrow<offset-index>,
+    page-index: u32,
+  ) -> result<page-location, error>;
+  offset-index-close: func(offset-index: own<offset-index>);
+}
+
+interface writer-api {
+  use schema-api.{schema};
+  use types.{binary-column, error, table-view, writer-options};
+
+  resource writer;
+
+  writer-create-buffer: func(
+    schema: borrow<schema>,
+    options: option<writer-options>,
+  ) -> result<own<writer>, error>;
+  writer-write-booleans: func(
+    writer: borrow<writer>,
+    column-index: u32,
+    values: list<bool>,
+    nulls: option<list<bool>>,
+  ) -> result<_, error>;
+  writer-write-i32: func(
+    writer: borrow<writer>,
+    column-index: u32,
+    values: list<s32>,
+    nulls: option<list<bool>>,
+  ) -> result<_, error>;
+  writer-write-i64: func(
+    writer: borrow<writer>,
+    column-index: u32,
+    values: list<s64>,
+    nulls: option<list<bool>>,
+  ) -> result<_, error>;
+  writer-write-f32: func(
+    writer: borrow<writer>,
+    column-index: u32,
+    values: list<f32>,
+    nulls: option<list<bool>>,
+  ) -> result<_, error>;
+  writer-write-f64: func(
+    writer: borrow<writer>,
+    column-index: u32,
+    values: list<f64>,
+    nulls: option<list<bool>>,
+  ) -> result<_, error>;
+  writer-write-binary: func(
+    writer: borrow<writer>,
+    column-index: u32,
+    column: binary-column,
+  ) -> result<_, error>;
+  writer-close: func(writer: borrow<writer>) -> result<_, error>;
+  writer-finish-buffer: func(writer: own<writer>) -> result<list<u8>, error>;
+
+  save-buffer-with-options: func(
+    schema: borrow<schema>,
+    options: option<writer-options>,
+    table: table-view,
+  ) -> result<list<u8>, error>;
+}
+
+interface helper-api {
+  use reader-api.{reader};
+  use schema-api.{schema};
+  use types.{
+    block-options,
+    block-range,
+    cell-location,
+    cell-update-options,
+    cell-value,
+    data-block,
+    error,
+    reader-options,
+    table-view,
+    writer-options,
+  };
+
+  open-file-with-options: func(path: string, options: option<reader-options>) -> result<own<reader>, error>;
+  save-file-with-options: func(
+    path: string,
+    schema: borrow<schema>,
+    options: option<writer-options>,
+    table: table-view,
+  ) -> result<_, error>;
+  update-cell-in-file: func(
+    input-path: string,
+    output-path: string,
+    location: cell-location,
+    value: cell-value,
+    options: option<cell-update-options>,
+  ) -> result<_, error>;
+  retrieve-block-from-file: func(
+    path: string,
+    range: block-range,
+    options: option<block-options>,
+  ) -> result<data-block, error>;
+}
+
+world carquet-api {
+  export lifecycle;
+  export schema-api;
+  export reader-api;
+  export writer-api;
+  export helper-api;
+}

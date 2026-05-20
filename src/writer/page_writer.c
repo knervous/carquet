@@ -22,29 +22,37 @@
 #include <string.h>
 
 /* Forward declarations for compression */
+#ifdef CARQUET_HAVE_SNAPPY
 extern carquet_status_t carquet_snappy_compress(const uint8_t* src, size_t src_size,
                                                  uint8_t* dst, size_t dst_capacity,
                                                  size_t* dst_size);
 extern size_t carquet_snappy_compress_bound(size_t src_size);
+#endif
 
 /* CRC32 for page integrity verification */
 extern uint32_t carquet_crc32(const uint8_t* data, size_t length);
 extern uint32_t carquet_crc32_update(uint32_t crc, const uint8_t* data, size_t length);
 
+#ifdef CARQUET_HAVE_LZ4
 extern carquet_status_t carquet_lz4_compress(const uint8_t* src, size_t src_size,
                                               uint8_t* dst, size_t dst_capacity,
                                               size_t* dst_size);
 extern size_t carquet_lz4_compress_bound(size_t src_size);
+#endif
 
+#ifdef CARQUET_HAVE_GZIP
 extern int carquet_gzip_compress(const uint8_t* src, size_t src_size,
                                   uint8_t* dst, size_t dst_capacity,
                                   size_t* dst_size, int level);
 extern size_t carquet_gzip_compress_bound(size_t src_size);
+#endif
 
+#ifdef CARQUET_HAVE_ZSTD
 extern int carquet_zstd_compress(const uint8_t* src, size_t src_size,
                                   uint8_t* dst, size_t dst_capacity,
                                   size_t* dst_size, int level);
 extern size_t carquet_zstd_compress_bound(size_t src_size);
+#endif
 
 extern carquet_status_t carquet_byte_stream_split_encode_float(
     const float* values,
@@ -1302,18 +1310,34 @@ static carquet_status_t compress_data(
     size_t bound = 0;
     switch (codec) {
         case CARQUET_COMPRESSION_SNAPPY:
+#ifdef CARQUET_HAVE_SNAPPY
             bound = carquet_snappy_compress_bound(input_size);
             break;
+#else
+            return CARQUET_ERROR_UNSUPPORTED_CODEC;
+#endif
         case CARQUET_COMPRESSION_LZ4:
         case CARQUET_COMPRESSION_LZ4_RAW:
+#ifdef CARQUET_HAVE_LZ4
             bound = carquet_lz4_compress_bound(input_size);
             break;
+#else
+            return CARQUET_ERROR_UNSUPPORTED_CODEC;
+#endif
         case CARQUET_COMPRESSION_GZIP:
+#ifdef CARQUET_HAVE_GZIP
             bound = carquet_gzip_compress_bound(input_size);
             break;
+#else
+            return CARQUET_ERROR_UNSUPPORTED_CODEC;
+#endif
         case CARQUET_COMPRESSION_ZSTD:
+#ifdef CARQUET_HAVE_ZSTD
             bound = carquet_zstd_compress_bound(input_size);
             break;
+#else
+            return CARQUET_ERROR_UNSUPPORTED_CODEC;
+#endif
         default:
             return CARQUET_ERROR_UNSUPPORTED_CODEC;
     }
@@ -1332,24 +1356,44 @@ static carquet_status_t compress_data(
 
     switch (codec) {
         case CARQUET_COMPRESSION_SNAPPY:
+#ifdef CARQUET_HAVE_SNAPPY
             status = carquet_snappy_compress(input, input_size,
                                               compressed, bound, &local_compressed_size);
             break;
+#else
+            status = CARQUET_ERROR_UNSUPPORTED_CODEC;
+            break;
+#endif
         case CARQUET_COMPRESSION_LZ4:
         case CARQUET_COMPRESSION_LZ4_RAW:
+#ifdef CARQUET_HAVE_LZ4
             status = carquet_lz4_compress(input, input_size,
                                            compressed, bound, &local_compressed_size);
             break;
+#else
+            status = CARQUET_ERROR_UNSUPPORTED_CODEC;
+            break;
+#endif
         case CARQUET_COMPRESSION_GZIP:
+#ifdef CARQUET_HAVE_GZIP
             status = carquet_gzip_compress(input, input_size,
                                             compressed, bound, &local_compressed_size,
                                             compression_level > 0 ? compression_level : 6);
             break;
+#else
+            status = CARQUET_ERROR_UNSUPPORTED_CODEC;
+            break;
+#endif
         case CARQUET_COMPRESSION_ZSTD:
+#ifdef CARQUET_HAVE_ZSTD
             status = carquet_zstd_compress(input, input_size,
                                             compressed, bound, &local_compressed_size,
                                             compression_level > 0 ? compression_level : 3);
             break;
+#else
+            status = CARQUET_ERROR_UNSUPPORTED_CODEC;
+            break;
+#endif
         default:
             status = CARQUET_ERROR_UNSUPPORTED_CODEC;
     }

@@ -2925,6 +2925,177 @@ carquet_status_t carquet_writer_get_buffer(
     size_t* size);
 
 /* ============================================================================
+ * Helper API
+ * ============================================================================
+ *
+ * Small wrappers for host integrations that want status-returning calls and
+ * compact data movement helpers instead of repeating reader/writer boilerplate.
+ * The file-path helpers return CARQUET_ERROR_NOT_IMPLEMENTED when the library
+ * is built with CARQUET_ENABLE_FILE_IO=OFF.
+ */
+
+/**
+ * @brief Generic view of one complete column to write.
+ *
+ * The values, definition levels, and repetition levels use the same layout as
+ * carquet_writer_write_batch().
+ */
+typedef struct carquet_column_view {
+    int32_t column_index;
+    const void* values;
+    int64_t num_values;
+    const int16_t* def_levels;
+    const int16_t* rep_levels;
+} carquet_column_view_t;
+
+/**
+ * @brief Open a file with options and return CARQUET_OK/error status.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_open_file_with_options(
+    const char* path,
+    const carquet_reader_options_t* options,
+    carquet_reader_t** reader,
+    carquet_error_t* error);
+
+/**
+ * @brief Save a complete flat table to a file with writer options.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_save_file_with_options(
+    const char* path,
+    const carquet_schema_t* schema,
+    const carquet_writer_options_t* options,
+    const carquet_column_view_t* columns,
+    int32_t num_columns,
+    carquet_error_t* error);
+
+/**
+ * @brief Save a complete flat table to an owned in-memory Parquet buffer.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_save_buffer_with_options(
+    const carquet_schema_t* schema,
+    const carquet_writer_options_t* options,
+    const carquet_column_view_t* columns,
+    int32_t num_columns,
+    void** buffer,
+    size_t* size,
+    carquet_error_t* error);
+
+/**
+ * @brief Address of a single logical cell.
+ */
+typedef struct carquet_cell_location {
+    int64_t row_index;
+    int32_t column_index;
+} carquet_cell_location_t;
+
+/**
+ * @brief Raw value for cell update helpers.
+ */
+typedef struct carquet_cell_value {
+    carquet_physical_type_t type;
+    const void* data;
+    size_t size;
+    bool is_null;
+} carquet_cell_value_t;
+
+/**
+ * @brief Options for cell update helpers.
+ */
+typedef struct carquet_cell_update_options {
+    const carquet_reader_options_t* reader_options;
+    const carquet_writer_options_t* writer_options;
+    bool preserve_metadata;
+} carquet_cell_update_options_t;
+
+/**
+ * @brief Rewrite a file with one logical cell changed.
+ *
+ * Parquet is immutable on disk, so this helper is intentionally modeled as an
+ * input-to-output rewrite operation.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_update_cell_in_file(
+    const char* input_path,
+    const char* output_path,
+    const carquet_cell_location_t* location,
+    const carquet_cell_value_t* value,
+    const carquet_cell_update_options_t* options,
+    carquet_error_t* error);
+
+/**
+ * @brief Inclusive-exclusive rectangular block range.
+ */
+typedef struct carquet_block_range {
+    int64_t start_row;
+    int64_t end_row;
+    int32_t start_column;
+    int32_t end_column;
+} carquet_block_range_t;
+
+/**
+ * @brief Options for rectangular block retrieval.
+ */
+typedef struct carquet_block_options {
+    int32_t batch_size;
+    bool include_null_bitmap;
+} carquet_block_options_t;
+
+/**
+ * @brief One materialized column in a retrieved block.
+ */
+typedef struct carquet_block_column {
+    int32_t column_index;
+    carquet_physical_type_t type;
+    int32_t type_length;
+    void* values;
+    size_t values_size;
+    uint8_t* null_bitmap;
+    size_t null_bitmap_size;
+    int64_t num_values;
+} carquet_block_column_t;
+
+/**
+ * @brief Materialized rectangular data block.
+ */
+typedef struct carquet_data_block {
+    int64_t start_row;
+    int64_t num_rows;
+    int32_t num_columns;
+    carquet_block_column_t* columns;
+} carquet_data_block_t;
+
+/**
+ * @brief Retrieve a rectangular row/column block from an open reader.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_retrieve_block(
+    carquet_reader_t* reader,
+    const carquet_block_range_t* range,
+    const carquet_block_options_t* options,
+    carquet_data_block_t* block,
+    carquet_error_t* error);
+
+/**
+ * @brief Open a file and retrieve a rectangular row/column block.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT
+carquet_status_t carquet_retrieve_block_from_file(
+    const char* path,
+    const carquet_block_range_t* range,
+    const carquet_block_options_t* options,
+    carquet_data_block_t* block,
+    carquet_error_t* error);
+
+/**
+ * @brief Free memory owned by a retrieved block.
+ */
+CARQUET_API
+void carquet_data_block_free(carquet_data_block_t* block);
+
+/* ============================================================================
  * C++ Compatibility - End
  * ============================================================================ */
 

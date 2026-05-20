@@ -1,0 +1,88 @@
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+#include <carquet/carquet.h>
+
+void carquet_wasm128_bitunpack8_4bit(const uint8_t* input, uint32_t* values);
+extern int carquet_gzip_compress(
+    const uint8_t* src,
+    size_t src_size,
+    uint8_t* dst,
+    size_t dst_capacity,
+    size_t* dst_size,
+    int level);
+extern int carquet_gzip_decompress(
+    const uint8_t* src,
+    size_t src_size,
+    uint8_t* dst,
+    size_t dst_capacity,
+    size_t* dst_size);
+extern size_t carquet_gzip_compress_bound(size_t src_size);
+
+uint32_t exports_carquet_version_major(void) {
+    return CARQUET_VERSION_MAJOR;
+}
+
+uint32_t exports_carquet_version_minor(void) {
+    return CARQUET_VERSION_MINOR;
+}
+
+uint32_t exports_carquet_version_patch(void) {
+    return CARQUET_VERSION_PATCH;
+}
+
+bool exports_carquet_link_probe(void) {
+    int major = -1;
+    int minor = -1;
+    int patch = -1;
+    const char* version = carquet_version();
+
+    carquet_version_components(&major, &minor, &patch);
+    return version[0] == '0' &&
+           major == CARQUET_VERSION_MAJOR &&
+           minor == CARQUET_VERSION_MINOR &&
+           patch == CARQUET_VERSION_PATCH;
+}
+
+bool exports_carquet_wasm128_probe(void) {
+    const uint8_t packed[] = {0x10, 0x32, 0x54, 0x76};
+    uint32_t values[8] = {0};
+
+    carquet_wasm128_bitunpack8_4bit(packed, values);
+
+    for (uint32_t i = 0; i < 8; i++) {
+        if (values[i] != i) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+bool exports_carquet_gzip_probe(void) {
+    const uint8_t source[] = "carquet gzip component probe";
+    uint8_t compressed[128] = {0};
+    uint8_t restored[sizeof(source)] = {0};
+    size_t compressed_size = 0;
+    size_t restored_size = 0;
+
+    if (carquet_gzip_compress_bound(sizeof(source)) > sizeof(compressed)) {
+        return false;
+    }
+
+    if (carquet_gzip_compress(source, sizeof(source),
+                              compressed, sizeof(compressed),
+                              &compressed_size, 6) != CARQUET_OK) {
+        return false;
+    }
+
+    if (carquet_gzip_decompress(compressed, compressed_size,
+                                restored, sizeof(restored),
+                                &restored_size) != CARQUET_OK) {
+        return false;
+    }
+
+    return restored_size == sizeof(source) &&
+           memcmp(restored, source, sizeof(source)) == 0;
+}

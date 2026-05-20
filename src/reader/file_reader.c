@@ -16,6 +16,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
+#ifndef _WIN32
+#include <sys/types.h>
+#endif
 
 /* External functions from metadata modules */
 extern carquet_status_t carquet_bloom_filter_read(carquet_bloom_filter_t** filter_out,
@@ -428,6 +431,7 @@ carquet_reader_t* carquet_reader_open(
 
     carquet_status_t status;
 
+#ifndef CARQUET_NO_MMAP
     /* Try mmap if requested */
     if (reader->options.use_mmap) {
         carquet_mmap_info_t* mmap_info = carquet_mmap_open(path, error);
@@ -451,6 +455,7 @@ carquet_reader_t* carquet_reader_open(
         }
         /* mmap failed, fall through to fread path */
     }
+#endif
 
     /* Standard fread path */
     FILE* file = fopen(path, "rb");
@@ -624,12 +629,14 @@ void carquet_reader_close(carquet_reader_t* reader) {
     /* Release prebuffer cache */
     carquet_reader_release_prebuffer(reader);
 
+#ifndef CARQUET_NO_MMAP
     /* Close mmap if active */
     if (reader->mmap_info) {
         carquet_mmap_close(reader->mmap_info);
         reader->mmap_info = NULL;
         reader->mmap_data = NULL;
     }
+#endif
 
     if (reader->owns_file && reader->file) {
         fclose(reader->file);
@@ -908,7 +915,12 @@ int64_t carquet_column_remaining(const carquet_column_reader_t* reader) {
 
 bool carquet_reader_is_mmap(const carquet_reader_t* reader) {
     /* reader is nonnull per API contract */
+#ifdef CARQUET_NO_MMAP
+    (void)reader;
+    return false;
+#else
     return reader->mmap_info != NULL && reader->mmap_info->is_valid;
+#endif
 }
 
 bool carquet_reader_can_zero_copy(
@@ -917,6 +929,12 @@ bool carquet_reader_can_zero_copy(
     int32_t column_index) {
 
     /* reader is nonnull per API contract */
+#ifdef CARQUET_NO_MMAP
+    (void)reader;
+    (void)row_group_index;
+    (void)column_index;
+    return false;
+#else
 
     /* Must have mmap enabled */
     if (!reader->mmap_info || !reader->mmap_info->is_valid) {
@@ -970,21 +988,7 @@ bool carquet_reader_can_zero_copy(
         default:
             return false;
     }
-}
-
-/* ============================================================================
- * Library Version
- * ============================================================================
- */
-
-const char* carquet_version(void) {
-    return CARQUET_VERSION_STRING;
-}
-
-void carquet_version_components(int* major, int* minor, int* patch) {
-    if (major) *major = CARQUET_VERSION_MAJOR;
-    if (minor) *minor = CARQUET_VERSION_MINOR;
-    if (patch) *patch = CARQUET_VERSION_PATCH;
+#endif
 }
 
 /* ============================================================================

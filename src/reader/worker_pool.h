@@ -15,7 +15,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#ifdef _WIN32
+#ifdef CARQUET_NO_WORKER_THREADS
+typedef void* carquet_thread_handle_t;
+#elif defined(_WIN32)
 #include <windows.h>
 #else
 #include <pthread.h>
@@ -39,7 +41,9 @@ typedef struct carquet_task {
 #define CARQUET_POOL_QUEUE_CAPACITY 512
 
 typedef struct carquet_worker_pool {
-#ifdef _WIN32
+#ifdef CARQUET_NO_WORKER_THREADS
+    carquet_thread_handle_t* threads;
+#elif defined(_WIN32)
     HANDLE* threads;
 #else
     pthread_t* threads;
@@ -53,7 +57,12 @@ typedef struct carquet_worker_pool {
     int32_t queue_count;    /* Number of tasks in queue */
 
     /* Synchronization */
-#ifdef _WIN32
+#ifdef CARQUET_NO_WORKER_THREADS
+    int mutex;
+    int work_available;
+    int work_done;
+    int queue_not_full;
+#elif defined(_WIN32)
     CRITICAL_SECTION mutex;
     CONDITION_VARIABLE work_available;
     CONDITION_VARIABLE work_done;

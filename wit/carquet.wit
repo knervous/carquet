@@ -1,0 +1,10 @@
+package simul8:carquet;
+
+world carquet {
+  export version-major: func() -> u32;
+  export version-minor: func() -> u32;
+  export version-patch: func() -> u32;
+  export link-probe: func() -> bool;
+  export wasm128-probe: func() -> bool;
+  export gzip-probe: func() -> bool;
+}

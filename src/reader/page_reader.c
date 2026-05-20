@@ -54,18 +54,26 @@ extern int64_t carquet_dispatch_count_non_nulls(const int16_t* def_levels, int64
 extern void carquet_dispatch_fill_def_levels(int16_t* def_levels, int64_t count, int16_t value);
 
 /* Forward declarations for compression functions */
+#ifdef CARQUET_HAVE_LZ4
 extern carquet_status_t carquet_lz4_decompress(
     const uint8_t* src, size_t src_size,
     uint8_t* dst, size_t dst_capacity, size_t* dst_size);
+#endif
+#ifdef CARQUET_HAVE_SNAPPY
 extern carquet_status_t carquet_snappy_decompress(
     const uint8_t* src, size_t src_size,
     uint8_t* dst, size_t dst_capacity, size_t* dst_size);
+#endif
+#ifdef CARQUET_HAVE_GZIP
 extern int carquet_gzip_decompress(
     const uint8_t* src, size_t src_size,
     uint8_t* dst, size_t dst_capacity, size_t* dst_size);
+#endif
+#ifdef CARQUET_HAVE_ZSTD
 extern int carquet_zstd_decompress(
     const uint8_t* src, size_t src_size,
     uint8_t* dst, size_t dst_capacity, size_t* dst_size);
+#endif
 extern carquet_status_t carquet_byte_stream_split_decode_float(
     const uint8_t* data,
     size_t data_size,
@@ -184,25 +192,41 @@ carquet_status_t carquet_decompress_page(
             return CARQUET_OK;
 
         case CARQUET_COMPRESSION_SNAPPY:
+#ifdef CARQUET_HAVE_SNAPPY
             return carquet_snappy_decompress(
                 compressed, compressed_size,
                 decompressed, decompressed_capacity, decompressed_size);
+#else
+            return CARQUET_ERROR_UNSUPPORTED_CODEC;
+#endif
 
         case CARQUET_COMPRESSION_LZ4:
         case CARQUET_COMPRESSION_LZ4_RAW:
+#ifdef CARQUET_HAVE_LZ4
             return carquet_lz4_decompress(
                 compressed, compressed_size,
                 decompressed, decompressed_capacity, decompressed_size);
+#else
+            return CARQUET_ERROR_UNSUPPORTED_CODEC;
+#endif
 
         case CARQUET_COMPRESSION_GZIP:
+#ifdef CARQUET_HAVE_GZIP
             return carquet_gzip_decompress(
                 compressed, compressed_size,
                 decompressed, decompressed_capacity, decompressed_size);
+#else
+            return CARQUET_ERROR_UNSUPPORTED_CODEC;
+#endif
 
         case CARQUET_COMPRESSION_ZSTD:
+#ifdef CARQUET_HAVE_ZSTD
             return carquet_zstd_decompress(
                 compressed, compressed_size,
                 decompressed, decompressed_capacity, decompressed_size);
+#else
+            return CARQUET_ERROR_UNSUPPORTED_CODEC;
+#endif
 
         default:
             return CARQUET_ERROR_UNSUPPORTED_CODEC;

@@ -34,7 +34,7 @@
  * automatically; on Windows callers must arrange per-thread cleanup.
  * ============================================================================ */
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(CARQUET_NO_WORKER_THREADS)
 /* ---- POSIX: pthread_key with destructors (works for OMP + worker pool) ---- */
 #include <pthread.h>
 
@@ -110,7 +110,7 @@ void carquet_zstd_cleanup(void) {
 }
 
 #else
-/* ---- Windows no OpenMP: global contexts ---- */
+/* ---- Single-thread fallback: global contexts ---- */
 static ZSTD_DCtx* global_dctx = NULL;
 static ZSTD_CCtx* global_cctx = NULL;
 
