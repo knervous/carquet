@@ -1850,20 +1850,16 @@ carquet_status_t carquet_writer_write_batch(
 
     writer->column_values_written[column_index] += num_values;
 
-    /* Track rows (use column 0 as reference).
-     * For repeated columns (max_rep_level > 0), the number of logical rows
-     * is the count of rep_level == 0 entries (new top-level records).
-     * For non-repeated columns, num_values == num_rows. */
-    if (column_index == 0) {
-        if (rep_levels && writer->columns[0].max_rep_level > 0) {
-            int64_t rows = 0;
-            for (int64_t i = 0; i < num_values; i++) {
-                if (rep_levels[i] == 0) rows++;
-            }
-            writer->current_row_group_rows += rows;
-        } else {
-            writer->current_row_group_rows += num_values;
+    /* Track the row group length as the longest written column. */
+    int64_t rows = num_values;
+    if (rep_levels && writer->columns[column_index].max_rep_level > 0) {
+        rows = 0;
+        for (int64_t i = 0; i < num_values; i++) {
+            if (rep_levels[i] == 0) rows++;
         }
+    }
+    if (rows > writer->current_row_group_rows) {
+        writer->current_row_group_rows = rows;
     }
 
     writer->current_row_group_estimated_bytes = saturating_add_i64(
